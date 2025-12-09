@@ -29,6 +29,51 @@ def encode_text_with_prompt_ensemble(model, obj, device, cnn, adapter):
     text_features = torch.stack(text_features, dim=1).to(device)
     return text_features
 
+def get_text_features_with_prompt_learner(clip_model, prompt_learner, device, adapter=None):
+    """
+    返回形状大概为 [2, C] 的文本特征：
+      [0] -> normal prompt embedding
+      [1] -> anomaly prompt embedding
+    具体 shape 要看你后面怎么 reshape，这里先给个思路
+    """
+    # prompts: (num_prompts, L, D)
+    # tokenized_prompts: (num_prompts, context_len)
+    prompts, tokenized_prompts = prompt_learner()
+
+    # 这里要对应你 CLIP 的 encode_text 实现。
+    # 如果 AD-DINOv3 的 clip_model.encode_text 还只能接受 token ids，
+    # 那你就需要在 CLIP 里加一个新的接口，专门处理已经嵌入好的 prompts。
+    # 伪代码结构大概这样：
+
+    # ---- 以下是伪代码，和你原来的 encode_text 对应着改 ----
+    x = prompts               # 已经是 token embedding 了
+    x = x + clip_model.positional_embedding
+    x = clip_model.transformer(x)
+    x = x[0] 
+    x = clip_model.ln_final(x)
+    # 取每个序列里的 [EOS] 位置（从 tokenized_prompts 里找 eot 的 index）
+    eos_indices = tokenized_prompts.argmax(dim=-1)
+    text_embeddings = x[torch.arange(x.shape[0]), eos_indices] @ clip_model.text_projection
+
+    # 现在 text_embeddings 的条数 = normal prompt 数 + anomaly prompt 数
+    # 你的 PromptLearner 里 normal_num = 1, anomaly_num = 1，
+    # 可以把前一半当 normal，后一半当 anomaly，再做平均 + 归一化
+    num_total = text_embeddings.shape[0]
+    num_half = num_total // 2
+
+    normal_embeds = text_embeddings[:num_half]
+    anomaly_embeds = text_embeddings[num_half:]
+
+    normal_feat = normal_embeds / normal_embeds.norm(dim=-1, keepdim=True)
+    normal_feat = normal_feat.mean(dim=0)
+    normal_feat = normal_feat / normal_feat.norm()
+
+    anomaly_feat = anomaly_embeds / anomaly_embeds.norm(dim=-1, keepdim=True)
+    anomaly_feat = anomaly_feat.mean(dim=0)
+    anomaly_feat = anomaly_feat / anomaly_feat.norm()
+
+    text_features = torch.stack([normal_feat, anomaly_feat], dim=1)  # [C, 2]
+    return text_features.to(device)  
 
 def cos_sim(a, b, eps=1e-8):
     a_n, b_n = a.norm(dim=1)[:, None], b.norm(dim=1)[:, None]

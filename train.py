@@ -17,6 +17,8 @@ from torch.optim.lr_scheduler import LambdaLR
 import math
 from Datasets import DATASET_REGISTRY, DATASET_CLASSES
 
+from tools.promptLearner import AnomalyCLIP_PromptLearner
+
 visa_ALL = {"candle", "capsules", "cashew", "chewinggum",
             "fryum", "macaroni1", "macaroni2", "pcb1",
             "pcb2", "pcb3", "pcb4", "pipe_fryum"}
@@ -57,9 +59,9 @@ def prepare_data(dataset_name, category, args, **kwargs):
 
     return test_loader
 
-def train_epoch(optimizer, loss_focal, loss_dice, epoch, anomaly_awareness_loss_list, seg_loss_list, global_anomaly_loss_list, loss_list, clip_model, start_time, train_data):
+def train_epoch(optimizer, loss_focal, loss_dice, epoch, anomaly_awareness_loss_list, seg_loss_list, global_anomaly_loss_list, loss_list, clip_model, start_time, train_data, prompt_learner):
     for idx, image_info in enumerate(train_data):
-        anomaly_map, mask, anomaly_map_cross_modal, global_anomaly_score = get_anomaly_map(clip_model, image_info, device, model, Dino_model)
+        anomaly_map, mask, anomaly_map_cross_modal, global_anomaly_score = get_anomaly_map(clip_model, image_info, device, model, Dino_model, prompt_learner)
         anomaly_awareness_loss = loss_focal(anomaly_map, mask) + loss_dice(anomaly_map[:, 1, :, :], mask)
         seg_loss = loss_focal(anomaly_map_cross_modal, mask) + loss_dice(anomaly_map_cross_modal[:, 1, :, :], mask)
         global_anomaly_loss = F.cross_entropy(global_anomaly_score.squeeze(1), image_info["is_anomaly"].to(device).long())
@@ -92,7 +94,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda:6", help="device")
     parser.add_argument("--batch_size", type=int, default=64, help="batch size")
     parser.add_argument("--dataset", type=str, default="visa", help="dataset")
-    parser.add_argument("--epoch", type=int, default=100, help="epoch")
+    parser.add_argument("--epoch", type=int, default=10, help="epoch")
     parser.add_argument("--lr", type=float, default=0.00001, help="lr")
     args = parser.parse_args()
 
@@ -108,8 +110,19 @@ if __name__ == "__main__":
 
     # loading clip
     clip_model = create_model(model_name='ViT-L-14-336', img_size=512, device=device, pretrained='openai', require_pretrained=True)
-    clip_model.to(device)
+    
     clip_model.eval()
+
+    # loading prompt learner
+    design_details = {
+        "Prompt_length": 4,
+        "learnabel_text_embedding_length": 4,
+        "learnabel_text_embedding_depth": 2,
+    }
+    prompt_learner = AnomalyCLIP_PromptLearner(clip_model.to("cpu"), design_details=design_details, classname="object")
+    prompt_learner.to(device)
+    prompt_learner.train()
+    clip_model.to(device)
 
     # AD-DINOv3
     model = model_adapter(c_in=1024, device=device)
@@ -123,6 +136,9 @@ if __name__ == "__main__":
             if update_name in name:
                 print(f"Learnable parameter: {name}")
                 params_to_update.append(param)
+
+    # add prompt learner parameters
+    params_to_update += list(prompt_learner.parameters())
 
     train_data = prepare_data(args.dataset, 'ALL', args, **kwargs)
 
@@ -144,12 +160,12 @@ if __name__ == "__main__":
         start_time = time.time()
         awareness_loss_list, seg_loss_list, loss_list, global_anomaly_loss_list = [], [], [], []
 
-        train_epoch(optimizer, loss_focal, loss_dice, epoch, awareness_loss_list, seg_loss_list, global_anomaly_loss_list, loss_list, clip_model, start_time, train_data)
+        train_epoch(optimizer, loss_focal, loss_dice, epoch, awareness_loss_list, seg_loss_list, global_anomaly_loss_list, loss_list, clip_model, start_time, train_data, prompt_learner)
         print()
         # scheduler.step()
 
         os.makedirs(f"{args.result_path}/ckpt", exist_ok=True)
-        torch.save({'cls_token_adapter': model.cls_token_adapter.state_dict(), 'patch_token_adapter': model.patch_token_adapter.state_dict(), 'prompt_adapter': model.prompt_adapter.state_dict()}, f"{args.result_path}/ckpt/{epoch}.pth")
+        torch.save({'cls_token_adapter': model.cls_token_adapter.state_dict(), 'patch_token_adapter': model.patch_token_adapter.state_dict(), 'prompt_adapter': model.prompt_adapter.state_dict(), 'prompt_learner': prompt_learner.state_dict()}, f"{args.result_path}/ckpt/{epoch}.pth")
         
         with open(f"{args.result_path}/loss.txt", "a") as f:
             f.write(

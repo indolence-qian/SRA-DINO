@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from utils import encode_text_with_prompt_ensemble
+from utils import encode_text_with_prompt_ensemble, get_text_features_with_prompt_learner
 
 def get_feature_dinov3(image_path, batch_img, device, Dino_model):
     with torch.no_grad():
@@ -47,7 +47,7 @@ def get_feature_dinov3(image_path, batch_img, device, Dino_model):
 
         return cls_token, patch_tokens
 
-def get_anomaly_map(clip_model, image_info, device, model, Dino_model):
+def get_anomaly_map(clip_model, image_info, device, model, Dino_model, prompt_learner):
     image = image_info["image"].to(device)
     image_path = image_info["image_path"]
     mask = image_info["mask"].to(device)
@@ -58,7 +58,8 @@ def get_anomaly_map(clip_model, image_info, device, model, Dino_model):
     text_feature = torch.zeros(len(image_path), 768, 2).to(device)
     with torch.no_grad():
         for i in range(len(image_path)):
-            text_feature[i] = encode_text_with_prompt_ensemble(clip_model, image_path[i].split('/')[-4], device, '', y)
+            # text_feature[i] = encode_text_with_prompt_ensemble(clip_model, image_path[i].split('/')[-4], device, '', y)
+            text_feature[i] = get_text_features_with_prompt_learner(clip_model=clip_model, prompt_learner=prompt_learner, device=device, adapter=None)  # shape: (768, 2)
     adjusted_feats_0 = []
     adjusted_feats_1 = []
     for i in range(len(image_path)):

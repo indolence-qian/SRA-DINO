@@ -14,6 +14,8 @@ from tools.utils import get_anomaly_map
 from tools.visualization import visualization
 from Datasets import DATASET_REGISTRY, DATASET_CLASSES
 
+from tools.promptLearner import AnomalyCLIP_PromptLearner
+
 use_cuda = torch.cuda.is_available()
 kwargs = {'num_workers': 0, 'pin_memory': True} if use_cuda else {}
 
@@ -44,7 +46,7 @@ def prepare_data(dataset_name, category, args, **kwargs):
 
     return test_loader
 
-def test(clip_model, result_path, epoch):
+def test(clip_model, prompt_learner ,result_path, epoch):
     AUROC = []
     F1 = []
     print(f"--------------------------------------Testing epoch {epoch}--------------------------------------")
@@ -58,7 +60,7 @@ def test(clip_model, result_path, epoch):
         test_data = prepare_data(args.dataset, category, args, **kwargs)
 
         for image_info in tqdm(test_data):
-            _, mask, anomaly_map_cross_modal, _ = get_anomaly_map(clip_model, image_info, device, model, Dino_model)
+            _, mask, anomaly_map_cross_modal, _ = get_anomaly_map(clip_model, image_info, device, model, Dino_model, prompt_learner)
             pixel_gt.extend(mask.squeeze(1).cpu().detach().numpy())
             img_list.extend(image_info["image_path"])
             pixel_pred.extend(anomaly_map_cross_modal[:, 1, :, :].cpu().detach().numpy())
@@ -98,7 +100,8 @@ def test(clip_model, result_path, epoch):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--result_path", type=str, default="./Result", help="path to result")
-    parser.add_argument("--device", type=str, default="cuda:1", help="device")
+    parser.add_argument("--weight_path", type=str, default="./checkpoint/ckpt", help="path to weight")
+    parser.add_argument("--device", type=str, default="cuda:0", help="device")
     parser.add_argument("--batch_size", type=int, default=64, help="batch size")
     parser.add_argument("--dataset", type=str, default="mvtec", help="dataset")
     args = parser.parse_args()
@@ -115,16 +118,28 @@ if __name__ == "__main__":
 
     # loading clip
     clip_model = create_model(model_name='ViT-L-14-336', img_size=512, device=device, pretrained='openai', require_pretrained=True)
-    clip_model.to(device)
     clip_model.eval()
+
+    # loading prompt learner
+    design_details = {
+        "Prompt_length": 4,
+        "learnabel_text_embedding_length": 4,
+        "learnabel_text_embedding_depth": 2,
+    }
+    prompt_learner = AnomalyCLIP_PromptLearner(clip_model.to("cpu"), design_details=design_details, classname="object")
+    prompt_learner.to(device)
+    prompt_learner.eval()
+    clip_model.to(device)
 
     # loading AD-DINOv3
     model = model_adapter(c_in=1024, device=device)
-    for i in range(100):
-        ckpt = f'./Result/ckpt/{i}.pth'
+    for i in range(10):
+        ckpt = f'{args.weight_path}/{i}.pth'
+        # ckpt = f'./checkpoint/ckpt/{i}.pth'
         model.patch_token_adapter.load_state_dict(torch.load(ckpt, map_location=device)['patch_token_adapter'])
         model.cls_token_adapter.load_state_dict(torch.load(ckpt, map_location=device)['cls_token_adapter'])
         model.prompt_adapter.load_state_dict(torch.load(ckpt, map_location=device)['prompt_adapter'])
+        prompt_learner.load_state_dict(torch.load(ckpt, map_location=device)['prompt_learner'])
         model.to(device)
         model.eval()
-        test(clip_model, f"{args.result_path}/{args.dataset}", i)
+        test(clip_model, prompt_learner, f"{args.result_path}/{args.dataset}", i)

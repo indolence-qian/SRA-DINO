@@ -1,0 +1,30 @@
+# Python cache
+__pycache__/
+*.pyc
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+.env/
+.venv/
+env/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 模型权重 / 大文件
+*.pt
+*.pth
+*.ckpt
+checkpoint/
+
+# 数据集 / 结果（按需选）
+TESTING_ALL/
+Datasets/
+results/
+logs/
+
+# IDE 配置
+.vscode/
+.idea/
