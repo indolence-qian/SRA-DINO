@@ -79,6 +79,17 @@ def train_epoch(optimizer, loss_focal, loss_dice, epoch, anomaly_awareness_loss_
         loss.requires_grad_(True)
         optimizer.zero_grad()
         loss.backward()
+        # no_grad = []
+        # has_grad = []
+        # for n, p in prompt_learner.named_parameters():
+        #     if p.requires_grad:
+        #         if p.grad is None:
+        #             no_grad.append(n)
+        #         else:
+        #             has_grad.append(n)
+
+        # print("HAS GRAD examples:", has_grad[:10])
+        # print("NO GRAD:", no_grad)
         optimizer.step()
         scheduler.step()
     return 
@@ -112,12 +123,14 @@ if __name__ == "__main__":
     clip_model = create_model(model_name='ViT-L-14-336', img_size=512, device=device, pretrained='openai', require_pretrained=True)
     
     clip_model.eval()
+    for p in clip_model.parameters():
+        p.requires_grad_(False)   # 冻结权重，但仍允许建立计算图
 
     # loading prompt learner
     design_details = {
         "Prompt_length": 4,
         "learnabel_text_embedding_length": 4,
-        "learnabel_text_embedding_depth": 2,
+        "learnabel_text_embedding_depth": 1, # 关闭 compound prompts
     }
     prompt_learner = AnomalyCLIP_PromptLearner(clip_model.to("cpu"), design_details=design_details, classname="object")
     prompt_learner.to(device)
@@ -131,14 +144,14 @@ if __name__ == "__main__":
 
     update_params = ['patch_token_adapter', 'cls_token_adapter', 'prompt_adapter']
     params_to_update = []
+    # add prompt learner parameters
+    params_to_update += list(prompt_learner.parameters())
+
     for name, param in model.named_parameters():
         for update_name in update_params:
             if update_name in name:
                 print(f"Learnable parameter: {name}")
                 params_to_update.append(param)
-
-    # add prompt learner parameters
-    params_to_update += list(prompt_learner.parameters())
 
     train_data = prepare_data(args.dataset, 'ALL', args, **kwargs)
 

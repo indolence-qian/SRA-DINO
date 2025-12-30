@@ -10,8 +10,8 @@ root_dir = "/Data"
 DATASET_REGISTRY = {
     "mvtec":       (mvtec.Dataset, mvtec.DatasetSplit, f"/home/kexin/hd1/Tate_qfg/data/mvtec"),
     "visa":        (visa.Dataset, visa.DatasetSplit, f"/home/kexin/hd1/Tate_qfg/data/VisA"),
-    "btad":        (btad.Dataset, btad.DatasetSplit, f"{root_dir}/Industrial_Dataset/BTAD/BTech_Dataset_transformed"),
-    "mpdd":        (mpdd.Dataset, mpdd.DatasetSplit, f"{root_dir}/Industrial_Dataset/MPDD"),
+    "btad":        (btad.Dataset, btad.DatasetSplit, f"/home/kexin/hd1/Tate_qfg/data/BTAD/BTech_Dataset_transformed"),
+    "mpdd":        (mpdd.Dataset, mpdd.DatasetSplit, f"/home/kexin/hd1/Tate_qfg/data/MPDD"),
     "tn3k":        (tn3k.Dataset, tn3k.DatasetSplit, f"{root_dir}/Medical_Dataset/TN3K"),
     "clinicdb":    (clinicdb.Dataset, clinicdb.DatasetSplit, f"{root_dir}/Medical_Dataset/CVC-ClinicDB"),
     "colondb":     (colondb.Dataset, colondb.DatasetSplit, f"{root_dir}/Medical_Dataset/CVC-ColonDB"),

@@ -102,7 +102,7 @@ if __name__ == "__main__":
     parser.add_argument("--result_path", type=str, default="./Result", help="path to result")
     parser.add_argument("--weight_path", type=str, default="./checkpoint/ckpt", help="path to weight")
     parser.add_argument("--device", type=str, default="cuda:0", help="device")
-    parser.add_argument("--batch_size", type=int, default=64, help="batch size")
+    parser.add_argument("--batch_size", type=int, default=32, help="batch size")
     parser.add_argument("--dataset", type=str, default="mvtec", help="dataset")
     args = parser.parse_args()
 

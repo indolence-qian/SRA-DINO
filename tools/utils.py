@@ -56,10 +56,11 @@ def get_anomaly_map(clip_model, image_info, device, model, Dino_model, prompt_le
 
     # textual branch
     text_feature = torch.zeros(len(image_path), 768, 2).to(device)
-    with torch.no_grad():
-        for i in range(len(image_path)):
-            # text_feature[i] = encode_text_with_prompt_ensemble(clip_model, image_path[i].split('/')[-4], device, '', y)
-            text_feature[i] = get_text_features_with_prompt_learner(clip_model=clip_model, prompt_learner=prompt_learner, device=device, adapter=None)  # shape: (768, 2)
+    for i in range(len(image_path)):
+        # 原版text_feature获取方式
+        # text_feature[i] = encode_text_with_prompt_ensemble(clip_model, image_path[i].split('/')[-4], device, '', y)
+        # 使用prompt learner获取text_feature
+        text_feature[i] = get_text_features_with_prompt_learner(clip_model=clip_model, prompt_learner=prompt_learner, device=device, adapter=None)  # shape: (768, 2)
     adjusted_feats_0 = []
     adjusted_feats_1 = []
     for i in range(len(image_path)):
