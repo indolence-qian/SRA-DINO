@@ -105,7 +105,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda:6", help="device")
     parser.add_argument("--batch_size", type=int, default=64, help="batch size")
     parser.add_argument("--dataset", type=str, default="visa", help="dataset")
-    parser.add_argument("--epoch", type=int, default=10, help="epoch")
+    parser.add_argument("--epoch", type=int, default=100, help="epoch")
     parser.add_argument("--lr", type=float, default=0.00001, help="lr")
     args = parser.parse_args()
 
@@ -142,16 +142,22 @@ if __name__ == "__main__":
     model.to(device)
     model.train()
 
-    update_params = ['patch_token_adapter', 'cls_token_adapter', 'prompt_adapter']
     params_to_update = []
-    # add prompt learner parameters
-    params_to_update += list(prompt_learner.parameters())
-
+    # 设置 adapter 需要更新的参数
+    adapter_update_params = ['patch_token_adapter', 'cls_token_adapter', 'prompt_adapter']
     for name, param in model.named_parameters():
-        for update_name in update_params:
+        print(f"Model parameter: {name}")
+        for update_name in adapter_update_params:
             if update_name in name:
-                print(f"Learnable parameter: {name}")
                 params_to_update.append(param)
+
+    # 设置 prompt learner 需要更新的参数
+    # params_to_update += list(prompt_learner.parameters())
+    prompt_update_params = ["ctx_pos", "ctx_neg"]   # 你想训练的字段名
+    for name, param in prompt_learner.named_parameters():
+        print(f"PromptLearner parameter: {name}")
+        if any(k in name for k in prompt_update_params):
+            params_to_update.append(param)
 
     train_data = prepare_data(args.dataset, 'ALL', args, **kwargs)
 

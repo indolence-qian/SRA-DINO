@@ -124,7 +124,7 @@ if __name__ == "__main__":
     design_details = {
         "Prompt_length": 4,
         "learnabel_text_embedding_length": 4,
-        "learnabel_text_embedding_depth": 2,
+        "learnabel_text_embedding_depth": 1,
     }
     prompt_learner = AnomalyCLIP_PromptLearner(clip_model.to("cpu"), design_details=design_details, classname="object")
     prompt_learner.to(device)
@@ -133,7 +133,7 @@ if __name__ == "__main__":
 
     # loading AD-DINOv3
     model = model_adapter(c_in=1024, device=device)
-    for i in range(10):
+    for i in range(100):
         ckpt = f'{args.weight_path}/{i}.pth'
         # ckpt = f'./checkpoint/ckpt/{i}.pth'
         model.patch_token_adapter.load_state_dict(torch.load(ckpt, map_location=device)['patch_token_adapter'])
