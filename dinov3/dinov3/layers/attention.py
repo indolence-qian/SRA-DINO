@@ -67,6 +67,14 @@ class SelfAttention(nn.Module):
         # All operations will use the dtype of rope, the output is cast back to the dtype of q and k
         q_dtype = q.dtype
         k_dtype = k.dtype
+        # --- add this before "sin, cos = rope" ---
+        if rope is not None:
+            # 常见异常情况：rope 被包成 [(sin, cos)] 或 ((sin, cos),)
+            if isinstance(rope, (list, tuple)) and len(rope) == 1:
+                inner = rope[0]
+                if isinstance(inner, (list, tuple)) and len(inner) == 2:
+                    rope = inner
+        # ----------------------------------------
         sin, cos = rope
         rope_dtype = sin.dtype
         q = q.to(dtype=rope_dtype)

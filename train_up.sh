@@ -6,13 +6,17 @@ set -e  # 只要有一条命令报错就退出脚本，避免训练失败还继�
 
 # 1) 日志目录与文件名
 LOG_DIR="./logs"              # 改成你希望保存的目录
+# TRICK_NAME="base"  # 改成你希望的trick名称
 TRICK_NAME="learnablePrompt"  # 改成你希望的trick名称
+EPOCH=15
+BS=16
+DIS="对比实验clip"
 mkdir -p "$LOG_DIR"
 
 # 用脚本名 + 时间戳，避免覆盖
 SCRIPT_NAME="$(basename "$0" .sh)"
 TS="$(date +'%Y%m%d_%H%M%S')"
-LOG_FILE="${LOG_DIR}/${TRICK_NAME}/${SCRIPT_NAME}_${TS}.log"
+LOG_FILE="${LOG_DIR}/${TRICK_NAME}/${SCRIPT_NAME}_${TS}_${DIS}.log"
 
 # 2) 把标准输出/错误都重定向到日志（追加写入用 >>，覆盖用 >）
 exec >>"$LOG_FILE" 2>&1
@@ -28,13 +32,24 @@ TRAIN_DATASET="visa"
 
 echo "===== Start Training on ${TRAIN_DATASET} ====="
 echo "Results will be saved to ${RESULT_PATH}"
-python train.py \
+python train_up.py \
   --result_path "${RESULT_PATH}" \
   --device "${DEVICE}" \
-  --dataset "${TRAIN_DATASET}"
+  --epoch "${EPOCH}" \
+  --batch_size "${BS}" \
+  --dataset "${TRAIN_DATASET}" \
+  --visual_backbone clip
 
 echo "===== Training Finished ====="
 
+# ====== 画 loss ======
+LOSS_FILE="${RESULT_PATH}/loss.txt"
+if [ -f "${LOSS_FILE}" ]; then
+  echo "===== Plot Loss: ${LOSS_FILE} ====="
+  python plot_loss.py --path "${LOSS_FILE}"
+else
+  echo "[WARN] loss file not found: ${LOSS_FILE}"
+fi
 
 # ====== 测试部分 ======
 declare -a DATASETS=("mvtec" "btad" "mpdd")
@@ -42,7 +57,7 @@ SAVE_PATH="./TESTING_ALL/${TRICK_NAME}/${TS}"
 
 for ds in "${DATASETS[@]}"; do
   echo "===== Start Testing on ${ds} ====="
-  python test.py \
+  python test2.py \
     --result_path "${SAVE_PATH}" \
     --weight_path "${RESULT_PATH}/ckpt" \
     --device "${DEVICE}" \
@@ -50,4 +65,19 @@ for ds in "${DATASETS[@]}"; do
   echo "===== Testing on ${ds} Done ====="
 done
 
+# ====== 画各数据集 metric ======
+for ds in "${DATASETS[@]}"; do
+  METRIC_FILE="${SAVE_PATH}/${ds}/metric.txt"
+  if [ -f "${METRIC_FILE}" ]; then
+    echo "===== Plot Metric: ${METRIC_FILE} ====="
+    python plot_metric.py --path "${METRIC_FILE}"
+  else
+    echo "[WARN] metric file not found: ${METRIC_FILE}"
+  fi
+done
+
+# ===== 汇总数据 ====
+SUMMARIZE_METRICS="${TRICK_NAME}/${TS}"
+echo "===== Plot SUMMARIZE_Metric: ${SUMMARIZE_METRICS} ====="
+python summarize_metrics.py --path "${SUMMARIZE_METRICS}"
 echo "===== ALL DONE ====="

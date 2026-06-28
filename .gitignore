@@ -28,3 +28,7 @@ logs/
 # IDE 配置
 .vscode/
 .idea/
+
+data/
+nohup*.out
+dev.ipynb

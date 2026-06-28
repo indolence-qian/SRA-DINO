@@ -13,6 +13,7 @@ import argparse
 from tools.utils import get_anomaly_map
 from tools.visualization import visualization
 from Datasets import DATASET_REGISTRY, DATASET_CLASSES
+from tools.bottleneckAdapter import install_bottleneck_adapters_into_dino
 
 from tools.promptLearner import AnomalyCLIP_PromptLearner
 
@@ -49,6 +50,7 @@ def prepare_data(dataset_name, category, args, **kwargs):
 def test(clip_model, prompt_learner ,result_path, epoch):
     AUROC = []
     F1 = []
+    idx = 0
     print(f"--------------------------------------Testing epoch {epoch}--------------------------------------")
     for category in sorted(DATASET_CLASSES[args.dataset]):
         os.makedirs(result_path + f"/{category}", exist_ok=True)
@@ -58,9 +60,10 @@ def test(clip_model, prompt_learner ,result_path, epoch):
         image_gt = []
         img_list = []
         test_data = prepare_data(args.dataset, category, args, **kwargs)
-
+    
         for image_info in tqdm(test_data):
-            _, mask, anomaly_map_cross_modal, _ = get_anomaly_map(clip_model, image_info, device, model, Dino_model, prompt_learner)
+            with torch.inference_mode(): # 关闭梯度回传，节省显存
+                _, mask, anomaly_map_cross_modal, _ = get_anomaly_map(clip_model, image_info, device, model, Dino_model, prompt_learner,idx)
             pixel_gt.extend(mask.squeeze(1).cpu().detach().numpy())
             img_list.extend(image_info["image_path"])
             pixel_pred.extend(anomaly_map_cross_modal[:, 1, :, :].cpu().detach().numpy())
@@ -102,7 +105,7 @@ if __name__ == "__main__":
     parser.add_argument("--result_path", type=str, default="./Result", help="path to result")
     parser.add_argument("--weight_path", type=str, default="./checkpoint/ckpt", help="path to weight")
     parser.add_argument("--device", type=str, default="cuda:0", help="device")
-    parser.add_argument("--batch_size", type=int, default=32, help="batch size")
+    parser.add_argument("--batch_size", type=int, default=64, help="batch size")
     parser.add_argument("--dataset", type=str, default="mvtec", help="dataset")
     args = parser.parse_args()
 
@@ -113,8 +116,14 @@ if __name__ == "__main__":
     repo_dir = './dinov3'
     Dinov3_model_path = './dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth'
     Dino_model = torch.hub.load(repo_dir, 'dinov3_vitl16', source = 'local', weights = Dinov3_model_path)
+    # install dino adapters (must match training setting)
+    dino_adapters, dino_handles = install_bottleneck_adapters_into_dino(
+        Dino_model, layers=(5, 11, 17, 23), bottleneck=256
+    )
+
     Dino_model.to(device)
     Dino_model.eval()
+    dino_adapters.eval()
 
     # loading clip
     clip_model = create_model(model_name='ViT-L-14-336', img_size=512, device=device, pretrained='openai', require_pretrained=True)
@@ -122,7 +131,7 @@ if __name__ == "__main__":
 
     # loading prompt learner
     design_details = {
-        "Prompt_length": 4,
+        "Prompt_length": 28,
         "learnabel_text_embedding_length": 4,
         "learnabel_text_embedding_depth": 1,
     }
@@ -134,12 +143,19 @@ if __name__ == "__main__":
     # loading AD-DINOv3
     model = model_adapter(c_in=1024, device=device)
     for i in range(100):
-        ckpt = f'{args.weight_path}/{i}.pth'
+        ckpt = f'{args.weight_path}/epoch_{i}.pth'
+        
+        # 如果第 i 个不存在，就结束当前数据集测试（正常退出，不报错）
+        if not os.path.isfile(ckpt):
+            print(f"[Info] checkpoint not found: {ckpt}. Stop testing at epoch {i-1}.")
+            break
+        
         # ckpt = f'./checkpoint/ckpt/{i}.pth'
         model.patch_token_adapter.load_state_dict(torch.load(ckpt, map_location=device)['patch_token_adapter'])
         model.cls_token_adapter.load_state_dict(torch.load(ckpt, map_location=device)['cls_token_adapter'])
         model.prompt_adapter.load_state_dict(torch.load(ckpt, map_location=device)['prompt_adapter'])
         prompt_learner.load_state_dict(torch.load(ckpt, map_location=device)['prompt_learner'])
+        dino_adapters.load_state_dict(torch.load(ckpt, map_location=device)['dino_adapters'])
         model.to(device)
         model.eval()
         test(clip_model, prompt_learner, f"{args.result_path}/{args.dataset}", i)
