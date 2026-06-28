@@ -415,3 +415,49 @@ class MARAAgent(nn.Module):
             "mean_quality": quality_steps[-1].mean().detach(),
             "mean_reward": rewards.sum(dim=1).mean().detach(),
         }
+
+    def infer(
+        self,
+        base_prob: torch.Tensor,
+        base_logits: torch.Tensor,
+        layer_maps: Optional[torch.Tensor] = None,
+        sample: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """Run deterministic MARA refinement for evaluation without using labels or masks."""
+        cfg = self.cfg
+        out_hw = base_prob.shape[-2:]
+
+        base_prob_lr = _resize_map(base_prob, cfg.map_size)
+        if layer_maps is None:
+            layer_maps_lr = base_prob_lr[:, 1:2].repeat(1, cfg.num_layers, 1, 1)
+        else:
+            layer_maps_lr = _resize_map(layer_maps, cfg.map_size)
+            if layer_maps_lr.shape[1] != cfg.num_layers:
+                raise ValueError(f"Expected {cfg.num_layers} layer maps, got {layer_maps_lr.shape[1]}.")
+
+        current_logits = _prob_to_logits(base_prob_lr)
+        current_prob = base_prob_lr
+        global_logits = base_logits
+        active = torch.ones(current_prob.shape[0], device=current_prob.device, dtype=torch.bool)
+
+        for step_idx in range(cfg.max_steps):
+            state = self._make_state(current_prob, base_prob_lr, layer_maps_lr, step_idx)
+            policy_out = self._policy(state, global_logits, active, step_idx, sample=sample)
+            current_logits, current_prob, global_logits, active = self._refine(
+                current_logits=current_logits,
+                current_prob=current_prob,
+                global_logits=global_logits,
+                state=state,
+                layer_maps=layer_maps_lr,
+                policy_out=policy_out,
+                active=active,
+            )
+
+        final_prob = _resize_map(current_prob, out_hw[0])
+        if final_prob.shape[-2:] != out_hw:
+            final_prob = F.interpolate(final_prob, size=out_hw, mode="bilinear", align_corners=False)
+
+        return {
+            "final_prob": final_prob,
+            "final_logits": global_logits,
+        }
