@@ -27,6 +27,7 @@ class MARAConfig:
     reward_conf_weight: float = 0.1
     reward_fp_weight: float = 0.2
     delta_scale: float = 1.0
+    force_first_refine: bool = False
 
 
 def _resize_map(x: torch.Tensor, size: int, mode: str = "bilinear") -> torch.Tensor:
@@ -194,6 +195,10 @@ class MARAAgent(nn.Module):
             nn.Flatten(),
             nn.Linear(cfg.hidden_dim, 1),
         )
+        nn.init.zeros_(self.delta_head.weight)
+        nn.init.zeros_(self.delta_head.bias)
+        nn.init.zeros_(self.score_head[-1].weight)
+        nn.init.zeros_(self.score_head[-1].bias)
 
     def _make_state(
         self,
@@ -249,7 +254,7 @@ class MARAAgent(nn.Module):
         global_features = self.global_head(torch.cat([pooled, image_prob, step_feat, active_feat], dim=1))
         layer_logits = self.layer_head(global_features)
         op_logits = self.op_head(global_features)
-        if step_idx == 0:
+        if step_idx == 0 and cfg.force_first_refine:
             op_logits = op_logits.clone()
             op_logits[:, 0] = -1e4
 

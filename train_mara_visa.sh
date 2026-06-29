@@ -13,6 +13,7 @@ set -euo pipefail
 TRICK_NAME="${TRICK_NAME:-mara_grpo}"
 DATASET="${DATASET:-visa}"
 HFA_SETTING="${HFA_SETTING:-hfa3}"
+VISUAL_LAYERS="${VISUAL_LAYERS:-5,11,17,23}"
 DEVICE="${DEVICE:-cuda:0}"
 
 BASE_EPOCH="${BASE_EPOCH:-15}"
@@ -21,6 +22,8 @@ MARA_EPOCH="${MARA_EPOCH:-30}"
 MARA_BS="${MARA_BS:-4}"
 GRPO_GROUP_SIZE="${GRPO_GROUP_SIZE:-4}"
 MARA_STEPS="${MARA_STEPS:-3}"
+MARA_DELTA_SCALE="${MARA_DELTA_SCALE:-0.25}"
+W_BASE_CONSISTENCY="${W_BASE_CONSISTENCY:-0.05}"
 
 RUN_BASE="${RUN_BASE:-1}"
 RUN_MARA="${RUN_MARA:-1}"
@@ -35,7 +38,7 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 
 echo "[$(date +'%F %T')] Start MARA training pipeline"
 echo "Log: ${LOG_FILE}"
-echo "Dataset=${DATASET}, Device=${DEVICE}, HFA=${HFA_SETTING}"
+echo "Dataset=${DATASET}, Device=${DEVICE}, HFA=${HFA_SETTING}, visual_layers=${VISUAL_LAYERS}"
 
 BASE_RESULT_PATH="./checkpoint/base_${DATASET}_${HFA_SETTING}_${TS}"
 MARA_RESULT_PATH="./checkpoint/mara_${DATASET}_${HFA_SETTING}_${TS}"
@@ -78,9 +81,12 @@ if [[ "${RUN_MARA}" == "1" ]]; then
     --batch_size "${MARA_BS}" \
     --epoch "${MARA_EPOCH}" \
     --visual_backbone dino \
-    --visual_layers 5,11,17,23 \
+    --visual_layers "${VISUAL_LAYERS}" \
+    --hfa_setting "${HFA_SETTING}" \
     --mara_steps "${MARA_STEPS}" \
-    --grpo_group_size "${GRPO_GROUP_SIZE}"
+    --grpo_group_size "${GRPO_GROUP_SIZE}" \
+    --mara_delta_scale "${MARA_DELTA_SCALE}" \
+    --w_base_consistency "${W_BASE_CONSISTENCY}"
 fi
 
 echo "===== Pipeline finished ====="

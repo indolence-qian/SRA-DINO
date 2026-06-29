@@ -13,12 +13,17 @@ from Datasets import DATASET_CLASSES, DATASET_REGISTRY
 from tools.mara_agent import MARAAgent, MARAConfig
 from tools.utils_up import get_anomaly_map
 from tools.visualization import visualization
-from train_mara import layer_maps_from_debug
+from train_mara import (
+    HFA_CHOICES,
+    apply_base_runtime_config,
+    create_visual_backbone_for_mara,
+    layer_maps_from_debug,
+    normalize_layers_obj,
+)
 from train_up import (
     create_adapter_model,
     create_clip_model,
     create_prompt_learner,
-    create_visual_backbone_for_name,
     parse_visual_layers,
     set_seed,
 )
@@ -88,17 +93,22 @@ def config_from_payload(payload: Dict, args) -> MARAConfig:
 
 
 def apply_payload_runtime_config(payload: Dict, args) -> None:
-    if "visual_backbone" in payload:
-        args.visual_backbone = payload["visual_backbone"]
-    if "visual_layers" in payload:
-        args.visual_layers = tuple(int(x) for x in payload["visual_layers"])
+    apply_base_runtime_config(args, payload)
 
 
 def build_models_from_checkpoint(args, device: torch.device, payload: Dict):
     apply_payload_runtime_config(payload, args)
+    print(
+        "Runtime config: "
+        f"visual_backbone={args.visual_backbone}, "
+        f"visual_layers={args.visual_layers}, "
+        f"hfa_setting={args.hfa_setting_runtime}, "
+        f"hfa_layers={args.hfa_layers_runtime}, "
+        f"hfa_bottleneck={args.hfa_bottleneck_runtime}"
+    )
     clip_model = create_clip_model(args, device)
     prompt_learner = create_prompt_learner(clip_model, device)
-    dino_model, dino_adapters = create_visual_backbone_for_name(args, device, args.visual_backbone)
+    dino_model, dino_adapters = create_visual_backbone_for_mara(args, device)
     model = create_adapter_model(clip_model, device, args.visual_backbone)
     mara_agent = MARAAgent(config_from_payload(payload, args)).to(device)
 
@@ -129,7 +139,7 @@ def load_mara_checkpoint(
     if "prompt_learner" in payload:
         prompt_learner.load_state_dict(payload["prompt_learner"], strict=False)
     if dino_adapters is not None and "dino_adapters" in payload:
-        dino_adapters.load_state_dict(payload["dino_adapters"], strict=False)
+        dino_adapters.load_state_dict(payload["dino_adapters"], strict=True)
     mara_agent.load_state_dict(payload["mara_agent"], strict=True)
 
     model.to(device).eval()
@@ -137,6 +147,16 @@ def load_mara_checkpoint(
     mara_agent.to(device).eval()
     if dino_adapters is not None:
         dino_adapters.to(device).eval()
+
+
+def compute_metrics(gt_masks: np.ndarray, pred_eval: np.ndarray, args) -> Dict[str, float]:
+    image_gt, image_pred = compute_image_level_scores(gt_masks, pred_eval)
+    return {
+        "F1": compute_best_f1(gt_masks, pred_eval),
+        "I_AUROC": compute_i_auroc(image_gt, image_pred),
+        "P_AUROC": compute_p_auroc(gt_masks, pred_eval),
+        "PRO": compute_pro(gt_masks, pred_eval, num_th=args.pro_num_th, max_fpr=args.pro_max_fpr),
+    }
 
 
 def evaluate_category(
@@ -150,7 +170,8 @@ def evaluate_category(
     device: torch.device,
     result_dir: str,
 ):
-    pred_maps = []
+    base_maps = []
+    mara_maps = []
     gt_masks = []
     img_paths = []
 
@@ -183,63 +204,73 @@ def evaluate_category(
                 sample=args.sample_policy,
             )
 
-            pred_maps.append(output["final_prob"][:, 1].detach().cpu().numpy())
+            base_maps.append(base_map[:, 1].detach().cpu().numpy())
+            mara_maps.append(output["final_prob"][:, 1].detach().cpu().numpy())
             mask_np = mask[:, 0].detach().cpu().numpy() if mask.dim() == 4 else mask.detach().cpu().numpy()
             gt_masks.append((mask_np > 0.5).astype(np.uint8))
             img_paths.extend(list(image_info["image_path"]))
 
-    pred_maps = np.concatenate(pred_maps, axis=0).astype(np.float32)
+    base_maps = np.concatenate(base_maps, axis=0).astype(np.float32)
+    mara_maps = np.concatenate(mara_maps, axis=0).astype(np.float32)
     gt_masks = np.concatenate(gt_masks, axis=0).astype(np.uint8)
-    pred_eval = normalize_maps(pred_maps, mode=args.norm_mode)
+    base_eval = normalize_maps(base_maps, mode=args.norm_mode)
+    mara_eval = normalize_maps(mara_maps, mode=args.norm_mode)
 
     if args.save_vis:
         vis_dir = os.path.join(result_dir, "visualization")
         os.makedirs(vis_dir, exist_ok=True)
-        visualization(img_paths, normalize_maps(pred_maps, mode="per_class"), gt_masks, category, vis_dir)
+        visualization(img_paths, normalize_maps(mara_maps, mode="per_class"), gt_masks, category, vis_dir)
 
-    image_gt, image_pred = compute_image_level_scores(gt_masks, pred_eval)
-    return {
-        "category": category,
-        "F1": compute_best_f1(gt_masks, pred_eval),
-        "I_AUROC": compute_i_auroc(image_gt, image_pred),
-        "P_AUROC": compute_p_auroc(gt_masks, pred_eval),
-        "PRO": compute_pro(gt_masks, pred_eval, num_th=args.pro_num_th, max_fpr=args.pro_max_fpr),
-    }
+    base_metrics = compute_metrics(gt_masks, base_eval, args)
+    mara_metrics = compute_metrics(gt_masks, mara_eval, args)
+    row = {"category": category}
+    for metric_name in ("F1", "I_AUROC", "P_AUROC", "PRO"):
+        row[f"base_{metric_name}"] = base_metrics[metric_name]
+        row[f"mara_{metric_name}"] = mara_metrics[metric_name]
+        row[f"delta_{metric_name}"] = mara_metrics[metric_name] - base_metrics[metric_name]
+    return row
 
 
 def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
     os.makedirs(result_dir, exist_ok=True)
-    means = {
-        "epoch": epoch_name,
-        "mean_F1": float(np.mean([r["F1"] for r in rows])),
-        "mean_I_AUROC": float(np.mean([r["I_AUROC"] for r in rows])),
-        "mean_P_AUROC": float(np.mean([r["P_AUROC"] for r in rows])),
-        "mean_PRO": float(np.mean([r["PRO"] for r in rows])),
-    }
+    metric_names = ("F1", "I_AUROC", "P_AUROC", "PRO")
+    means = {"epoch": epoch_name}
+    for prefix in ("base", "mara", "delta"):
+        for metric_name in metric_names:
+            means[f"mean_{prefix}_{metric_name}"] = float(np.mean([r[f"{prefix}_{metric_name}"] for r in rows]))
 
     metric_file = os.path.join(result_dir, "metric_mara.txt")
     with open(metric_file, "a", encoding="utf-8") as f:
         f.write(f"----------MARA epoch {epoch_name}----------\n")
-        f.write(f"{'Classname':<18s}{'F1':>10s}{'I-AUROC':>12s}{'P-AUROC':>12s}{'PRO':>10s}\n")
+        f.write(
+            f"{'Classname':<18s}"
+            f"{'Base_PRO':>10s}{'MARA_PRO':>10s}{'D_PRO':>10s}"
+            f"{'Base_F1':>10s}{'MARA_F1':>10s}{'D_F1':>10s}"
+            f"{'Base_P-AUC':>12s}{'MARA_P-AUC':>12s}{'D_P-AUC':>10s}"
+            f"{'Base_I-AUC':>12s}{'MARA_I-AUC':>12s}{'D_I-AUC':>10s}\n"
+        )
         for row in rows:
             f.write(
                 f"{row['category']:<18s}"
-                f"{row['F1']:>10.5f}"
-                f"{row['I_AUROC']:>12.5f}"
-                f"{row['P_AUROC']:>12.5f}"
-                f"{row['PRO']:>10.5f}\n"
+                f"{row['base_PRO']:>10.5f}{row['mara_PRO']:>10.5f}{row['delta_PRO']:>10.5f}"
+                f"{row['base_F1']:>10.5f}{row['mara_F1']:>10.5f}{row['delta_F1']:>10.5f}"
+                f"{row['base_P_AUROC']:>12.5f}{row['mara_P_AUROC']:>12.5f}{row['delta_P_AUROC']:>10.5f}"
+                f"{row['base_I_AUROC']:>12.5f}{row['mara_I_AUROC']:>12.5f}{row['delta_I_AUROC']:>10.5f}\n"
             )
         f.write(
             f"{'Mean':<18s}"
-            f"{means['mean_F1']:>10.5f}"
-            f"{means['mean_I_AUROC']:>12.5f}"
-            f"{means['mean_P_AUROC']:>12.5f}"
-            f"{means['mean_PRO']:>10.5f}\n\n"
+            f"{means['mean_base_PRO']:>10.5f}{means['mean_mara_PRO']:>10.5f}{means['mean_delta_PRO']:>10.5f}"
+            f"{means['mean_base_F1']:>10.5f}{means['mean_mara_F1']:>10.5f}{means['mean_delta_F1']:>10.5f}"
+            f"{means['mean_base_P_AUROC']:>12.5f}{means['mean_mara_P_AUROC']:>12.5f}{means['mean_delta_P_AUROC']:>10.5f}"
+            f"{means['mean_base_I_AUROC']:>12.5f}{means['mean_mara_I_AUROC']:>12.5f}{means['mean_delta_I_AUROC']:>10.5f}\n\n"
         )
 
     csv_file = os.path.join(result_dir, f"{epoch_name}_mara_metrics.csv")
     with open(csv_file, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["category", "F1", "I_AUROC", "P_AUROC", "PRO"])
+        fieldnames = ["category"]
+        for metric_name in metric_names:
+            fieldnames.extend([f"base_{metric_name}", f"mara_{metric_name}", f"delta_{metric_name}"])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
     return means
@@ -260,6 +291,8 @@ def main():
     parser.add_argument("--visual_backbone", type=str, default="dino", choices=["dino", "clip"])
     parser.add_argument("--visual_layers", type=parse_visual_layers, default=(5, 11, 17, 23))
     parser.add_argument("--text_source", type=str, default="prompt_learner", choices=["prompt_learner", "ensemble"])
+    parser.add_argument("--hfa_setting", type=str, default="hfa4", choices=HFA_CHOICES)
+    parser.add_argument("--hfa_layers", type=str, default="", help="optional comma-separated HFA adapter layers")
 
     parser.add_argument("--clip_model_name", type=str, default="ViT-L-14-336")
     parser.add_argument("--clip_pretrained", type=str, default="openai")
@@ -267,6 +300,7 @@ def main():
     parser.add_argument("--dino_model_name", type=str, default="dinov3_vitl16")
     parser.add_argument("--dino_weights", type=str, default="./dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth")
     parser.add_argument("--dino_bottleneck", type=int, default=256)
+    parser.add_argument("--hfa_bottleneck", type=int, default=None, help="alias for DINO adapter bottleneck fallback")
 
     parser.add_argument("--mara_steps", type=int, default=3)
     parser.add_argument("--mara_map_size", type=int, default=128)
@@ -304,6 +338,12 @@ def main():
     for ckpt_path in ckpts:
         epoch_name = Path(ckpt_path).stem
         payload = torch.load(ckpt_path, map_location=device)
+        cur_hfa_layers = normalize_layers_obj(payload.get("hfa_layers"))
+        if cur_hfa_layers and tuple(cur_hfa_layers) != tuple(args.hfa_layers_runtime):
+            raise ValueError(
+                f"HFA layer mismatch across MARA checkpoints. "
+                f"Runtime layers={args.hfa_layers_runtime}, but {ckpt_path} uses {cur_hfa_layers}."
+            )
         load_mara_checkpoint(
             ckpt_path=ckpt_path,
             payload=payload,
@@ -332,26 +372,37 @@ def main():
         summary["ckpt_path"] = ckpt_path
         summaries.append(summary)
         print(
-            f"MARA {epoch_name}: F1={summary['mean_F1']:.5f}, "
-            f"I-AUROC={summary['mean_I_AUROC']:.5f}, "
-            f"P-AUROC={summary['mean_P_AUROC']:.5f}, PRO={summary['mean_PRO']:.5f}"
+            f"MARA {epoch_name}: "
+            f"PRO base={summary['mean_base_PRO']:.5f}, "
+            f"mara={summary['mean_mara_PRO']:.5f}, "
+            f"delta={summary['mean_delta_PRO']:.5f} | "
+            f"F1 base={summary['mean_base_F1']:.5f}, "
+            f"mara={summary['mean_mara_F1']:.5f}, "
+            f"delta={summary['mean_delta_F1']:.5f}"
         )
 
     ranking_file = os.path.join(dataset_result_dir, "mara_epoch_ranking.csv")
     with open(ranking_file, "w", newline="", encoding="utf-8") as f:
+        metric_names = ("F1", "I_AUROC", "P_AUROC", "PRO")
+        fieldnames = ["epoch"]
+        for prefix in ("base", "mara", "delta"):
+            fieldnames.extend([f"mean_{prefix}_{metric_name}" for metric_name in metric_names])
+        fieldnames.append("ckpt_path")
         writer = csv.DictWriter(
             f,
-            fieldnames=["epoch", "mean_F1", "mean_I_AUROC", "mean_P_AUROC", "mean_PRO", "ckpt_path"],
+            fieldnames=fieldnames,
         )
         writer.writeheader()
         writer.writerows(summaries)
 
-    best = max(summaries, key=lambda x: x["mean_PRO"])
+    best = max(summaries, key=lambda x: x["mean_mara_PRO"])
     print("=" * 60)
     print(
         f"Best MARA checkpoint by mean_PRO: {best['epoch']} | "
-        f"F1={best['mean_F1']:.5f}, I-AUROC={best['mean_I_AUROC']:.5f}, "
-        f"P-AUROC={best['mean_P_AUROC']:.5f}, PRO={best['mean_PRO']:.5f}"
+        f"Base_PRO={best['mean_base_PRO']:.5f}, "
+        f"MARA_PRO={best['mean_mara_PRO']:.5f}, "
+        f"Delta_PRO={best['mean_delta_PRO']:.5f}, "
+        f"MARA_F1={best['mean_mara_F1']:.5f}"
     )
     print(f"Best checkpoint file: {best['ckpt_path']}")
 
