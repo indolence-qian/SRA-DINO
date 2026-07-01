@@ -332,7 +332,7 @@ class MARAAgent(nn.Module):
         proposal_prob = torch.softmax(proposal_logits, dim=1)
         next_prob = base_prob * (1.0 - next_cumulative_gate) + proposal_prob * next_cumulative_gate
 
-        gate_scalar = next_cumulative_gate.flatten(1).amax(dim=1).values
+        gate_scalar = next_cumulative_gate.flatten(1).amax(dim=1)
         delta_score = self.score_head(hidden).squeeze(1) * refine_gate * gate_scalar
         proposal_global_logits = global_logits + torch.stack([-delta_score, delta_score], dim=1)
         next_global_logits = base_logits * (1.0 - gate_scalar.unsqueeze(1)) + proposal_global_logits * gate_scalar.unsqueeze(1)
