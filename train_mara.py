@@ -188,6 +188,11 @@ def build_mara_config(args) -> MARAConfig:
         reward_fp_weight=args.reward_fp_weight,
         delta_scale=args.mara_delta_scale,
         force_first_refine=args.force_first_refine,
+        base_anchor_margin=args.base_anchor_margin,
+        negative_advantage_scale=args.negative_advantage_scale,
+        advantage_clip=args.advantage_clip,
+        gate_max=args.mara_gate_max,
+        gate_init_bias=args.mara_gate_init_bias,
     )
 
 
@@ -250,8 +255,10 @@ def train_one_epoch(
         "consistency": [],
         "grpo": [],
         "entropy": [],
+        "gate": [],
         "reward": [],
         "quality": [],
+        "gain": [],
     }
 
     for idx, image_info in enumerate(train_loader):
@@ -314,7 +321,13 @@ def train_one_epoch(
 
         grpo_loss = rollout["policy_loss"]
         entropy = rollout["entropy"]
-        total_loss = sup_loss + args.w_grpo * grpo_loss - args.entropy_coef * entropy
+        gate_loss = rollout["gate_l1"]
+        total_loss = (
+            sup_loss
+            + args.w_grpo * grpo_loss
+            + args.w_gate_sparse * gate_loss
+            - args.entropy_coef * entropy
+        )
 
         optimizer.zero_grad()
         total_loss.backward()
@@ -330,16 +343,19 @@ def train_one_epoch(
         meters["consistency"].append(float(consistency_loss.item()))
         meters["grpo"].append(float(grpo_loss.item()))
         meters["entropy"].append(float(entropy.item()))
+        meters["gate"].append(float(gate_loss.item()))
         meters["reward"].append(float(rollout["mean_reward"].item()))
         meters["quality"].append(float(rollout["mean_quality"].item()))
+        meters["gain"].append(float(rollout["mean_quality_gain"].item()))
 
         print(
             f"Epoch {epoch + 1}/{args.epoch} | Batch {idx + 1}/{len(train_loader)} "
             f"| loss {meters['loss'][-1]:.4f} | sup {meters['sup'][-1]:.4f} "
             f"| seg {meters['seg'][-1]:.4f} | global {meters['global'][-1]:.4f} "
             f"| cons {meters['consistency'][-1]:.4f} "
-            f"| grpo {meters['grpo'][-1]:.4f} | entropy {meters['entropy'][-1]:.4f} "
-            f"| reward {meters['reward'][-1]:.4f} | quality {meters['quality'][-1]:.4f}",
+            f"| grpo {meters['grpo'][-1]:.4f} | gate {meters['gate'][-1]:.4f} "
+            f"| entropy {meters['entropy'][-1]:.4f} | reward {meters['reward'][-1]:.4f} "
+            f"| gain {meters['gain'][-1]:.4f} | quality {meters['quality'][-1]:.4f}",
             end="\r",
             flush=True,
         )
@@ -443,15 +459,19 @@ def run_train(args) -> None:
                 f"global={meters['global']:.6f}\t"
                 f"consistency={meters['consistency']:.6f}\t"
                 f"grpo={meters['grpo']:.6f}\t"
+                f"gate={meters['gate']:.6f}\t"
                 f"entropy={meters['entropy']:.6f}\t"
                 f"reward={meters['reward']:.6f}\t"
+                f"gain={meters['gain']:.6f}\t"
                 f"quality={meters['quality']:.6f}\n"
             )
 
         print(
             f"epoch_{epoch}: loss={meters['loss']:.6f}, sup={meters['sup']:.6f}, "
-            f"consistency={meters['consistency']:.6f}, grpo={meters['grpo']:.6f}, reward={meters['reward']:.6f}, "
-            f"quality={meters['quality']:.6f}, time={time.time() - start:.2f}s, ckpt={ckpt_path}"
+            f"consistency={meters['consistency']:.6f}, grpo={meters['grpo']:.6f}, "
+            f"gate={meters['gate']:.6f}, reward={meters['reward']:.6f}, "
+            f"gain={meters['gain']:.6f}, quality={meters['quality']:.6f}, "
+            f"time={time.time() - start:.2f}s, ckpt={ckpt_path}"
         )
 
 
@@ -489,6 +509,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mara_roi_size", type=int, default=32)
     parser.add_argument("--mara_hidden_dim", type=int, default=64)
     parser.add_argument("--mara_delta_scale", type=float, default=0.25)
+    parser.add_argument("--mara_gate_max", type=float, default=0.35)
+    parser.add_argument("--mara_gate_init_bias", type=float, default=-4.0)
     parser.add_argument("--force_first_refine", action="store_true")
     parser.add_argument("--mara_lr", type=float, default=1e-4)
     parser.add_argument("--mara_weight_decay", type=float, default=1e-4)
@@ -497,6 +519,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--grpo_gamma", type=float, default=0.95)
     parser.add_argument("--grpo_clip_eps", type=float, default=0.2)
+    parser.add_argument("--base_anchor_margin", type=float, default=0.0)
+    parser.add_argument("--negative_advantage_scale", type=float, default=1.0)
+    parser.add_argument("--advantage_clip", type=float, default=5.0)
     parser.add_argument("--entropy_coef", type=float, default=0.01)
     parser.add_argument("--reward_cls_weight", type=float, default=0.5)
     parser.add_argument("--reward_loc_weight", type=float, default=1.0)
@@ -507,6 +532,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--w_global", type=float, default=0.3)
     parser.add_argument("--w_base_consistency", type=float, default=0.05)
     parser.add_argument("--w_grpo", type=float, default=0.1)
+    parser.add_argument("--w_gate_sparse", type=float, default=0.02)
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--min_lr_ratio", type=float, default=0.05)
     parser.add_argument("--grad_clip", type=float, default=1.0)

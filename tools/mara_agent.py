@@ -28,6 +28,11 @@ class MARAConfig:
     reward_fp_weight: float = 0.2
     delta_scale: float = 1.0
     force_first_refine: bool = False
+    base_anchor_margin: float = 0.0
+    negative_advantage_scale: float = 1.0
+    advantage_clip: float = 5.0
+    gate_max: float = 0.35
+    gate_init_bias: float = -4.0
 
 
 def _resize_map(x: torch.Tensor, size: int, mode: str = "bilinear") -> torch.Tensor:
@@ -190,6 +195,7 @@ class MARAAgent(nn.Module):
             nn.GELU(),
         )
         self.delta_head = nn.Conv2d(cfg.hidden_dim, 2, kernel_size=1)
+        self.gate_head = nn.Conv2d(cfg.hidden_dim, 1, kernel_size=1)
         self.score_head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -197,6 +203,8 @@ class MARAAgent(nn.Module):
         )
         nn.init.zeros_(self.delta_head.weight)
         nn.init.zeros_(self.delta_head.bias)
+        nn.init.zeros_(self.gate_head.weight)
+        nn.init.constant_(self.gate_head.bias, cfg.gate_init_bias)
         nn.init.zeros_(self.score_head[-1].weight)
         nn.init.zeros_(self.score_head[-1].bias)
 
@@ -292,14 +300,17 @@ class MARAAgent(nn.Module):
 
     def _refine(
         self,
+        base_prob: torch.Tensor,
+        base_logits: torch.Tensor,
         current_logits: torch.Tensor,
         current_prob: torch.Tensor,
         global_logits: torch.Tensor,
+        cumulative_gate: torch.Tensor,
         state: torch.Tensor,
         layer_maps: torch.Tensor,
         policy_out: Dict[str, torch.Tensor],
         active: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz = current_prob.shape[0]
         region_idx = policy_out["region_action"].view(bsz, 1, 1, 1).expand(-1, 1, current_prob.shape[-2], current_prob.shape[-1])
         selected_mask = policy_out["masks"].gather(1, region_idx)
@@ -312,14 +323,21 @@ class MARAAgent(nn.Module):
 
         refiner_in = torch.cat([state, selected_layer, selected_mask], dim=1)
         hidden = self.refiner(refiner_in)
-        delta = self.delta_head(hidden) * selected_mask * gate * self.cfg.delta_scale
-        next_logits = current_logits + delta
-        next_prob = torch.softmax(next_logits, dim=1)
+        update_gate = torch.sigmoid(self.gate_head(hidden)) * self.cfg.gate_max
+        update_gate = update_gate * selected_mask * gate
+        next_cumulative_gate = 1.0 - (1.0 - cumulative_gate) * (1.0 - update_gate)
 
-        delta_score = self.score_head(hidden).squeeze(1) * refine_gate
-        next_global_logits = global_logits + torch.stack([-delta_score, delta_score], dim=1)
+        delta = self.delta_head(hidden) * selected_mask * gate * self.cfg.delta_scale
+        proposal_logits = current_logits + delta
+        proposal_prob = torch.softmax(proposal_logits, dim=1)
+        next_prob = base_prob * (1.0 - next_cumulative_gate) + proposal_prob * next_cumulative_gate
+
+        gate_scalar = next_cumulative_gate.flatten(1).amax(dim=1).values
+        delta_score = self.score_head(hidden).squeeze(1) * refine_gate * gate_scalar
+        proposal_global_logits = global_logits + torch.stack([-delta_score, delta_score], dim=1)
+        next_global_logits = base_logits * (1.0 - gate_scalar.unsqueeze(1)) + proposal_global_logits * gate_scalar.unsqueeze(1)
         next_active = active & (policy_out["op_action"] == 1)
-        return next_logits, next_prob, next_global_logits, next_active
+        return proposal_logits, next_prob, next_global_logits, next_active, next_cumulative_gate, update_gate
 
     def rollout(
         self,
@@ -356,21 +374,34 @@ class MARAAgent(nn.Module):
         current_logits = _prob_to_logits(base_prob_g)
         current_prob = base_prob_g
         global_logits = logits_g
+        cumulative_gate = torch.zeros(
+            current_prob.shape[0],
+            1,
+            current_prob.shape[-2],
+            current_prob.shape[-1],
+            device=current_prob.device,
+            dtype=current_prob.dtype,
+        )
         active = torch.ones(current_prob.shape[0], device=current_prob.device, dtype=torch.bool)
 
         logprob_steps = []
         entropy_steps = []
         reward_steps = []
+        cost_steps = []
+        gate_steps = []
         quality_steps = [quality_score(current_prob, global_logits, mask_g, labels_g, cfg).detach()]
 
         for step_idx in range(cfg.max_steps):
             q_before = quality_score(current_prob, global_logits, mask_g, labels_g, cfg).detach()
             state = self._make_state(current_prob, base_prob_g, layer_maps_g, step_idx)
             policy_out = self._policy(state, global_logits, active, step_idx, sample=sample)
-            current_logits, current_prob, global_logits, next_active = self._refine(
+            current_logits, current_prob, global_logits, next_active, cumulative_gate, update_gate = self._refine(
+                base_prob=base_prob_g,
+                base_logits=logits_g,
                 current_logits=current_logits,
                 current_prob=current_prob,
                 global_logits=global_logits,
+                cumulative_gate=cumulative_gate,
                 state=state,
                 layer_maps=layer_maps_g,
                 policy_out=policy_out,
@@ -379,27 +410,44 @@ class MARAAgent(nn.Module):
             q_after = quality_score(current_prob, global_logits, mask_g, labels_g, cfg).detach()
             refine_cost = cfg.refine_cost * (policy_out["op_action"] == 1).float()
             step_cost = cfg.step_cost * active.float()
-            reward = (q_after - q_before - refine_cost - step_cost) * active.float()
+            cost = (refine_cost + step_cost) * active.float()
+            reward = (q_after - q_before - cost) * active.float()
 
             logprob_steps.append(policy_out["logprob"])
             entropy_steps.append(policy_out["entropy"])
             reward_steps.append(reward)
+            cost_steps.append(cost)
+            gate_steps.append(update_gate.mean(dim=(1, 2, 3)))
             quality_steps.append(q_after)
             active = next_active
 
         rewards = torch.stack(reward_steps, dim=1)
+        costs = torch.stack(cost_steps, dim=1)
         discounts = torch.pow(
             torch.full_like(rewards, cfg.gamma),
             torch.arange(cfg.max_steps, device=rewards.device).view(1, -1),
         )
-        returns = (rewards * discounts).sum(dim=1) + quality_steps[-1]
+        base_quality = quality_steps[0]
+        final_quality = quality_steps[-1]
+        discounted_costs = (costs * discounts).sum(dim=1)
+        quality_gain = final_quality - base_quality - cfg.base_anchor_margin
+        anchored_score = quality_gain - discounted_costs
+        advantage = torch.where(
+            anchored_score >= 0,
+            anchored_score,
+            anchored_score * cfg.negative_advantage_scale,
+        )
+        advantage_g = advantage.view(-1, group_size)
+        advantage_scale = advantage_g.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-3)
+        advantage = (advantage_g / advantage_scale).reshape(-1).clamp(
+            -cfg.advantage_clip,
+            cfg.advantage_clip,
+        )
+
+        returns = anchored_score
         logprob_sum = torch.stack(logprob_steps, dim=1).sum(dim=1)
         entropy_mean = torch.stack(entropy_steps, dim=1).mean()
-
-        returns_g = returns.view(-1, group_size)
-        adv = returns_g - returns_g.mean(dim=1, keepdim=True)
-        adv = adv / (returns_g.std(dim=1, keepdim=True, unbiased=False) + 1e-6)
-        advantage = adv.reshape(-1)
+        gate_l1 = torch.stack(gate_steps, dim=1).mean()
         old_logprob = logprob_sum.detach()
         ratio = torch.exp(logprob_sum - old_logprob)
         unclipped = ratio * advantage.detach()
@@ -417,7 +465,10 @@ class MARAAgent(nn.Module):
             "entropy": entropy_mean,
             "returns": returns.detach(),
             "advantage": advantage.detach(),
+            "gate_l1": gate_l1,
             "mean_quality": quality_steps[-1].mean().detach(),
+            "mean_base_quality": base_quality.mean().detach(),
+            "mean_quality_gain": quality_gain.mean().detach(),
             "mean_reward": rewards.sum(dim=1).mean().detach(),
         }
 
@@ -443,15 +494,26 @@ class MARAAgent(nn.Module):
         current_logits = _prob_to_logits(base_prob_lr)
         current_prob = base_prob_lr
         global_logits = base_logits
+        cumulative_gate = torch.zeros(
+            current_prob.shape[0],
+            1,
+            current_prob.shape[-2],
+            current_prob.shape[-1],
+            device=current_prob.device,
+            dtype=current_prob.dtype,
+        )
         active = torch.ones(current_prob.shape[0], device=current_prob.device, dtype=torch.bool)
 
         for step_idx in range(cfg.max_steps):
             state = self._make_state(current_prob, base_prob_lr, layer_maps_lr, step_idx)
             policy_out = self._policy(state, global_logits, active, step_idx, sample=sample)
-            current_logits, current_prob, global_logits, active = self._refine(
+            current_logits, current_prob, global_logits, active, cumulative_gate, _ = self._refine(
+                base_prob=base_prob_lr,
+                base_logits=base_logits,
                 current_logits=current_logits,
                 current_prob=current_prob,
                 global_logits=global_logits,
+                cumulative_gate=cumulative_gate,
                 state=state,
                 layer_maps=layer_maps_lr,
                 policy_out=policy_out,
@@ -461,8 +523,12 @@ class MARAAgent(nn.Module):
         final_prob = _resize_map(current_prob, out_hw[0])
         if final_prob.shape[-2:] != out_hw:
             final_prob = F.interpolate(final_prob, size=out_hw, mode="bilinear", align_corners=False)
+        gate_map = _resize_map(cumulative_gate, out_hw[0])
+        if gate_map.shape[-2:] != out_hw:
+            gate_map = F.interpolate(gate_map, size=out_hw, mode="bilinear", align_corners=False)
 
         return {
             "final_prob": final_prob,
             "final_logits": global_logits,
+            "gate_map": gate_map,
         }

@@ -140,7 +140,9 @@ def load_mara_checkpoint(
         prompt_learner.load_state_dict(payload["prompt_learner"], strict=False)
     if dino_adapters is not None and "dino_adapters" in payload:
         dino_adapters.load_state_dict(payload["dino_adapters"], strict=True)
-    mara_agent.load_state_dict(payload["mara_agent"], strict=True)
+    missing, unexpected = mara_agent.load_state_dict(payload["mara_agent"], strict=False)
+    if missing or unexpected:
+        print(f"[WARN] MARA state loaded with missing={missing}, unexpected={unexpected}")
 
     model.to(device).eval()
     prompt_learner.to(device).eval()
@@ -172,6 +174,7 @@ def evaluate_category(
 ):
     base_maps = []
     mara_maps = []
+    gate_values = []
     gt_masks = []
     img_paths = []
 
@@ -206,6 +209,8 @@ def evaluate_category(
 
             base_maps.append(base_map[:, 1].detach().cpu().numpy())
             mara_maps.append(output["final_prob"][:, 1].detach().cpu().numpy())
+            if "gate_map" in output:
+                gate_values.append(output["gate_map"].detach().mean(dim=(1, 2, 3)).cpu().numpy())
             mask_np = mask[:, 0].detach().cpu().numpy() if mask.dim() == 4 else mask.detach().cpu().numpy()
             gt_masks.append((mask_np > 0.5).astype(np.uint8))
             img_paths.extend(list(image_info["image_path"]))
@@ -228,6 +233,7 @@ def evaluate_category(
         row[f"base_{metric_name}"] = base_metrics[metric_name]
         row[f"mara_{metric_name}"] = mara_metrics[metric_name]
         row[f"delta_{metric_name}"] = mara_metrics[metric_name] - base_metrics[metric_name]
+    row["gate_mean"] = float(np.concatenate(gate_values).mean()) if gate_values else 0.0
     return row
 
 
@@ -238,6 +244,7 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
     for prefix in ("base", "mara", "delta"):
         for metric_name in metric_names:
             means[f"mean_{prefix}_{metric_name}"] = float(np.mean([r[f"{prefix}_{metric_name}"] for r in rows]))
+    means["mean_gate"] = float(np.mean([r["gate_mean"] for r in rows]))
 
     metric_file = os.path.join(result_dir, "metric_mara.txt")
     with open(metric_file, "a", encoding="utf-8") as f:
@@ -246,6 +253,7 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
             f"{'Classname':<18s}"
             f"{'Base_PRO':>10s}{'MARA_PRO':>10s}{'D_PRO':>10s}"
             f"{'Base_F1':>10s}{'MARA_F1':>10s}{'D_F1':>10s}"
+            f"{'Gate':>10s}"
             f"{'Base_P-AUC':>12s}{'MARA_P-AUC':>12s}{'D_P-AUC':>10s}"
             f"{'Base_I-AUC':>12s}{'MARA_I-AUC':>12s}{'D_I-AUC':>10s}\n"
         )
@@ -254,6 +262,7 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
                 f"{row['category']:<18s}"
                 f"{row['base_PRO']:>10.5f}{row['mara_PRO']:>10.5f}{row['delta_PRO']:>10.5f}"
                 f"{row['base_F1']:>10.5f}{row['mara_F1']:>10.5f}{row['delta_F1']:>10.5f}"
+                f"{row['gate_mean']:>10.5f}"
                 f"{row['base_P_AUROC']:>12.5f}{row['mara_P_AUROC']:>12.5f}{row['delta_P_AUROC']:>10.5f}"
                 f"{row['base_I_AUROC']:>12.5f}{row['mara_I_AUROC']:>12.5f}{row['delta_I_AUROC']:>10.5f}\n"
             )
@@ -261,6 +270,7 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
             f"{'Mean':<18s}"
             f"{means['mean_base_PRO']:>10.5f}{means['mean_mara_PRO']:>10.5f}{means['mean_delta_PRO']:>10.5f}"
             f"{means['mean_base_F1']:>10.5f}{means['mean_mara_F1']:>10.5f}{means['mean_delta_F1']:>10.5f}"
+            f"{means['mean_gate']:>10.5f}"
             f"{means['mean_base_P_AUROC']:>12.5f}{means['mean_mara_P_AUROC']:>12.5f}{means['mean_delta_P_AUROC']:>10.5f}"
             f"{means['mean_base_I_AUROC']:>12.5f}{means['mean_mara_I_AUROC']:>12.5f}{means['mean_delta_I_AUROC']:>10.5f}\n\n"
         )
@@ -270,6 +280,7 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
         fieldnames = ["category"]
         for metric_name in metric_names:
             fieldnames.extend([f"base_{metric_name}", f"mara_{metric_name}", f"delta_{metric_name}"])
+        fieldnames.append("gate_mean")
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
@@ -378,7 +389,8 @@ def main():
             f"delta={summary['mean_delta_PRO']:.5f} | "
             f"F1 base={summary['mean_base_F1']:.5f}, "
             f"mara={summary['mean_mara_F1']:.5f}, "
-            f"delta={summary['mean_delta_F1']:.5f}"
+            f"delta={summary['mean_delta_F1']:.5f}, "
+            f"gate={summary['mean_gate']:.5f}"
         )
 
     ranking_file = os.path.join(dataset_result_dir, "mara_epoch_ranking.csv")
@@ -387,6 +399,7 @@ def main():
         fieldnames = ["epoch"]
         for prefix in ("base", "mara", "delta"):
             fieldnames.extend([f"mean_{prefix}_{metric_name}" for metric_name in metric_names])
+        fieldnames.append("mean_gate")
         fieldnames.append("ckpt_path")
         writer = csv.DictWriter(
             f,
@@ -402,7 +415,8 @@ def main():
         f"Base_PRO={best['mean_base_PRO']:.5f}, "
         f"MARA_PRO={best['mean_mara_PRO']:.5f}, "
         f"Delta_PRO={best['mean_delta_PRO']:.5f}, "
-        f"MARA_F1={best['mean_mara_F1']:.5f}"
+        f"MARA_F1={best['mean_mara_F1']:.5f}, "
+        f"Gate={best['mean_gate']:.5f}"
     )
     print(f"Best checkpoint file: {best['ckpt_path']}")
 
