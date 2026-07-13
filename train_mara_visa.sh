@@ -21,20 +21,28 @@ BASE_BS="${BASE_BS:-16}"
 MARA_EPOCH="${MARA_EPOCH:-30}"
 MARA_BS="${MARA_BS:-4}"
 GRPO_GROUP_SIZE="${GRPO_GROUP_SIZE:-4}"
+GRPO_UPDATE_EPOCHS="${GRPO_UPDATE_EPOCHS:-3}"
+GRPO_KL_COEF="${GRPO_KL_COEF:-0.01}"
 MARA_STEPS="${MARA_STEPS:-3}"
+MARA_STEP_COST="${MARA_STEP_COST:-0.001}"
+MARA_REFINE_COST="${MARA_REFINE_COST:-0.002}"
 MARA_DELTA_SCALE="${MARA_DELTA_SCALE:-0.35}"
 MARA_GATE_MAX="${MARA_GATE_MAX:-0.50}"
 MARA_GATE_INIT_BIAS="${MARA_GATE_INIT_BIAS:--3.5}"
 GAIN_ACCEPT_THRESHOLD="${GAIN_ACCEPT_THRESHOLD:-0.0}"
-GAIN_GATE_TEMPERATURE="${GAIN_GATE_TEMPERATURE:-0.1}"
+GAIN_GATE_TEMPERATURE="${GAIN_GATE_TEMPERATURE:-1.0}"
 GAIN_LOSS_CLIP="${GAIN_LOSS_CLIP:-1.0}"
+GAIN_CLS_WEIGHT="${GAIN_CLS_WEIGHT:-0.5}"
+GAIN_WARMUP_EPOCHS="${GAIN_WARMUP_EPOCHS:-5}"
 DISABLE_GAIN_GATE="${DISABLE_GAIN_GATE:-0}"
 BASE_ANCHOR_MARGIN="${BASE_ANCHOR_MARGIN:-0.0}"
 NEGATIVE_ADVANTAGE_SCALE="${NEGATIVE_ADVANTAGE_SCALE:-1.0}"
 ADVANTAGE_CLIP="${ADVANTAGE_CLIP:-5.0}"
 W_BASE_CONSISTENCY="${W_BASE_CONSISTENCY:-0.05}"
+W_GRPO="${W_GRPO:-0.5}"
 W_GATE_SPARSE="${W_GATE_SPARSE:-0.01}"
 W_GAIN_VALUE="${W_GAIN_VALUE:-0.05}"
+REWARD_CONF_WEIGHT="${REWARD_CONF_WEIGHT:-0.0}"
 
 RUN_BASE="${RUN_BASE:-1}"
 RUN_MARA="${RUN_MARA:-1}"
@@ -51,7 +59,8 @@ echo "[$(date +'%F %T')] Start MARA training pipeline"
 echo "Log: ${LOG_FILE}"
 echo "Dataset=${DATASET}, Device=${DEVICE}, HFA=${HFA_SETTING}, visual_layers=${VISUAL_LAYERS}"
 echo "MARA gate: max=${MARA_GATE_MAX}, init_bias=${MARA_GATE_INIT_BIAS}, sparse_weight=${W_GATE_SPARSE}"
-echo "Gain gate: disabled=${DISABLE_GAIN_GATE}, threshold=${GAIN_ACCEPT_THRESHOLD}, temperature=${GAIN_GATE_TEMPERATURE}, value_weight=${W_GAIN_VALUE}"
+echo "GRPO: group=${GRPO_GROUP_SIZE}, replay_updates=${GRPO_UPDATE_EPOCHS}, kl_coef=${GRPO_KL_COEF}, weight=${W_GRPO}"
+echo "Gain gate: disabled=${DISABLE_GAIN_GATE}, warmup=${GAIN_WARMUP_EPOCHS}, threshold=${GAIN_ACCEPT_THRESHOLD}, temperature=${GAIN_GATE_TEMPERATURE}, value_weight=${W_GAIN_VALUE}"
 
 BASE_RESULT_PATH="./checkpoint/base_${DATASET}_${HFA_SETTING}_${TS}"
 MARA_RESULT_PATH="./checkpoint/mara_${DATASET}_${HFA_SETTING}_${TS}"
@@ -103,18 +112,26 @@ if [[ "${RUN_MARA}" == "1" ]]; then
     --hfa_setting "${HFA_SETTING}" \
     --mara_steps "${MARA_STEPS}" \
     --grpo_group_size "${GRPO_GROUP_SIZE}" \
+    --grpo_update_epochs "${GRPO_UPDATE_EPOCHS}" \
+    --grpo_kl_coef "${GRPO_KL_COEF}" \
+    --mara_step_cost "${MARA_STEP_COST}" \
+    --mara_refine_cost "${MARA_REFINE_COST}" \
     --mara_delta_scale "${MARA_DELTA_SCALE}" \
     --mara_gate_max "${MARA_GATE_MAX}" \
     --mara_gate_init_bias "${MARA_GATE_INIT_BIAS}" \
     --gain_accept_threshold "${GAIN_ACCEPT_THRESHOLD}" \
     --gain_gate_temperature "${GAIN_GATE_TEMPERATURE}" \
     --gain_loss_clip "${GAIN_LOSS_CLIP}" \
+    --gain_cls_weight "${GAIN_CLS_WEIGHT}" \
+    --gain_warmup_epochs "${GAIN_WARMUP_EPOCHS}" \
     --base_anchor_margin "${BASE_ANCHOR_MARGIN}" \
     --negative_advantage_scale "${NEGATIVE_ADVANTAGE_SCALE}" \
     --advantage_clip "${ADVANTAGE_CLIP}" \
     --w_base_consistency "${W_BASE_CONSISTENCY}" \
+    --w_grpo "${W_GRPO}" \
     --w_gate_sparse "${W_GATE_SPARSE}" \
     --w_gain_value "${W_GAIN_VALUE}" \
+    --reward_conf_weight "${REWARD_CONF_WEIGHT}" \
     "${GAIN_GATE_FLAG[@]}"
 fi
 

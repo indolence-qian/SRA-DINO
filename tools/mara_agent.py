@@ -28,6 +28,7 @@ class MARAConfig:
     reward_fp_weight: float = 0.2
     delta_scale: float = 1.0
     force_first_refine: bool = False
+    include_base_trajectory: bool = True
     base_anchor_margin: float = 0.0
     negative_advantage_scale: float = 1.0
     advantage_clip: float = 5.0
@@ -35,8 +36,9 @@ class MARAConfig:
     gate_init_bias: float = -4.0
     use_gain_gate: bool = True
     gain_accept_threshold: float = 0.0
-    gain_gate_temperature: float = 0.1
+    gain_gate_temperature: float = 1.0
     gain_loss_clip: float = 1.0
+    gain_cls_weight: float = 0.5
 
 
 def _resize_map(x: torch.Tensor, size: int, mode: str = "bilinear") -> torch.Tensor:
@@ -165,6 +167,39 @@ def quality_score(
     )
 
 
+def _discounted_returns(rewards: torch.Tensor, gamma: float) -> torch.Tensor:
+    """Return-to-go for every active decision step."""
+    returns = torch.zeros_like(rewards)
+    running = torch.zeros_like(rewards[:, 0])
+    for step_idx in range(rewards.shape[1] - 1, -1, -1):
+        running = rewards[:, step_idx] + gamma * running
+        returns[:, step_idx] = running
+    return returns
+
+
+def _group_relative_advantages(
+    returns: torch.Tensor,
+    active_mask: torch.Tensor,
+    group_size: int,
+    negative_scale: float,
+    clip: float,
+) -> torch.Tensor:
+    """Center and normalize trajectory returns per image and per decision step."""
+    if returns.shape[0] % group_size != 0:
+        raise ValueError(f"Rollout batch {returns.shape[0]} is not divisible by group_size={group_size}.")
+
+    returns_g = returns.view(-1, group_size, returns.shape[1])
+    mask_g = active_mask.view(-1, group_size, active_mask.shape[1]).float()
+    count = mask_g.sum(dim=1, keepdim=True).clamp_min(1.0)
+    mean = (returns_g * mask_g).sum(dim=1, keepdim=True) / count
+    centered = (returns_g - mean) * mask_g
+    variance = centered.square().sum(dim=1, keepdim=True) / count
+    scale = variance.sqrt().clamp_min(1e-3)
+    advantage = centered / scale
+    advantage = torch.where(advantage >= 0, advantage, advantage * negative_scale)
+    return advantage.reshape_as(returns).clamp(-clip, clip)
+
+
 class MARAAgent(nn.Module):
     """Multi-step Anomaly Refinement Agent with GRPO-style policy training."""
 
@@ -210,6 +245,11 @@ class MARAAgent(nn.Module):
             nn.Flatten(),
             nn.Linear(cfg.hidden_dim, 1),
         )
+        self.gain_accept_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(cfg.hidden_dim, 1),
+        )
         nn.init.zeros_(self.delta_head.weight)
         nn.init.zeros_(self.delta_head.bias)
         nn.init.zeros_(self.gate_head.weight)
@@ -218,6 +258,8 @@ class MARAAgent(nn.Module):
         nn.init.zeros_(self.score_head[-1].bias)
         nn.init.zeros_(self.gain_head[-1].weight)
         nn.init.zeros_(self.gain_head[-1].bias)
+        nn.init.zeros_(self.gain_accept_head[-1].weight)
+        nn.init.zeros_(self.gain_accept_head[-1].bias)
 
     def _make_state(
         self,
@@ -252,6 +294,8 @@ class MARAAgent(nn.Module):
         active: torch.Tensor,
         step_idx: int,
         sample: bool,
+        actions: Optional[Dict[str, torch.Tensor]] = None,
+        forced_op: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         cfg = self.cfg
         encoded = self.state_encoder(state)
@@ -281,7 +325,11 @@ class MARAAgent(nn.Module):
         layer_dist = Categorical(logits=layer_logits)
         op_dist = Categorical(logits=op_logits)
 
-        if sample:
+        if actions is not None:
+            region_action = actions["region"].long()
+            layer_action = actions["layer"].long()
+            op_action = actions["op"].long()
+        elif sample:
             region_action = region_dist.sample()
             layer_action = layer_dist.sample()
             op_action = op_dist.sample()
@@ -289,6 +337,8 @@ class MARAAgent(nn.Module):
             region_action = region_logits.argmax(dim=1)
             layer_action = layer_logits.argmax(dim=1)
             op_action = op_logits.argmax(dim=1)
+        if forced_op is not None:
+            op_action = torch.where(forced_op >= 0, forced_op.long(), op_action)
 
         logprob = (
             region_dist.log_prob(region_action)
@@ -321,7 +371,8 @@ class MARAAgent(nn.Module):
         layer_maps: torch.Tensor,
         policy_out: Dict[str, torch.Tensor],
         active: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        apply_gain_gate: bool,
+    ) -> Dict[str, torch.Tensor]:
         bsz = current_prob.shape[0]
         region_idx = policy_out["region_action"].view(bsz, 1, 1, 1).expand(-1, 1, current_prob.shape[-2], current_prob.shape[-1])
         selected_mask = policy_out["masks"].gather(1, region_idx)
@@ -335,37 +386,69 @@ class MARAAgent(nn.Module):
         refiner_in = torch.cat([state, selected_layer, selected_mask], dim=1)
         hidden = self.refiner(refiner_in)
         predicted_gain = self.gain_head(hidden).squeeze(1)
+        accept_logit = self.gain_accept_head(hidden).squeeze(1)
         if self.cfg.use_gain_gate:
             temperature = max(float(self.cfg.gain_gate_temperature), 1e-6)
-            accept_score = torch.sigmoid((predicted_gain - self.cfg.gain_accept_threshold) / temperature)
+            accept_score = torch.sigmoid(accept_logit / temperature)
         else:
             accept_score = torch.ones_like(predicted_gain)
-        effective_gate = gate * accept_score.view(bsz, 1, 1, 1)
 
-        update_gate = torch.sigmoid(self.gate_head(hidden)) * self.cfg.gate_max
-        update_gate = update_gate * selected_mask * effective_gate
+        # Build an ungated counterfactual proposal first. Its immediate quality
+        # improvement supervises gain_head without depending on gain_head itself.
+        candidate_update_gate = torch.sigmoid(self.gate_head(hidden)) * self.cfg.gate_max
+        candidate_update_gate = candidate_update_gate * selected_mask * gate
+        candidate_cumulative_gate = 1.0 - (1.0 - cumulative_gate) * (1.0 - candidate_update_gate)
+        candidate_delta = self.delta_head(hidden) * selected_mask * gate * self.cfg.delta_scale
+        candidate_logits = current_logits + candidate_delta
+        candidate_proposal_prob = torch.softmax(candidate_logits, dim=1)
+        candidate_prob = (
+            base_prob * (1.0 - candidate_cumulative_gate)
+            + candidate_proposal_prob * candidate_cumulative_gate
+        )
+        candidate_gate_scalar = candidate_cumulative_gate.flatten(1).amax(dim=1)
+        candidate_delta_score = self.score_head(hidden).squeeze(1) * refine_gate * candidate_gate_scalar
+        candidate_global_proposal = global_logits + torch.stack(
+            [-candidate_delta_score, candidate_delta_score], dim=1
+        )
+        candidate_global_logits = (
+            base_logits * (1.0 - candidate_gate_scalar.unsqueeze(1))
+            + candidate_global_proposal * candidate_gate_scalar.unsqueeze(1)
+        )
+
+        # The gain predictor is a critic. Detaching its acceptance weight keeps
+        # segmentation/classification gradients from pushing every gain positive.
+        if self.cfg.use_gain_gate and apply_gain_gate:
+            accept_weight = accept_score.detach().view(bsz, 1, 1, 1)
+        else:
+            accept_weight = torch.ones(bsz, 1, 1, 1, device=current_prob.device, dtype=current_prob.dtype)
+        update_gate = candidate_update_gate * accept_weight
         next_cumulative_gate = 1.0 - (1.0 - cumulative_gate) * (1.0 - update_gate)
-
-        delta = self.delta_head(hidden) * selected_mask * effective_gate * self.cfg.delta_scale
+        delta = candidate_delta * accept_weight
         proposal_logits = current_logits + delta
         proposal_prob = torch.softmax(proposal_logits, dim=1)
         next_prob = base_prob * (1.0 - next_cumulative_gate) + proposal_prob * next_cumulative_gate
 
         gate_scalar = next_cumulative_gate.flatten(1).amax(dim=1)
-        delta_score = self.score_head(hidden).squeeze(1) * refine_gate * accept_score * gate_scalar
+        delta_score = self.score_head(hidden).squeeze(1) * refine_gate * accept_weight.flatten(1)[:, 0] * gate_scalar
         proposal_global_logits = global_logits + torch.stack([-delta_score, delta_score], dim=1)
-        next_global_logits = base_logits * (1.0 - gate_scalar.unsqueeze(1)) + proposal_global_logits * gate_scalar.unsqueeze(1)
-        next_active = active & (policy_out["op_action"] == 1)
-        return (
-            proposal_logits,
-            next_prob,
-            next_global_logits,
-            next_active,
-            next_cumulative_gate,
-            update_gate,
-            predicted_gain,
-            accept_score,
+        next_global_logits = (
+            base_logits * (1.0 - gate_scalar.unsqueeze(1))
+            + proposal_global_logits * gate_scalar.unsqueeze(1)
         )
+        next_active = active & (policy_out["op_action"] == 1)
+        return {
+            "next_logits": proposal_logits,
+            "next_prob": next_prob,
+            "next_global_logits": next_global_logits,
+            "next_active": next_active,
+            "next_cumulative_gate": next_cumulative_gate,
+            "update_gate": update_gate,
+            "predicted_gain": predicted_gain,
+            "accept_logit": accept_logit,
+            "accept_score": accept_score,
+            "candidate_prob": candidate_prob,
+            "candidate_global_logits": candidate_global_logits,
+        }
 
     def rollout(
         self,
@@ -376,7 +459,10 @@ class MARAAgent(nn.Module):
         labels: torch.Tensor,
         group_size: Optional[int] = None,
         sample: bool = True,
+        trajectory: Optional[Dict[str, torch.Tensor]] = None,
+        apply_gain_gate: bool = True,
     ) -> Dict[str, torch.Tensor]:
+        """Sample a behavior trajectory or replay fixed actions for a GRPO update."""
         cfg = self.cfg
         group_size = int(group_size or cfg.group_size)
         out_hw = base_prob.shape[-2:]
@@ -415,28 +501,53 @@ class MARAAgent(nn.Module):
         logprob_steps = []
         entropy_steps = []
         reward_steps = []
-        cost_steps = []
         gate_steps = []
         predicted_gain_steps = []
+        accept_logit_steps = []
         accept_steps = []
-        value_weight_steps = []
+        gain_target_steps = []
+        gain_weight_steps = []
+        active_steps = []
+        policy_weight_steps = []
+        region_action_steps = []
+        layer_action_steps = []
+        op_action_steps = []
         quality_steps = [quality_score(current_prob, global_logits, mask_g, labels_g, cfg).detach()]
 
         for step_idx in range(cfg.max_steps):
             q_before = quality_score(current_prob, global_logits, mask_g, labels_g, cfg).detach()
             state = self._make_state(current_prob, base_prob_g, layer_maps_g, step_idx)
-            policy_out = self._policy(state, global_logits, active, step_idx, sample=sample)
-            active_before = active
-            (
-                current_logits,
-                current_prob,
+            fixed_actions = None
+            if trajectory is not None:
+                fixed_actions = {
+                    "region": trajectory["region_actions"][:, step_idx],
+                    "layer": trajectory["layer_actions"][:, step_idx],
+                    "op": trajectory["op_actions"][:, step_idx],
+                }
+            forced_op = None
+            base_anchor = torch.zeros_like(active)
+            if (
+                trajectory is None
+                and sample
+                and step_idx == 0
+                and group_size > 1
+                and cfg.include_base_trajectory
+                and not cfg.force_first_refine
+            ):
+                base_anchor = torch.arange(active.shape[0], device=active.device) % group_size == 0
+                forced_op = torch.full_like(labels_g, -1)
+                forced_op[base_anchor] = 0
+            policy_out = self._policy(
+                state,
                 global_logits,
-                next_active,
-                cumulative_gate,
-                update_gate,
-                predicted_gain,
-                accept_score,
-            ) = self._refine(
+                active,
+                step_idx,
+                sample=sample,
+                actions=fixed_actions,
+                forced_op=forced_op,
+            )
+            active_before = active
+            refine_out = self._refine(
                 base_prob=base_prob_g,
                 base_logits=logits_g,
                 current_logits=current_logits,
@@ -447,64 +558,112 @@ class MARAAgent(nn.Module):
                 layer_maps=layer_maps_g,
                 policy_out=policy_out,
                 active=active,
+                apply_gain_gate=apply_gain_gate,
             )
+            current_logits = refine_out["next_logits"]
+            current_prob = refine_out["next_prob"]
+            global_logits = refine_out["next_global_logits"]
+            cumulative_gate = refine_out["next_cumulative_gate"]
             q_after = quality_score(current_prob, global_logits, mask_g, labels_g, cfg).detach()
-            refine_cost = cfg.refine_cost * (policy_out["op_action"] == 1).float()
-            step_cost = cfg.step_cost * active.float()
-            cost = (refine_cost + step_cost) * active.float()
-            reward = (q_after - q_before - cost) * active.float()
+            q_candidate = quality_score(
+                refine_out["candidate_prob"],
+                refine_out["candidate_global_logits"],
+                mask_g,
+                labels_g,
+                cfg,
+            ).detach()
+            refine_mask = active_before.float() * (policy_out["op_action"] == 1).float()
+            step_cost = cfg.step_cost * active_before.float()
+            refine_cost = cfg.refine_cost * refine_mask
+            reward = (q_after - q_before - step_cost - refine_cost) * active_before.float()
+            counterfactual_gain = (q_candidate - q_before - cfg.refine_cost).clamp(
+                -cfg.gain_loss_clip,
+                cfg.gain_loss_clip,
+            )
 
             logprob_steps.append(policy_out["logprob"])
             entropy_steps.append(policy_out["entropy"])
             reward_steps.append(reward)
-            cost_steps.append(cost)
-            gate_steps.append(update_gate.mean(dim=(1, 2, 3)))
-            predicted_gain_steps.append(predicted_gain)
-            accept_steps.append(accept_score)
-            value_weight_steps.append(active_before.float())
+            gate_steps.append(refine_out["update_gate"].mean(dim=(1, 2, 3)))
+            predicted_gain_steps.append(refine_out["predicted_gain"])
+            accept_logit_steps.append(refine_out["accept_logit"])
+            accept_steps.append(refine_out["accept_score"])
+            gain_target_steps.append(counterfactual_gain)
+            gain_weight_steps.append(refine_mask)
+            active_steps.append(active_before.float())
+            policy_weight_steps.append(active_before.float() * (~base_anchor).float())
+            region_action_steps.append(policy_out["region_action"])
+            layer_action_steps.append(policy_out["layer_action"])
+            op_action_steps.append(policy_out["op_action"])
             quality_steps.append(q_after)
-            active = next_active
+            active = refine_out["next_active"]
 
         rewards = torch.stack(reward_steps, dim=1)
-        costs = torch.stack(cost_steps, dim=1)
-        discounts = torch.pow(
-            torch.full_like(rewards, cfg.gamma),
-            torch.arange(cfg.max_steps, device=rewards.device).view(1, -1),
-        )
+        logprobs = torch.stack(logprob_steps, dim=1)
+        active_mask = torch.stack(active_steps, dim=1)
+        policy_mask = torch.stack(policy_weight_steps, dim=1)
+        returns_to_go = _discounted_returns(rewards, cfg.gamma) - cfg.base_anchor_margin
         base_quality = quality_steps[0]
         final_quality = quality_steps[-1]
-        discounted_costs = (costs * discounts).sum(dim=1)
         quality_gain = final_quality - base_quality - cfg.base_anchor_margin
-        anchored_score = quality_gain - discounted_costs
-        advantage = torch.where(
-            anchored_score >= 0,
-            anchored_score,
-            anchored_score * cfg.negative_advantage_scale,
-        )
-        advantage_g = advantage.view(-1, group_size)
-        advantage_scale = advantage_g.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-3)
-        advantage = (advantage_g / advantage_scale).reshape(-1).clamp(
-            -cfg.advantage_clip,
-            cfg.advantage_clip,
-        )
 
-        returns = anchored_score
-        logprob_sum = torch.stack(logprob_steps, dim=1).sum(dim=1)
-        entropy_mean = torch.stack(entropy_steps, dim=1).mean()
+        if trajectory is None:
+            advantages = _group_relative_advantages(
+                returns=returns_to_go,
+                active_mask=active_mask,
+                group_size=group_size,
+                negative_scale=cfg.negative_advantage_scale,
+                clip=cfg.advantage_clip,
+            ).detach()
+            trajectory = {
+                "region_actions": torch.stack(region_action_steps, dim=1).detach(),
+                "layer_actions": torch.stack(layer_action_steps, dim=1).detach(),
+                "op_actions": torch.stack(op_action_steps, dim=1).detach(),
+                "old_logprobs": logprobs.detach(),
+                "advantages": advantages,
+                "returns_to_go": returns_to_go.detach(),
+                "active_mask": active_mask.detach(),
+                "policy_mask": policy_mask.detach(),
+            }
+        else:
+            advantages = trajectory["advantages"].to(logprobs.device)
+            active_mask = trajectory["active_mask"].to(logprobs.device)
+            policy_mask = trajectory.get("policy_mask", active_mask).to(logprobs.device)
+
+        old_logprobs = trajectory["old_logprobs"].to(logprobs.device)
+        log_ratio = (logprobs - old_logprobs).clamp(-20.0, 20.0)
+        ratio = torch.exp(log_ratio)
+        unclipped = ratio * advantages
+        clipped = ratio.clamp(1.0 - cfg.grpo_clip_eps, 1.0 + cfg.grpo_clip_eps) * advantages
+        policy_terms = torch.min(unclipped, clipped) * policy_mask
+        policy_denom = policy_mask.sum().clamp_min(1.0)
+        policy_loss = -policy_terms.sum() / policy_denom
+        approx_kl = (((ratio - 1.0) - log_ratio) * policy_mask).sum() / policy_denom
+        clip_fraction = (
+            ((ratio - 1.0).abs() > cfg.grpo_clip_eps).float() * policy_mask
+        ).sum() / policy_denom
+
+        entropy_all = torch.stack(entropy_steps, dim=1)
+        entropy_mean = (entropy_all * policy_mask).sum() / policy_denom
         gate_l1 = torch.stack(gate_steps, dim=1).mean()
         predicted_gain_all = torch.stack(predicted_gain_steps, dim=1)
+        accept_logits_all = torch.stack(accept_logit_steps, dim=1)
         accept_all = torch.stack(accept_steps, dim=1)
-        value_weights = torch.stack(value_weight_steps, dim=1)
-        value_denom = value_weights.sum(dim=1).clamp_min(1.0)
-        predicted_gain = (predicted_gain_all * value_weights).sum(dim=1) / value_denom
-        accept_mean = (accept_all * value_weights).sum(dim=1) / value_denom
-        gain_target = quality_gain.detach().clamp(-cfg.gain_loss_clip, cfg.gain_loss_clip)
-        gain_loss = F.smooth_l1_loss(predicted_gain, gain_target)
-        old_logprob = logprob_sum.detach()
-        ratio = torch.exp(logprob_sum - old_logprob)
-        unclipped = ratio * advantage.detach()
-        clipped = ratio.clamp(1.0 - cfg.grpo_clip_eps, 1.0 + cfg.grpo_clip_eps) * advantage.detach()
-        policy_loss = -torch.min(unclipped, clipped).mean()
+        gain_targets = torch.stack(gain_target_steps, dim=1).detach()
+        gain_weights = torch.stack(gain_weight_steps, dim=1)
+        gain_denom = gain_weights.sum().clamp_min(1.0)
+        gain_reg = F.smooth_l1_loss(predicted_gain_all, gain_targets, reduction="none")
+        gain_class_target = (gain_targets > cfg.gain_accept_threshold).float()
+        temperature = max(float(cfg.gain_gate_temperature), 1e-6)
+        gain_cls = F.binary_cross_entropy_with_logits(
+            accept_logits_all / temperature,
+            gain_class_target,
+            reduction="none",
+        )
+        gain_loss = ((gain_reg + cfg.gain_cls_weight * gain_cls) * gain_weights).sum() / gain_denom
+        predicted_gain = (predicted_gain_all * gain_weights).sum() / gain_denom
+        accept_mean = (accept_all * gain_weights).sum() / gain_denom
+        positive_rate = (gain_class_target * gain_weights).sum() / gain_denom
 
         final_prob = _resize_map(current_prob, out_hw[0])
         if final_prob.shape[-2:] != out_hw:
@@ -514,16 +673,20 @@ class MARAAgent(nn.Module):
             "final_prob": final_prob,
             "final_logits": global_logits,
             "policy_loss": policy_loss,
+            "approx_kl": approx_kl,
+            "clip_fraction": clip_fraction,
             "entropy": entropy_mean,
-            "returns": returns.detach(),
-            "advantage": advantage.detach(),
+            "returns": returns_to_go[:, 0].detach(),
+            "advantage": advantages.detach(),
             "gate_l1": gate_l1,
             "gain_loss": gain_loss,
+            "trajectory": trajectory,
             "mean_quality": quality_steps[-1].mean().detach(),
             "mean_base_quality": base_quality.mean().detach(),
             "mean_quality_gain": quality_gain.mean().detach(),
-            "mean_predicted_gain": predicted_gain.mean().detach(),
-            "mean_accept_score": accept_mean.mean().detach(),
+            "mean_predicted_gain": predicted_gain.detach(),
+            "mean_accept_score": accept_mean.detach(),
+            "mean_counterfactual_positive": positive_rate.detach(),
             "mean_reward": rewards.sum(dim=1).mean().detach(),
         }
 
@@ -560,20 +723,13 @@ class MARAAgent(nn.Module):
         active = torch.ones(current_prob.shape[0], device=current_prob.device, dtype=torch.bool)
         predicted_gain_steps = []
         accept_steps = []
+        refine_weight_steps = []
 
         for step_idx in range(cfg.max_steps):
             state = self._make_state(current_prob, base_prob_lr, layer_maps_lr, step_idx)
             policy_out = self._policy(state, global_logits, active, step_idx, sample=sample)
-            (
-                current_logits,
-                current_prob,
-                global_logits,
-                active,
-                cumulative_gate,
-                _,
-                predicted_gain,
-                accept_score,
-            ) = self._refine(
+            active_before = active
+            refine_out = self._refine(
                 base_prob=base_prob_lr,
                 base_logits=base_logits,
                 current_logits=current_logits,
@@ -584,9 +740,17 @@ class MARAAgent(nn.Module):
                 layer_maps=layer_maps_lr,
                 policy_out=policy_out,
                 active=active,
+                apply_gain_gate=True,
             )
-            predicted_gain_steps.append(predicted_gain)
-            accept_steps.append(accept_score)
+            current_logits = refine_out["next_logits"]
+            current_prob = refine_out["next_prob"]
+            global_logits = refine_out["next_global_logits"]
+            active = refine_out["next_active"]
+            cumulative_gate = refine_out["next_cumulative_gate"]
+            refine_weight = active_before.float() * (policy_out["op_action"] == 1).float()
+            predicted_gain_steps.append(refine_out["predicted_gain"])
+            accept_steps.append(refine_out["accept_score"])
+            refine_weight_steps.append(refine_weight)
 
         final_prob = _resize_map(current_prob, out_hw[0])
         if final_prob.shape[-2:] != out_hw:
@@ -595,10 +759,25 @@ class MARAAgent(nn.Module):
         if gate_map.shape[-2:] != out_hw:
             gate_map = F.interpolate(gate_map, size=out_hw, mode="bilinear", align_corners=False)
 
+        refine_weights = torch.stack(refine_weight_steps, dim=1)
+        refine_denom = refine_weights.sum(dim=1).clamp_min(1.0)
+        predicted_gain = (
+            torch.stack(predicted_gain_steps, dim=1) * refine_weights
+        ).sum(dim=1) / refine_denom
+        accept_score = (
+            torch.stack(accept_steps, dim=1) * refine_weights
+        ).sum(dim=1) / refine_denom
+        changed = (gate_map > 1e-6).to(gate_map.dtype)
+        changed_denom = changed.sum(dim=(1, 2, 3)).clamp_min(1.0)
+        gate_roi_mean = (gate_map * changed).sum(dim=(1, 2, 3)) / changed_denom
+
         return {
             "final_prob": final_prob,
             "final_logits": global_logits,
             "gate_map": gate_map,
-            "predicted_gain": torch.stack(predicted_gain_steps, dim=1).mean(dim=1),
-            "accept_score": torch.stack(accept_steps, dim=1).mean(dim=1),
+            "predicted_gain": predicted_gain,
+            "accept_score": accept_score,
+            "refine_steps": refine_weights.sum(dim=1),
+            "gate_roi_mean": gate_roi_mean,
+            "changed_ratio": changed.mean(dim=(1, 2, 3)),
         }

@@ -188,6 +188,7 @@ def build_mara_config(args) -> MARAConfig:
         reward_fp_weight=args.reward_fp_weight,
         delta_scale=args.mara_delta_scale,
         force_first_refine=args.force_first_refine,
+        include_base_trajectory=not args.disable_base_trajectory,
         base_anchor_margin=args.base_anchor_margin,
         negative_advantage_scale=args.negative_advantage_scale,
         advantage_clip=args.advantage_clip,
@@ -197,6 +198,7 @@ def build_mara_config(args) -> MARAConfig:
         gain_accept_threshold=args.gain_accept_threshold,
         gain_gate_temperature=args.gain_gate_temperature,
         gain_loss_clip=args.gain_loss_clip,
+        gain_cls_weight=args.gain_cls_weight,
     )
 
 
@@ -258,11 +260,14 @@ def train_one_epoch(
         "global": [],
         "consistency": [],
         "grpo": [],
+        "kl": [],
+        "clip_frac": [],
         "entropy": [],
         "gate": [],
         "gain_value": [],
         "pred_gain": [],
         "accept": [],
+        "gain_positive": [],
         "reward": [],
         "quality": [],
         "gain": [],
@@ -292,82 +297,117 @@ def train_one_epoch(
             num_layers=len(args.visual_layers),
         )
 
-        rollout = mara_agent.rollout(
-            base_prob=base_map,
-            base_logits=base_logits,
-            layer_maps=layer_maps,
-            mask=mask,
-            labels=labels,
-            group_size=args.grpo_group_size,
-            sample=True,
-        )
-
         group_size = args.grpo_group_size
         mask_g = mask.repeat_interleave(group_size, dim=0)
         labels_g = labels.repeat_interleave(group_size, dim=0)
         mask_bhw = mask_g[:, 0] if mask_g.dim() == 4 else mask_g
-
-        final_map = rollout["final_prob"]
-        final_logits = rollout["final_logits"]
-        seg_focal = loss_focal(final_map, mask_g)
-        seg_dice = loss_dice(final_map[:, 1], mask_bhw)
-        seg_loss = seg_focal + seg_dice
-        global_loss = F.cross_entropy(final_logits, labels_g)
         base_map_g = base_map.detach().repeat_interleave(group_size, dim=0)
         normal_weight = (1.0 - labels_g.float())
-        drift_per_sample = (final_map[:, 1] - base_map_g[:, 1]).abs().mean(dim=(-2, -1))
-        if normal_weight.sum() > 0:
-            consistency_loss = (drift_per_sample * normal_weight).sum() / normal_weight.sum().clamp_min(1.0)
-        else:
-            consistency_loss = drift_per_sample.mean() * 0.0
-        sup_loss = (
-            args.w_seg * seg_loss
-            + args.w_global * global_loss
-            + args.w_base_consistency * consistency_loss
-        )
 
-        grpo_loss = rollout["policy_loss"]
-        entropy = rollout["entropy"]
-        gate_loss = rollout["gate_l1"]
-        gain_value_loss = rollout["gain_loss"]
-        total_loss = (
-            sup_loss
-            + args.w_grpo * grpo_loss
-            + args.w_gate_sparse * gate_loss
-            + args.w_gain_value * gain_value_loss
-            - args.entropy_coef * entropy
-        )
+        apply_gain_gate = epoch >= args.gain_warmup_epochs
+        with torch.no_grad():
+            behavior = mara_agent.rollout(
+                base_prob=base_map,
+                base_logits=base_logits,
+                layer_maps=layer_maps,
+                mask=mask,
+                labels=labels,
+                group_size=group_size,
+                sample=True,
+                apply_gain_gate=apply_gain_gate,
+            )
+        trajectory = behavior["trajectory"]
+        batch_meters = {key: [] for key in meters}
 
-        optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(mara_agent.parameters(), args.grad_clip)
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
+        for _ in range(args.grpo_update_epochs):
+            rollout = mara_agent.rollout(
+                base_prob=base_map,
+                base_logits=base_logits,
+                layer_maps=layer_maps,
+                mask=mask,
+                labels=labels,
+                group_size=group_size,
+                sample=False,
+                trajectory=trajectory,
+                apply_gain_gate=apply_gain_gate,
+            )
 
-        meters["loss"].append(float(total_loss.item()))
-        meters["sup"].append(float(sup_loss.item()))
-        meters["seg"].append(float(seg_loss.item()))
-        meters["global"].append(float(global_loss.item()))
-        meters["consistency"].append(float(consistency_loss.item()))
-        meters["grpo"].append(float(grpo_loss.item()))
-        meters["entropy"].append(float(entropy.item()))
-        meters["gate"].append(float(gate_loss.item()))
-        meters["gain_value"].append(float(gain_value_loss.item()))
-        meters["pred_gain"].append(float(rollout["mean_predicted_gain"].item()))
-        meters["accept"].append(float(rollout["mean_accept_score"].item()))
-        meters["reward"].append(float(rollout["mean_reward"].item()))
-        meters["quality"].append(float(rollout["mean_quality"].item()))
-        meters["gain"].append(float(rollout["mean_quality_gain"].item()))
+            final_map = rollout["final_prob"]
+            final_logits = rollout["final_logits"]
+            seg_focal = loss_focal(final_map, mask_g)
+            seg_dice = loss_dice(final_map[:, 1], mask_bhw)
+            seg_loss = seg_focal + seg_dice
+            global_loss = F.cross_entropy(final_logits, labels_g)
+            drift_per_sample = (final_map[:, 1] - base_map_g[:, 1]).abs().mean(dim=(-2, -1))
+            if normal_weight.sum() > 0:
+                consistency_loss = (
+                    (drift_per_sample * normal_weight).sum()
+                    / normal_weight.sum().clamp_min(1.0)
+                )
+            else:
+                consistency_loss = drift_per_sample.mean() * 0.0
+            sup_loss = (
+                args.w_seg * seg_loss
+                + args.w_global * global_loss
+                + args.w_base_consistency * consistency_loss
+            )
+
+            grpo_loss = rollout["policy_loss"]
+            approx_kl = rollout["approx_kl"]
+            entropy = rollout["entropy"]
+            gate_loss = rollout["gate_l1"]
+            gain_value_loss = rollout["gain_loss"]
+            rl_scale = 1.0 if apply_gain_gate else 0.0
+            total_loss = (
+                sup_loss
+                + rl_scale * args.w_grpo * (grpo_loss + args.grpo_kl_coef * approx_kl)
+                + args.w_gate_sparse * gate_loss
+                + args.w_gain_value * gain_value_loss
+                - rl_scale * args.entropy_coef * entropy
+            )
+
+            optimizer.zero_grad(set_to_none=True)
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(mara_agent.parameters(), args.grad_clip)
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+
+            values = {
+                "loss": total_loss,
+                "sup": sup_loss,
+                "seg": seg_loss,
+                "global": global_loss,
+                "consistency": consistency_loss,
+                "grpo": grpo_loss,
+                "kl": approx_kl,
+                "clip_frac": rollout["clip_fraction"],
+                "entropy": entropy,
+                "gate": gate_loss,
+                "gain_value": gain_value_loss,
+                "pred_gain": rollout["mean_predicted_gain"],
+                "accept": rollout["mean_accept_score"],
+                "gain_positive": rollout["mean_counterfactual_positive"],
+                "reward": rollout["mean_reward"],
+                "quality": rollout["mean_quality"],
+                "gain": rollout["mean_quality_gain"],
+            }
+            for key, value in values.items():
+                batch_meters[key].append(float(value.detach().item()))
+
+        for key in meters:
+            meters[key].append(float(np.mean(batch_meters[key])))
 
         print(
             f"Epoch {epoch + 1}/{args.epoch} | Batch {idx + 1}/{len(train_loader)} "
             f"| loss {meters['loss'][-1]:.4f} | sup {meters['sup'][-1]:.4f} "
             f"| seg {meters['seg'][-1]:.4f} | global {meters['global'][-1]:.4f} "
             f"| cons {meters['consistency'][-1]:.4f} "
-            f"| grpo {meters['grpo'][-1]:.4f} | gate {meters['gate'][-1]:.4f} "
+            f"| grpo {meters['grpo'][-1]:.4f} | kl {meters['kl'][-1]:.5f} "
+            f"| clip {meters['clip_frac'][-1]:.3f} | gate {meters['gate'][-1]:.4f} "
             f"| gain_v {meters['gain_value'][-1]:.4f} | pred_g {meters['pred_gain'][-1]:.4f} "
-            f"| accept {meters['accept'][-1]:.4f} | entropy {meters['entropy'][-1]:.4f} | reward {meters['reward'][-1]:.4f} "
+            f"| accept {meters['accept'][-1]:.4f} | cf_pos {meters['gain_positive'][-1]:.4f} "
+            f"| entropy {meters['entropy'][-1]:.4f} | reward {meters['reward'][-1]:.4f} "
             f"| gain {meters['gain'][-1]:.4f} | quality {meters['quality'][-1]:.4f}",
             end="\r",
             flush=True,
@@ -378,6 +418,12 @@ def train_one_epoch(
 
 def run_train(args) -> None:
     set_seed(args.seed)
+    if args.train_split.lower() == "test":
+        print(
+            "[WARN] MARA is training on split=test with ground-truth masks. "
+            "Use this only for the existing supervised/transductive protocol; "
+            "a standard unsupervised benchmark needs a separate training/validation protocol."
+        )
     if torch.cuda.is_available():
         device = torch.device(args.device)
         if device.type == "cuda":
@@ -427,7 +473,7 @@ def run_train(args) -> None:
         weight_decay=args.mara_weight_decay,
         betas=(0.9, 0.999),
     )
-    total_steps = max(1, args.epoch * len(train_loader))
+    total_steps = max(1, args.epoch * len(train_loader) * args.grpo_update_epochs)
     scheduler = build_warmup_cosine_scheduler(
         optimizer,
         warmup_steps=max(1, int(args.warmup_ratio * total_steps)),
@@ -472,10 +518,13 @@ def run_train(args) -> None:
                 f"global={meters['global']:.6f}\t"
                 f"consistency={meters['consistency']:.6f}\t"
                 f"grpo={meters['grpo']:.6f}\t"
+                f"kl={meters['kl']:.6f}\t"
+                f"clip_frac={meters['clip_frac']:.6f}\t"
                 f"gate={meters['gate']:.6f}\t"
                 f"gain_value={meters['gain_value']:.6f}\t"
                 f"pred_gain={meters['pred_gain']:.6f}\t"
                 f"accept={meters['accept']:.6f}\t"
+                f"gain_positive={meters['gain_positive']:.6f}\t"
                 f"entropy={meters['entropy']:.6f}\t"
                 f"reward={meters['reward']:.6f}\t"
                 f"gain={meters['gain']:.6f}\t"
@@ -485,8 +534,9 @@ def run_train(args) -> None:
         print(
             f"epoch_{epoch}: loss={meters['loss']:.6f}, sup={meters['sup']:.6f}, "
             f"consistency={meters['consistency']:.6f}, grpo={meters['grpo']:.6f}, "
-            f"gate={meters['gate']:.6f}, gain_value={meters['gain_value']:.6f}, "
-            f"pred_gain={meters['pred_gain']:.6f}, accept={meters['accept']:.6f}, reward={meters['reward']:.6f}, "
+            f"kl={meters['kl']:.6f}, clip={meters['clip_frac']:.6f}, gate={meters['gate']:.6f}, "
+            f"gain_value={meters['gain_value']:.6f}, pred_gain={meters['pred_gain']:.6f}, "
+            f"accept={meters['accept']:.6f}, cf_pos={meters['gain_positive']:.6f}, reward={meters['reward']:.6f}, "
             f"gain={meters['gain']:.6f}, quality={meters['quality']:.6f}, "
             f"time={time.time() - start:.2f}s, ckpt={ckpt_path}"
         )
@@ -530,29 +580,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mara_gate_init_bias", type=float, default=-3.5)
     parser.add_argument("--disable_gain_gate", action="store_true")
     parser.add_argument("--gain_accept_threshold", type=float, default=0.0)
-    parser.add_argument("--gain_gate_temperature", type=float, default=0.1)
+    parser.add_argument("--gain_gate_temperature", type=float, default=1.0)
     parser.add_argument("--gain_loss_clip", type=float, default=1.0)
+    parser.add_argument("--gain_cls_weight", type=float, default=0.5)
+    parser.add_argument("--gain_warmup_epochs", type=int, default=5)
     parser.add_argument("--force_first_refine", action="store_true")
+    parser.add_argument("--disable_base_trajectory", action="store_true")
     parser.add_argument("--mara_lr", type=float, default=1e-4)
     parser.add_argument("--mara_weight_decay", type=float, default=1e-4)
-    parser.add_argument("--mara_step_cost", type=float, default=0.01)
-    parser.add_argument("--mara_refine_cost", type=float, default=0.02)
+    parser.add_argument("--mara_step_cost", type=float, default=0.001)
+    parser.add_argument("--mara_refine_cost", type=float, default=0.002)
 
     parser.add_argument("--grpo_gamma", type=float, default=0.95)
     parser.add_argument("--grpo_clip_eps", type=float, default=0.2)
+    parser.add_argument("--grpo_update_epochs", type=int, default=3)
+    parser.add_argument("--grpo_kl_coef", type=float, default=0.01)
     parser.add_argument("--base_anchor_margin", type=float, default=0.0)
     parser.add_argument("--negative_advantage_scale", type=float, default=1.0)
     parser.add_argument("--advantage_clip", type=float, default=5.0)
     parser.add_argument("--entropy_coef", type=float, default=0.01)
     parser.add_argument("--reward_cls_weight", type=float, default=0.5)
     parser.add_argument("--reward_loc_weight", type=float, default=1.0)
-    parser.add_argument("--reward_conf_weight", type=float, default=0.1)
+    parser.add_argument("--reward_conf_weight", type=float, default=0.0)
     parser.add_argument("--reward_fp_weight", type=float, default=0.2)
 
     parser.add_argument("--w_seg", type=float, default=0.7)
     parser.add_argument("--w_global", type=float, default=0.3)
     parser.add_argument("--w_base_consistency", type=float, default=0.05)
-    parser.add_argument("--w_grpo", type=float, default=0.1)
+    parser.add_argument("--w_grpo", type=float, default=0.5)
     parser.add_argument("--w_gate_sparse", type=float, default=0.01)
     parser.add_argument("--w_gain_value", type=float, default=0.05)
     parser.add_argument("--warmup_ratio", type=float, default=0.05)

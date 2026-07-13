@@ -89,7 +89,9 @@ def config_from_payload(payload: Dict, args) -> MARAConfig:
             "group_size": 1,
         }
     mara_state = payload.get("mara_agent", {})
-    if mara_state and not any(str(key).startswith("gain_head.") for key in mara_state.keys()):
+    has_gain_regressor = any(str(key).startswith("gain_head.") for key in mara_state.keys())
+    has_gain_classifier = any(str(key).startswith("gain_accept_head.") for key in mara_state.keys())
+    if mara_state and not (has_gain_regressor and has_gain_classifier):
         cfg_dict["use_gain_gate"] = False
     valid_keys = MARAConfig.__dataclass_fields__.keys()
     return MARAConfig(**{k: v for k, v in cfg_dict.items() if k in valid_keys})
@@ -178,6 +180,9 @@ def evaluate_category(
     base_maps = []
     mara_maps = []
     gate_values = []
+    gate_roi_values = []
+    changed_values = []
+    refine_values = []
     gain_values = []
     accept_values = []
     gt_masks = []
@@ -216,10 +221,26 @@ def evaluate_category(
             mara_maps.append(output["final_prob"][:, 1].detach().cpu().numpy())
             if "gate_map" in output:
                 gate_values.append(output["gate_map"].detach().mean(dim=(1, 2, 3)).cpu().numpy())
+            if "gate_roi_mean" in output:
+                gate_roi_values.append(output["gate_roi_mean"].detach().cpu().numpy())
+            if "changed_ratio" in output:
+                changed_values.append(output["changed_ratio"].detach().cpu().numpy())
+            if "refine_steps" in output:
+                refine_values.append(output["refine_steps"].detach().cpu().numpy())
+            refined = output.get("refine_steps")
+            refined_mask = refined > 0 if refined is not None else None
             if "predicted_gain" in output:
-                gain_values.append(output["predicted_gain"].detach().cpu().numpy())
+                values = output["predicted_gain"]
+                if refined_mask is not None:
+                    values = values[refined_mask]
+                if values.numel() > 0:
+                    gain_values.append(values.detach().cpu().numpy())
             if "accept_score" in output:
-                accept_values.append(output["accept_score"].detach().cpu().numpy())
+                values = output["accept_score"]
+                if refined_mask is not None:
+                    values = values[refined_mask]
+                if values.numel() > 0:
+                    accept_values.append(values.detach().cpu().numpy())
             mask_np = mask[:, 0].detach().cpu().numpy() if mask.dim() == 4 else mask.detach().cpu().numpy()
             gt_masks.append((mask_np > 0.5).astype(np.uint8))
             img_paths.extend(list(image_info["image_path"]))
@@ -243,6 +264,9 @@ def evaluate_category(
         row[f"mara_{metric_name}"] = mara_metrics[metric_name]
         row[f"delta_{metric_name}"] = mara_metrics[metric_name] - base_metrics[metric_name]
     row["gate_mean"] = float(np.concatenate(gate_values).mean()) if gate_values else 0.0
+    row["gate_roi_mean"] = float(np.concatenate(gate_roi_values).mean()) if gate_roi_values else 0.0
+    row["changed_ratio_mean"] = float(np.concatenate(changed_values).mean()) if changed_values else 0.0
+    row["refine_steps_mean"] = float(np.concatenate(refine_values).mean()) if refine_values else 0.0
     row["pred_gain_mean"] = float(np.concatenate(gain_values).mean()) if gain_values else 0.0
     row["accept_mean"] = float(np.concatenate(accept_values).mean()) if accept_values else 0.0
     return row
@@ -256,6 +280,9 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
         for metric_name in metric_names:
             means[f"mean_{prefix}_{metric_name}"] = float(np.mean([r[f"{prefix}_{metric_name}"] for r in rows]))
     means["mean_gate"] = float(np.mean([r["gate_mean"] for r in rows]))
+    means["mean_gate_roi"] = float(np.mean([r["gate_roi_mean"] for r in rows]))
+    means["mean_changed_ratio"] = float(np.mean([r["changed_ratio_mean"] for r in rows]))
+    means["mean_refine_steps"] = float(np.mean([r["refine_steps_mean"] for r in rows]))
     means["mean_pred_gain"] = float(np.mean([r["pred_gain_mean"] for r in rows]))
     means["mean_accept"] = float(np.mean([r["accept_mean"] for r in rows]))
 
@@ -266,7 +293,8 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
             f"{'Classname':<18s}"
             f"{'Base_PRO':>10s}{'MARA_PRO':>10s}{'D_PRO':>10s}"
             f"{'Base_F1':>10s}{'MARA_F1':>10s}{'D_F1':>10s}"
-            f"{'Gate':>10s}{'GainPred':>10s}{'Accept':>10s}"
+            f"{'Gate':>10s}{'GateROI':>10s}{'Changed':>10s}{'Refine':>10s}"
+            f"{'GainPred':>10s}{'Accept':>10s}"
             f"{'Base_P-AUC':>12s}{'MARA_P-AUC':>12s}{'D_P-AUC':>10s}"
             f"{'Base_I-AUC':>12s}{'MARA_I-AUC':>12s}{'D_I-AUC':>10s}\n"
         )
@@ -275,7 +303,9 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
                 f"{row['category']:<18s}"
                 f"{row['base_PRO']:>10.5f}{row['mara_PRO']:>10.5f}{row['delta_PRO']:>10.5f}"
                 f"{row['base_F1']:>10.5f}{row['mara_F1']:>10.5f}{row['delta_F1']:>10.5f}"
-                f"{row['gate_mean']:>10.5f}{row['pred_gain_mean']:>10.5f}{row['accept_mean']:>10.5f}"
+                f"{row['gate_mean']:>10.5f}{row['gate_roi_mean']:>10.5f}"
+                f"{row['changed_ratio_mean']:>10.5f}{row['refine_steps_mean']:>10.5f}"
+                f"{row['pred_gain_mean']:>10.5f}{row['accept_mean']:>10.5f}"
                 f"{row['base_P_AUROC']:>12.5f}{row['mara_P_AUROC']:>12.5f}{row['delta_P_AUROC']:>10.5f}"
                 f"{row['base_I_AUROC']:>12.5f}{row['mara_I_AUROC']:>12.5f}{row['delta_I_AUROC']:>10.5f}\n"
             )
@@ -283,7 +313,9 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
             f"{'Mean':<18s}"
             f"{means['mean_base_PRO']:>10.5f}{means['mean_mara_PRO']:>10.5f}{means['mean_delta_PRO']:>10.5f}"
             f"{means['mean_base_F1']:>10.5f}{means['mean_mara_F1']:>10.5f}{means['mean_delta_F1']:>10.5f}"
-            f"{means['mean_gate']:>10.5f}{means['mean_pred_gain']:>10.5f}{means['mean_accept']:>10.5f}"
+            f"{means['mean_gate']:>10.5f}{means['mean_gate_roi']:>10.5f}"
+            f"{means['mean_changed_ratio']:>10.5f}{means['mean_refine_steps']:>10.5f}"
+            f"{means['mean_pred_gain']:>10.5f}{means['mean_accept']:>10.5f}"
             f"{means['mean_base_P_AUROC']:>12.5f}{means['mean_mara_P_AUROC']:>12.5f}{means['mean_delta_P_AUROC']:>10.5f}"
             f"{means['mean_base_I_AUROC']:>12.5f}{means['mean_mara_I_AUROC']:>12.5f}{means['mean_delta_I_AUROC']:>10.5f}\n\n"
         )
@@ -294,6 +326,9 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
         for metric_name in metric_names:
             fieldnames.extend([f"base_{metric_name}", f"mara_{metric_name}", f"delta_{metric_name}"])
         fieldnames.append("gate_mean")
+        fieldnames.append("gate_roi_mean")
+        fieldnames.append("changed_ratio_mean")
+        fieldnames.append("refine_steps_mean")
         fieldnames.append("pred_gain_mean")
         fieldnames.append("accept_mean")
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -406,6 +441,8 @@ def main():
             f"mara={summary['mean_mara_F1']:.5f}, "
             f"delta={summary['mean_delta_F1']:.5f}, "
             f"gate={summary['mean_gate']:.5f}, "
+            f"gate_roi={summary['mean_gate_roi']:.5f}, "
+            f"refine={summary['mean_refine_steps']:.3f}, "
             f"pred_gain={summary['mean_pred_gain']:.5f}, "
             f"accept={summary['mean_accept']:.5f}"
         )
@@ -417,6 +454,9 @@ def main():
         for prefix in ("base", "mara", "delta"):
             fieldnames.extend([f"mean_{prefix}_{metric_name}" for metric_name in metric_names])
         fieldnames.append("mean_gate")
+        fieldnames.append("mean_gate_roi")
+        fieldnames.append("mean_changed_ratio")
+        fieldnames.append("mean_refine_steps")
         fieldnames.append("mean_pred_gain")
         fieldnames.append("mean_accept")
         fieldnames.append("ckpt_path")
@@ -436,6 +476,8 @@ def main():
         f"Delta_PRO={best['mean_delta_PRO']:.5f}, "
         f"MARA_F1={best['mean_mara_F1']:.5f}, "
         f"Gate={best['mean_gate']:.5f}, "
+        f"GateROI={best['mean_gate_roi']:.5f}, "
+        f"Refine={best['mean_refine_steps']:.3f}, "
         f"PredGain={best['mean_pred_gain']:.5f}, "
         f"Accept={best['mean_accept']:.5f}"
     )
