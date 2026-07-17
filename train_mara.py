@@ -199,6 +199,10 @@ def build_mara_config(args) -> MARAConfig:
         gain_gate_temperature=args.gain_gate_temperature,
         gain_loss_clip=args.gain_loss_clip,
         gain_cls_weight=args.gain_cls_weight,
+        gain_safety_margin=args.gain_safety_margin,
+        gain_accept_probability=args.gain_accept_probability,
+        hard_gain_gate=not args.disable_hard_gain_gate,
+        gain_consistency_temperature=args.gain_consistency_temperature,
     )
 
 
@@ -265,6 +269,8 @@ def train_one_epoch(
         "entropy": [],
         "gate": [],
         "gain_value": [],
+        "gain_consistency": [],
+        "op_aux": [],
         "pred_gain": [],
         "accept": [],
         "gain_positive": [],
@@ -357,12 +363,16 @@ def train_one_epoch(
             entropy = rollout["entropy"]
             gate_loss = rollout["gate_l1"]
             gain_value_loss = rollout["gain_loss"]
+            gain_consistency_loss = rollout["gain_consistency_loss"]
+            op_aux_loss = rollout["op_aux_loss"]
             rl_scale = 1.0 if apply_gain_gate else 0.0
             total_loss = (
                 sup_loss
                 + rl_scale * args.w_grpo * (grpo_loss + args.grpo_kl_coef * approx_kl)
                 + args.w_gate_sparse * gate_loss
                 + args.w_gain_value * gain_value_loss
+                + args.w_gain_consistency * gain_consistency_loss
+                + args.w_op_aux * op_aux_loss
                 - rl_scale * args.entropy_coef * entropy
             )
 
@@ -385,6 +395,8 @@ def train_one_epoch(
                 "entropy": entropy,
                 "gate": gate_loss,
                 "gain_value": gain_value_loss,
+                "gain_consistency": gain_consistency_loss,
+                "op_aux": op_aux_loss,
                 "pred_gain": rollout["mean_predicted_gain"],
                 "accept": rollout["mean_accept_score"],
                 "gain_positive": rollout["mean_counterfactual_positive"],
@@ -405,7 +417,8 @@ def train_one_epoch(
             f"| cons {meters['consistency'][-1]:.4f} "
             f"| grpo {meters['grpo'][-1]:.4f} | kl {meters['kl'][-1]:.5f} "
             f"| clip {meters['clip_frac'][-1]:.3f} | gate {meters['gate'][-1]:.4f} "
-            f"| gain_v {meters['gain_value'][-1]:.4f} | pred_g {meters['pred_gain'][-1]:.4f} "
+            f"| gain_v {meters['gain_value'][-1]:.4f} | gain_c {meters['gain_consistency'][-1]:.4f} "
+            f"| op_aux {meters['op_aux'][-1]:.4f} | pred_g {meters['pred_gain'][-1]:.4f} "
             f"| accept {meters['accept'][-1]:.4f} | cf_pos {meters['gain_positive'][-1]:.4f} "
             f"| entropy {meters['entropy'][-1]:.4f} | reward {meters['reward'][-1]:.4f} "
             f"| gain {meters['gain'][-1]:.4f} | quality {meters['quality'][-1]:.4f}",
@@ -522,6 +535,8 @@ def run_train(args) -> None:
                 f"clip_frac={meters['clip_frac']:.6f}\t"
                 f"gate={meters['gate']:.6f}\t"
                 f"gain_value={meters['gain_value']:.6f}\t"
+                f"gain_consistency={meters['gain_consistency']:.6f}\t"
+                f"op_aux={meters['op_aux']:.6f}\t"
                 f"pred_gain={meters['pred_gain']:.6f}\t"
                 f"accept={meters['accept']:.6f}\t"
                 f"gain_positive={meters['gain_positive']:.6f}\t"
@@ -535,7 +550,8 @@ def run_train(args) -> None:
             f"epoch_{epoch}: loss={meters['loss']:.6f}, sup={meters['sup']:.6f}, "
             f"consistency={meters['consistency']:.6f}, grpo={meters['grpo']:.6f}, "
             f"kl={meters['kl']:.6f}, clip={meters['clip_frac']:.6f}, gate={meters['gate']:.6f}, "
-            f"gain_value={meters['gain_value']:.6f}, pred_gain={meters['pred_gain']:.6f}, "
+            f"gain_value={meters['gain_value']:.6f}, gain_consistency={meters['gain_consistency']:.6f}, "
+            f"op_aux={meters['op_aux']:.6f}, pred_gain={meters['pred_gain']:.6f}, "
             f"accept={meters['accept']:.6f}, cf_pos={meters['gain_positive']:.6f}, reward={meters['reward']:.6f}, "
             f"gain={meters['gain']:.6f}, quality={meters['quality']:.6f}, "
             f"time={time.time() - start:.2f}s, ckpt={ckpt_path}"
@@ -575,15 +591,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mara_regions", type=int, default=16)
     parser.add_argument("--mara_roi_size", type=int, default=32)
     parser.add_argument("--mara_hidden_dim", type=int, default=64)
-    parser.add_argument("--mara_delta_scale", type=float, default=0.35)
-    parser.add_argument("--mara_gate_max", type=float, default=0.50)
+    parser.add_argument("--mara_delta_scale", type=float, default=0.25)
+    parser.add_argument("--mara_gate_max", type=float, default=0.25)
     parser.add_argument("--mara_gate_init_bias", type=float, default=-3.5)
     parser.add_argument("--disable_gain_gate", action="store_true")
     parser.add_argument("--gain_accept_threshold", type=float, default=0.0)
     parser.add_argument("--gain_gate_temperature", type=float, default=1.0)
     parser.add_argument("--gain_loss_clip", type=float, default=1.0)
     parser.add_argument("--gain_cls_weight", type=float, default=0.5)
+    parser.add_argument("--gain_safety_margin", type=float, default=0.0)
+    parser.add_argument("--gain_accept_probability", type=float, default=0.55)
+    parser.add_argument("--gain_consistency_temperature", type=float, default=0.05)
     parser.add_argument("--gain_warmup_epochs", type=int, default=5)
+    parser.add_argument("--disable_hard_gain_gate", action="store_true")
     parser.add_argument("--force_first_refine", action="store_true")
     parser.add_argument("--disable_base_trajectory", action="store_true")
     parser.add_argument("--mara_lr", type=float, default=1e-4)
@@ -610,6 +630,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--w_grpo", type=float, default=0.5)
     parser.add_argument("--w_gate_sparse", type=float, default=0.01)
     parser.add_argument("--w_gain_value", type=float, default=0.05)
+    parser.add_argument("--w_gain_consistency", type=float, default=0.05)
+    parser.add_argument("--w_op_aux", type=float, default=0.1)
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--min_lr_ratio", type=float, default=0.05)
     parser.add_argument("--grad_clip", type=float, default=1.0)

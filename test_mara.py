@@ -94,7 +94,14 @@ def config_from_payload(payload: Dict, args) -> MARAConfig:
     if mara_state and not (has_gain_regressor and has_gain_classifier):
         cfg_dict["use_gain_gate"] = False
     valid_keys = MARAConfig.__dataclass_fields__.keys()
-    return MARAConfig(**{k: v for k, v in cfg_dict.items() if k in valid_keys})
+    cfg = MARAConfig(**{k: v for k, v in cfg_dict.items() if k in valid_keys})
+    if args.gain_safety_margin is not None:
+        cfg.gain_safety_margin = args.gain_safety_margin
+    if args.gain_accept_probability is not None:
+        cfg.gain_accept_probability = args.gain_accept_probability
+    if args.disable_hard_gain_gate:
+        cfg.hard_gain_gate = False
+    return cfg
 
 
 def apply_payload_runtime_config(payload: Dict, args) -> None:
@@ -183,6 +190,8 @@ def evaluate_category(
     gate_roi_values = []
     changed_values = []
     refine_values = []
+    attempt_values = []
+    reject_values = []
     gain_values = []
     accept_values = []
     gt_masks = []
@@ -227,8 +236,12 @@ def evaluate_category(
                 changed_values.append(output["changed_ratio"].detach().cpu().numpy())
             if "refine_steps" in output:
                 refine_values.append(output["refine_steps"].detach().cpu().numpy())
-            refined = output.get("refine_steps")
-            refined_mask = refined > 0 if refined is not None else None
+            if "refine_attempts" in output:
+                attempt_values.append(output["refine_attempts"].detach().cpu().numpy())
+            if "rejected_steps" in output:
+                reject_values.append(output["rejected_steps"].detach().cpu().numpy())
+            attempted = output.get("refine_attempts", output.get("refine_steps"))
+            refined_mask = attempted > 0 if attempted is not None else None
             if "predicted_gain" in output:
                 values = output["predicted_gain"]
                 if refined_mask is not None:
@@ -267,6 +280,8 @@ def evaluate_category(
     row["gate_roi_mean"] = float(np.concatenate(gate_roi_values).mean()) if gate_roi_values else 0.0
     row["changed_ratio_mean"] = float(np.concatenate(changed_values).mean()) if changed_values else 0.0
     row["refine_steps_mean"] = float(np.concatenate(refine_values).mean()) if refine_values else 0.0
+    row["refine_attempts_mean"] = float(np.concatenate(attempt_values).mean()) if attempt_values else 0.0
+    row["rejected_steps_mean"] = float(np.concatenate(reject_values).mean()) if reject_values else 0.0
     row["pred_gain_mean"] = float(np.concatenate(gain_values).mean()) if gain_values else 0.0
     row["accept_mean"] = float(np.concatenate(accept_values).mean()) if accept_values else 0.0
     return row
@@ -283,6 +298,8 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
     means["mean_gate_roi"] = float(np.mean([r["gate_roi_mean"] for r in rows]))
     means["mean_changed_ratio"] = float(np.mean([r["changed_ratio_mean"] for r in rows]))
     means["mean_refine_steps"] = float(np.mean([r["refine_steps_mean"] for r in rows]))
+    means["mean_refine_attempts"] = float(np.mean([r["refine_attempts_mean"] for r in rows]))
+    means["mean_rejected_steps"] = float(np.mean([r["rejected_steps_mean"] for r in rows]))
     means["mean_pred_gain"] = float(np.mean([r["pred_gain_mean"] for r in rows]))
     means["mean_accept"] = float(np.mean([r["accept_mean"] for r in rows]))
 
@@ -293,7 +310,8 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
             f"{'Classname':<18s}"
             f"{'Base_PRO':>10s}{'MARA_PRO':>10s}{'D_PRO':>10s}"
             f"{'Base_F1':>10s}{'MARA_F1':>10s}{'D_F1':>10s}"
-            f"{'Gate':>10s}{'GateROI':>10s}{'Changed':>10s}{'Refine':>10s}"
+            f"{'Gate':>10s}{'GateROI':>10s}{'Changed':>10s}"
+            f"{'Attempt':>10s}{'Refine':>10s}{'Reject':>10s}"
             f"{'GainPred':>10s}{'Accept':>10s}"
             f"{'Base_P-AUC':>12s}{'MARA_P-AUC':>12s}{'D_P-AUC':>10s}"
             f"{'Base_I-AUC':>12s}{'MARA_I-AUC':>12s}{'D_I-AUC':>10s}\n"
@@ -304,7 +322,8 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
                 f"{row['base_PRO']:>10.5f}{row['mara_PRO']:>10.5f}{row['delta_PRO']:>10.5f}"
                 f"{row['base_F1']:>10.5f}{row['mara_F1']:>10.5f}{row['delta_F1']:>10.5f}"
                 f"{row['gate_mean']:>10.5f}{row['gate_roi_mean']:>10.5f}"
-                f"{row['changed_ratio_mean']:>10.5f}{row['refine_steps_mean']:>10.5f}"
+                f"{row['changed_ratio_mean']:>10.5f}{row['refine_attempts_mean']:>10.5f}"
+                f"{row['refine_steps_mean']:>10.5f}{row['rejected_steps_mean']:>10.5f}"
                 f"{row['pred_gain_mean']:>10.5f}{row['accept_mean']:>10.5f}"
                 f"{row['base_P_AUROC']:>12.5f}{row['mara_P_AUROC']:>12.5f}{row['delta_P_AUROC']:>10.5f}"
                 f"{row['base_I_AUROC']:>12.5f}{row['mara_I_AUROC']:>12.5f}{row['delta_I_AUROC']:>10.5f}\n"
@@ -314,7 +333,8 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
             f"{means['mean_base_PRO']:>10.5f}{means['mean_mara_PRO']:>10.5f}{means['mean_delta_PRO']:>10.5f}"
             f"{means['mean_base_F1']:>10.5f}{means['mean_mara_F1']:>10.5f}{means['mean_delta_F1']:>10.5f}"
             f"{means['mean_gate']:>10.5f}{means['mean_gate_roi']:>10.5f}"
-            f"{means['mean_changed_ratio']:>10.5f}{means['mean_refine_steps']:>10.5f}"
+            f"{means['mean_changed_ratio']:>10.5f}{means['mean_refine_attempts']:>10.5f}"
+            f"{means['mean_refine_steps']:>10.5f}{means['mean_rejected_steps']:>10.5f}"
             f"{means['mean_pred_gain']:>10.5f}{means['mean_accept']:>10.5f}"
             f"{means['mean_base_P_AUROC']:>12.5f}{means['mean_mara_P_AUROC']:>12.5f}{means['mean_delta_P_AUROC']:>10.5f}"
             f"{means['mean_base_I_AUROC']:>12.5f}{means['mean_mara_I_AUROC']:>12.5f}{means['mean_delta_I_AUROC']:>10.5f}\n\n"
@@ -329,6 +349,8 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
         fieldnames.append("gate_roi_mean")
         fieldnames.append("changed_ratio_mean")
         fieldnames.append("refine_steps_mean")
+        fieldnames.append("refine_attempts_mean")
+        fieldnames.append("rejected_steps_mean")
         fieldnames.append("pred_gain_mean")
         fieldnames.append("accept_mean")
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -368,6 +390,9 @@ def main():
     parser.add_argument("--mara_regions", type=int, default=16)
     parser.add_argument("--mara_roi_size", type=int, default=32)
     parser.add_argument("--mara_hidden_dim", type=int, default=64)
+    parser.add_argument("--gain_safety_margin", type=float, default=None)
+    parser.add_argument("--gain_accept_probability", type=float, default=None)
+    parser.add_argument("--disable_hard_gain_gate", action="store_true")
 
     parser.add_argument("--norm_mode", type=str, default="none", choices=["none", "per_image", "per_class"])
     parser.add_argument("--pro_num_th", type=int, default=1000)
@@ -442,7 +467,9 @@ def main():
             f"delta={summary['mean_delta_F1']:.5f}, "
             f"gate={summary['mean_gate']:.5f}, "
             f"gate_roi={summary['mean_gate_roi']:.5f}, "
+            f"attempt={summary['mean_refine_attempts']:.3f}, "
             f"refine={summary['mean_refine_steps']:.3f}, "
+            f"reject={summary['mean_rejected_steps']:.3f}, "
             f"pred_gain={summary['mean_pred_gain']:.5f}, "
             f"accept={summary['mean_accept']:.5f}"
         )
@@ -457,6 +484,8 @@ def main():
         fieldnames.append("mean_gate_roi")
         fieldnames.append("mean_changed_ratio")
         fieldnames.append("mean_refine_steps")
+        fieldnames.append("mean_refine_attempts")
+        fieldnames.append("mean_rejected_steps")
         fieldnames.append("mean_pred_gain")
         fieldnames.append("mean_accept")
         fieldnames.append("ckpt_path")
@@ -477,7 +506,9 @@ def main():
         f"MARA_F1={best['mean_mara_F1']:.5f}, "
         f"Gate={best['mean_gate']:.5f}, "
         f"GateROI={best['mean_gate_roi']:.5f}, "
+        f"Attempt={best['mean_refine_attempts']:.3f}, "
         f"Refine={best['mean_refine_steps']:.3f}, "
+        f"Reject={best['mean_rejected_steps']:.3f}, "
         f"PredGain={best['mean_pred_gain']:.5f}, "
         f"Accept={best['mean_accept']:.5f}"
     )

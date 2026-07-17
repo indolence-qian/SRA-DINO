@@ -26,13 +26,16 @@ GRPO_KL_COEF="${GRPO_KL_COEF:-0.01}"
 MARA_STEPS="${MARA_STEPS:-3}"
 MARA_STEP_COST="${MARA_STEP_COST:-0.001}"
 MARA_REFINE_COST="${MARA_REFINE_COST:-0.002}"
-MARA_DELTA_SCALE="${MARA_DELTA_SCALE:-0.35}"
-MARA_GATE_MAX="${MARA_GATE_MAX:-0.50}"
+MARA_DELTA_SCALE="${MARA_DELTA_SCALE:-0.25}"
+MARA_GATE_MAX="${MARA_GATE_MAX:-0.25}"
 MARA_GATE_INIT_BIAS="${MARA_GATE_INIT_BIAS:--3.5}"
 GAIN_ACCEPT_THRESHOLD="${GAIN_ACCEPT_THRESHOLD:-0.0}"
 GAIN_GATE_TEMPERATURE="${GAIN_GATE_TEMPERATURE:-1.0}"
 GAIN_LOSS_CLIP="${GAIN_LOSS_CLIP:-1.0}"
 GAIN_CLS_WEIGHT="${GAIN_CLS_WEIGHT:-0.5}"
+GAIN_SAFETY_MARGIN="${GAIN_SAFETY_MARGIN:-0.0}"
+GAIN_ACCEPT_PROBABILITY="${GAIN_ACCEPT_PROBABILITY:-0.55}"
+GAIN_CONSISTENCY_TEMPERATURE="${GAIN_CONSISTENCY_TEMPERATURE:-0.05}"
 GAIN_WARMUP_EPOCHS="${GAIN_WARMUP_EPOCHS:-5}"
 DISABLE_GAIN_GATE="${DISABLE_GAIN_GATE:-0}"
 BASE_ANCHOR_MARGIN="${BASE_ANCHOR_MARGIN:-0.0}"
@@ -42,6 +45,8 @@ W_BASE_CONSISTENCY="${W_BASE_CONSISTENCY:-0.05}"
 W_GRPO="${W_GRPO:-0.5}"
 W_GATE_SPARSE="${W_GATE_SPARSE:-0.01}"
 W_GAIN_VALUE="${W_GAIN_VALUE:-0.05}"
+W_GAIN_CONSISTENCY="${W_GAIN_CONSISTENCY:-0.05}"
+W_OP_AUX="${W_OP_AUX:-0.1}"
 REWARD_CONF_WEIGHT="${REWARD_CONF_WEIGHT:-0.0}"
 
 RUN_BASE="${RUN_BASE:-1}"
@@ -60,7 +65,7 @@ echo "Log: ${LOG_FILE}"
 echo "Dataset=${DATASET}, Device=${DEVICE}, HFA=${HFA_SETTING}, visual_layers=${VISUAL_LAYERS}"
 echo "MARA gate: max=${MARA_GATE_MAX}, init_bias=${MARA_GATE_INIT_BIAS}, sparse_weight=${W_GATE_SPARSE}"
 echo "GRPO: group=${GRPO_GROUP_SIZE}, replay_updates=${GRPO_UPDATE_EPOCHS}, kl_coef=${GRPO_KL_COEF}, weight=${W_GRPO}"
-echo "Gain gate: disabled=${DISABLE_GAIN_GATE}, warmup=${GAIN_WARMUP_EPOCHS}, threshold=${GAIN_ACCEPT_THRESHOLD}, temperature=${GAIN_GATE_TEMPERATURE}, value_weight=${W_GAIN_VALUE}"
+echo "Gain gate: disabled=${DISABLE_GAIN_GATE}, warmup=${GAIN_WARMUP_EPOCHS}, target_threshold=${GAIN_ACCEPT_THRESHOLD}, safety_margin=${GAIN_SAFETY_MARGIN}, accept_probability=${GAIN_ACCEPT_PROBABILITY}"
 
 BASE_RESULT_PATH="./checkpoint/base_${DATASET}_${HFA_SETTING}_${TS}"
 MARA_RESULT_PATH="./checkpoint/mara_${DATASET}_${HFA_SETTING}_${TS}"
@@ -123,6 +128,9 @@ if [[ "${RUN_MARA}" == "1" ]]; then
     --gain_gate_temperature "${GAIN_GATE_TEMPERATURE}" \
     --gain_loss_clip "${GAIN_LOSS_CLIP}" \
     --gain_cls_weight "${GAIN_CLS_WEIGHT}" \
+    --gain_safety_margin "${GAIN_SAFETY_MARGIN}" \
+    --gain_accept_probability "${GAIN_ACCEPT_PROBABILITY}" \
+    --gain_consistency_temperature "${GAIN_CONSISTENCY_TEMPERATURE}" \
     --gain_warmup_epochs "${GAIN_WARMUP_EPOCHS}" \
     --base_anchor_margin "${BASE_ANCHOR_MARGIN}" \
     --negative_advantage_scale "${NEGATIVE_ADVANTAGE_SCALE}" \
@@ -131,6 +139,8 @@ if [[ "${RUN_MARA}" == "1" ]]; then
     --w_grpo "${W_GRPO}" \
     --w_gate_sparse "${W_GATE_SPARSE}" \
     --w_gain_value "${W_GAIN_VALUE}" \
+    --w_gain_consistency "${W_GAIN_CONSISTENCY}" \
+    --w_op_aux "${W_OP_AUX}" \
     --reward_conf_weight "${REWARD_CONF_WEIGHT}" \
     "${GAIN_GATE_FLAG[@]}"
 fi
