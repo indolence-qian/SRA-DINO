@@ -6,7 +6,11 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from tools.loss import BinaryDiceLoss, FocalLoss
 from tools.mara_agent import MARAAgent, MARAConfig
@@ -24,6 +28,76 @@ from train_up import (
 
 
 HFA_CHOICES = ("none", "l5", "l11", "l17", "l23", "hfa1", "hfa2", "hfa3", "hfa4")
+
+
+def setup_distributed(args) -> torch.device:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    args.distributed = world_size > 1
+    args.world_size = world_size
+    args.rank = 0
+    args.local_rank = int(os.environ.get("LOCAL_RANK", getattr(args, "local_rank", 0)))
+
+    if args.distributed:
+        if not torch.cuda.is_available():
+            raise RuntimeError("Distributed MARA training requires CUDA/NCCL.")
+        torch.cuda.set_device(args.local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
+        args.rank = dist.get_rank()
+        args.world_size = dist.get_world_size()
+        device = torch.device("cuda", args.local_rank)
+    elif torch.cuda.is_available():
+        device = torch.device(args.device)
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
+
+    args.is_main_process = args.rank == 0
+    return device
+
+
+def cleanup_distributed() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def unwrap_mara_agent(module: torch.nn.Module) -> MARAAgent:
+    return module.module if isinstance(module, DDP) else module
+
+
+def build_distributed_loader(loader: DataLoader, args) -> Tuple[DataLoader, Optional[DistributedSampler]]:
+    if not args.distributed:
+        return loader, None
+
+    sampler = DistributedSampler(
+        loader.dataset,
+        num_replicas=args.world_size,
+        rank=args.rank,
+        shuffle=True,
+        seed=args.seed,
+        drop_last=False,
+    )
+    distributed_loader = DataLoader(
+        loader.dataset,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        shuffle=False,
+        num_workers=loader.num_workers,
+        collate_fn=loader.collate_fn,
+        pin_memory=loader.pin_memory,
+        drop_last=loader.drop_last,
+    )
+    return distributed_loader, sampler
+
+
+def reduce_epoch_metrics(meters: Dict[str, float], device: torch.device, args) -> Dict[str, float]:
+    if not args.distributed:
+        return meters
+    keys = list(meters.keys())
+    values = torch.tensor([meters[key] for key in keys], device=device, dtype=torch.float64)
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    values /= float(args.world_size)
+    return {key: float(value) for key, value in zip(keys, values.cpu().tolist())}
 
 
 def freeze_module(module: Optional[torch.nn.Module]) -> None:
@@ -217,6 +291,7 @@ def save_mara_checkpoint(
     args,
 ) -> str:
     os.makedirs(save_dir, exist_ok=True)
+    mara_agent = unwrap_mara_agent(mara_agent)
     payload = {
         "epoch": epoch,
         "base_ckpt": args.base_ckpt,
@@ -242,7 +317,7 @@ def save_mara_checkpoint(
 
 def train_one_epoch(
     epoch: int,
-    mara_agent: MARAAgent,
+    mara_agent: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler,
     clip_model: torch.nn.Module,
@@ -312,7 +387,7 @@ def train_one_epoch(
 
         apply_gain_gate = epoch >= args.gain_warmup_epochs
         with torch.no_grad():
-            behavior = mara_agent.rollout(
+            behavior = unwrap_mara_agent(mara_agent).rollout(
                 base_prob=base_map,
                 base_logits=base_logits,
                 layer_maps=layer_maps,
@@ -326,7 +401,7 @@ def train_one_epoch(
         batch_meters = {key: [] for key in meters}
 
         for _ in range(args.grpo_update_epochs):
-            rollout = mara_agent.rollout(
+            rollout = mara_agent(
                 base_prob=base_map,
                 base_logits=base_logits,
                 layer_maps=layer_maps,
@@ -410,52 +485,54 @@ def train_one_epoch(
         for key in meters:
             meters[key].append(float(np.mean(batch_meters[key])))
 
-        print(
-            f"Epoch {epoch + 1}/{args.epoch} | Batch {idx + 1}/{len(train_loader)} "
-            f"| loss {meters['loss'][-1]:.4f} | sup {meters['sup'][-1]:.4f} "
-            f"| seg {meters['seg'][-1]:.4f} | global {meters['global'][-1]:.4f} "
-            f"| cons {meters['consistency'][-1]:.4f} "
-            f"| grpo {meters['grpo'][-1]:.4f} | kl {meters['kl'][-1]:.5f} "
-            f"| clip {meters['clip_frac'][-1]:.3f} | gate {meters['gate'][-1]:.4f} "
-            f"| gain_v {meters['gain_value'][-1]:.4f} | gain_c {meters['gain_consistency'][-1]:.4f} "
-            f"| op_aux {meters['op_aux'][-1]:.4f} | pred_g {meters['pred_gain'][-1]:.4f} "
-            f"| accept {meters['accept'][-1]:.4f} | cf_pos {meters['gain_positive'][-1]:.4f} "
-            f"| entropy {meters['entropy'][-1]:.4f} | reward {meters['reward'][-1]:.4f} "
-            f"| gain {meters['gain'][-1]:.4f} | quality {meters['quality'][-1]:.4f}",
-            end="\r",
-            flush=True,
-        )
+        if args.is_main_process:
+            print(
+                f"Epoch {epoch + 1}/{args.epoch} | Batch {idx + 1}/{len(train_loader)} "
+                f"| loss {meters['loss'][-1]:.4f} | sup {meters['sup'][-1]:.4f} "
+                f"| seg {meters['seg'][-1]:.4f} | global {meters['global'][-1]:.4f} "
+                f"| cons {meters['consistency'][-1]:.4f} "
+                f"| grpo {meters['grpo'][-1]:.4f} | kl {meters['kl'][-1]:.5f} "
+                f"| clip {meters['clip_frac'][-1]:.3f} | gate {meters['gate'][-1]:.4f} "
+                f"| gain_v {meters['gain_value'][-1]:.4f} | gain_c {meters['gain_consistency'][-1]:.4f} "
+                f"| op_aux {meters['op_aux'][-1]:.4f} | pred_g {meters['pred_gain'][-1]:.4f} "
+                f"| accept {meters['accept'][-1]:.4f} | cf_pos {meters['gain_positive'][-1]:.4f} "
+                f"| entropy {meters['entropy'][-1]:.4f} | reward {meters['reward'][-1]:.4f} "
+                f"| gain {meters['gain'][-1]:.4f} | quality {meters['quality'][-1]:.4f}",
+                end="\r",
+                flush=True,
+            )
 
-    return {key: float(np.mean(values)) if values else 0.0 for key, values in meters.items()}
+    epoch_metrics = {key: float(np.mean(values)) if values else 0.0 for key, values in meters.items()}
+    return reduce_epoch_metrics(epoch_metrics, device, args)
 
 
 def run_train(args) -> None:
-    set_seed(args.seed)
-    if args.train_split.lower() == "test":
+    device = setup_distributed(args)
+    set_seed(args.seed + args.rank)
+    if args.is_main_process and args.train_split.lower() == "test":
         print(
             "[WARN] MARA is training on split=test with ground-truth masks. "
             "Use this only for the existing supervised/transductive protocol; "
             "a standard unsupervised benchmark needs a separate training/validation protocol."
         )
-    if torch.cuda.is_available():
-        device = torch.device(args.device)
-        if device.type == "cuda":
-            torch.cuda.set_device(device)
-    else:
-        device = torch.device("cpu")
-
-    os.makedirs(args.result_path, exist_ok=True)
+    if args.is_main_process:
+        os.makedirs(args.result_path, exist_ok=True)
+    if args.distributed:
+        dist.barrier()
     base_payload = load_checkpoint_payload(args.base_ckpt)
     apply_base_runtime_config(args, base_payload)
 
-    print(
-        "Runtime config: "
-        f"visual_backbone={args.visual_backbone}, "
-        f"visual_layers={args.visual_layers}, "
-        f"hfa_setting={args.hfa_setting_runtime}, "
-        f"hfa_layers={args.hfa_layers_runtime}, "
-        f"hfa_bottleneck={args.hfa_bottleneck_runtime}"
-    )
+    if args.is_main_process:
+        print(
+            "Runtime config: "
+            f"visual_backbone={args.visual_backbone}, "
+            f"visual_layers={args.visual_layers}, "
+            f"hfa_setting={args.hfa_setting_runtime}, "
+            f"hfa_layers={args.hfa_layers_runtime}, "
+            f"hfa_bottleneck={args.hfa_bottleneck_runtime}, "
+            f"world_size={args.world_size}, per_gpu_batch={args.batch_size}, "
+            f"global_batch={args.batch_size * args.world_size}"
+        )
 
     clip_model = create_clip_model(args, device)
     prompt_learner = create_prompt_learner(clip_model, device)
@@ -475,11 +552,19 @@ def run_train(args) -> None:
         batch_size=args.batch_size,
         split_name=args.train_split,
         image_size=args.image_size,
-        shuffle=True,
+        shuffle=not args.distributed,
     )
+    train_loader, train_sampler = build_distributed_loader(train_loader, args)
 
     mara_cfg = build_mara_config(args)
     mara_agent = MARAAgent(mara_cfg).to(device)
+    if args.distributed:
+        mara_agent = DDP(
+            mara_agent,
+            device_ids=[args.local_rank],
+            output_device=args.local_rank,
+            broadcast_buffers=False,
+        )
     optimizer = torch.optim.AdamW(
         mara_agent.parameters(),
         lr=args.mara_lr,
@@ -494,8 +579,11 @@ def run_train(args) -> None:
         min_lr_ratio=args.min_lr_ratio,
     )
 
-    print("MARA config:", mara_cfg)
+    if args.is_main_process:
+        print("MARA config:", mara_cfg)
     for epoch in range(args.epoch):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         start = time.time()
         meters = train_one_epoch(
             epoch=epoch,
@@ -510,52 +598,55 @@ def run_train(args) -> None:
             device=device,
             args=args,
         )
-        print()
-        ckpt_path = save_mara_checkpoint(
-            epoch=epoch,
-            save_dir=os.path.join(args.result_path, "ckpt"),
-            mara_agent=mara_agent,
-            model=model,
-            prompt_learner=prompt_learner,
-            dino_adapters=dino_adapters,
-            optimizer=optimizer,
-            args=args,
-        )
-
-        with open(os.path.join(args.result_path, "loss_mara.txt"), "a", encoding="utf-8") as f:
-            f.write(
-                f"epoch_{epoch}: "
-                f"loss={meters['loss']:.6f}\t"
-                f"sup={meters['sup']:.6f}\t"
-                f"seg={meters['seg']:.6f}\t"
-                f"global={meters['global']:.6f}\t"
-                f"consistency={meters['consistency']:.6f}\t"
-                f"grpo={meters['grpo']:.6f}\t"
-                f"kl={meters['kl']:.6f}\t"
-                f"clip_frac={meters['clip_frac']:.6f}\t"
-                f"gate={meters['gate']:.6f}\t"
-                f"gain_value={meters['gain_value']:.6f}\t"
-                f"gain_consistency={meters['gain_consistency']:.6f}\t"
-                f"op_aux={meters['op_aux']:.6f}\t"
-                f"pred_gain={meters['pred_gain']:.6f}\t"
-                f"accept={meters['accept']:.6f}\t"
-                f"gain_positive={meters['gain_positive']:.6f}\t"
-                f"entropy={meters['entropy']:.6f}\t"
-                f"reward={meters['reward']:.6f}\t"
-                f"gain={meters['gain']:.6f}\t"
-                f"quality={meters['quality']:.6f}\n"
+        if args.is_main_process:
+            print()
+            ckpt_path = save_mara_checkpoint(
+                epoch=epoch,
+                save_dir=os.path.join(args.result_path, "ckpt"),
+                mara_agent=mara_agent,
+                model=model,
+                prompt_learner=prompt_learner,
+                dino_adapters=dino_adapters,
+                optimizer=optimizer,
+                args=args,
             )
 
-        print(
-            f"epoch_{epoch}: loss={meters['loss']:.6f}, sup={meters['sup']:.6f}, "
-            f"consistency={meters['consistency']:.6f}, grpo={meters['grpo']:.6f}, "
-            f"kl={meters['kl']:.6f}, clip={meters['clip_frac']:.6f}, gate={meters['gate']:.6f}, "
-            f"gain_value={meters['gain_value']:.6f}, gain_consistency={meters['gain_consistency']:.6f}, "
-            f"op_aux={meters['op_aux']:.6f}, pred_gain={meters['pred_gain']:.6f}, "
-            f"accept={meters['accept']:.6f}, cf_pos={meters['gain_positive']:.6f}, reward={meters['reward']:.6f}, "
-            f"gain={meters['gain']:.6f}, quality={meters['quality']:.6f}, "
-            f"time={time.time() - start:.2f}s, ckpt={ckpt_path}"
-        )
+            with open(os.path.join(args.result_path, "loss_mara.txt"), "a", encoding="utf-8") as f:
+                f.write(
+                    f"epoch_{epoch}: "
+                    f"loss={meters['loss']:.6f}\t"
+                    f"sup={meters['sup']:.6f}\t"
+                    f"seg={meters['seg']:.6f}\t"
+                    f"global={meters['global']:.6f}\t"
+                    f"consistency={meters['consistency']:.6f}\t"
+                    f"grpo={meters['grpo']:.6f}\t"
+                    f"kl={meters['kl']:.6f}\t"
+                    f"clip_frac={meters['clip_frac']:.6f}\t"
+                    f"gate={meters['gate']:.6f}\t"
+                    f"gain_value={meters['gain_value']:.6f}\t"
+                    f"gain_consistency={meters['gain_consistency']:.6f}\t"
+                    f"op_aux={meters['op_aux']:.6f}\t"
+                    f"pred_gain={meters['pred_gain']:.6f}\t"
+                    f"accept={meters['accept']:.6f}\t"
+                    f"gain_positive={meters['gain_positive']:.6f}\t"
+                    f"entropy={meters['entropy']:.6f}\t"
+                    f"reward={meters['reward']:.6f}\t"
+                    f"gain={meters['gain']:.6f}\t"
+                    f"quality={meters['quality']:.6f}\n"
+                )
+
+            print(
+                f"epoch_{epoch}: loss={meters['loss']:.6f}, sup={meters['sup']:.6f}, "
+                f"consistency={meters['consistency']:.6f}, grpo={meters['grpo']:.6f}, "
+                f"kl={meters['kl']:.6f}, clip={meters['clip_frac']:.6f}, gate={meters['gate']:.6f}, "
+                f"gain_value={meters['gain_value']:.6f}, gain_consistency={meters['gain_consistency']:.6f}, "
+                f"op_aux={meters['op_aux']:.6f}, pred_gain={meters['pred_gain']:.6f}, "
+                f"accept={meters['accept']:.6f}, cf_pos={meters['gain_positive']:.6f}, reward={meters['reward']:.6f}, "
+                f"gain={meters['gain']:.6f}, quality={meters['quality']:.6f}, "
+                f"time={time.time() - start:.2f}s, ckpt={ckpt_path}"
+            )
+        if args.distributed:
+            dist.barrier()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -570,6 +661,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--epoch", type=int, default=30)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--local-rank", "--local_rank", type=int, default=0)
 
     parser.add_argument("--visual_backbone", type=str, default="dino", choices=["dino", "clip"])
     parser.add_argument("--visual_layers", type=parse_visual_layers, default=(5, 11, 17, 23))
@@ -591,16 +683,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mara_regions", type=int, default=16)
     parser.add_argument("--mara_roi_size", type=int, default=32)
     parser.add_argument("--mara_hidden_dim", type=int, default=64)
-    parser.add_argument("--mara_delta_scale", type=float, default=0.25)
-    parser.add_argument("--mara_gate_max", type=float, default=0.25)
-    parser.add_argument("--mara_gate_init_bias", type=float, default=-3.5)
+    parser.add_argument("--mara_delta_scale", type=float, default=0.50)
+    parser.add_argument("--mara_gate_max", type=float, default=0.35)
+    parser.add_argument("--mara_gate_init_bias", type=float, default=-2.0)
     parser.add_argument("--disable_gain_gate", action="store_true")
     parser.add_argument("--gain_accept_threshold", type=float, default=0.0)
     parser.add_argument("--gain_gate_temperature", type=float, default=1.0)
     parser.add_argument("--gain_loss_clip", type=float, default=1.0)
     parser.add_argument("--gain_cls_weight", type=float, default=0.5)
     parser.add_argument("--gain_safety_margin", type=float, default=0.0)
-    parser.add_argument("--gain_accept_probability", type=float, default=0.55)
+    parser.add_argument("--gain_accept_probability", type=float, default=0.50)
     parser.add_argument("--gain_consistency_temperature", type=float, default=0.05)
     parser.add_argument("--gain_warmup_epochs", type=int, default=5)
     parser.add_argument("--disable_hard_gain_gate", action="store_true")
@@ -628,7 +720,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--w_global", type=float, default=0.3)
     parser.add_argument("--w_base_consistency", type=float, default=0.05)
     parser.add_argument("--w_grpo", type=float, default=0.5)
-    parser.add_argument("--w_gate_sparse", type=float, default=0.01)
+    parser.add_argument("--w_gate_sparse", type=float, default=0.001)
     parser.add_argument("--w_gain_value", type=float, default=0.05)
     parser.add_argument("--w_gain_consistency", type=float, default=0.05)
     parser.add_argument("--w_op_aux", type=float, default=0.1)
@@ -640,7 +732,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    run_train(args)
+    try:
+        run_train(args)
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":

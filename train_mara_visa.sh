@@ -7,36 +7,40 @@ set -euo pipefail
 #   3) Evaluate the MARA checkpoint produced by this run.
 #
 # Common overrides:
-#   DEVICE=cuda:1 bash train_mara_visa.sh
+#   GPU_IDS=0,1 bash train_mara_visa.sh
 #   BASE_EPOCH=30 MARA_EPOCH=50 bash train_mara_visa.sh
 #   BASE_CKPT=./checkpoint/base_visa_hfa3_xxx/ckpt/14.pth RUN_BASE=0 bash train_mara_visa.sh
-#   TEST_EVAL_LATEST_ONLY=0 TEST_DATASETS="mvtec btad mpdd" bash train_mara_visa.sh
+#   TEST_EVAL_LATEST_ONLY=1 TEST_DATASETS="mvtec btad mpdd" bash train_mara_visa.sh
 
 TRICK_NAME="${TRICK_NAME:-mara_grpo}"
 DATASET="${DATASET:-visa}"
 HFA_SETTING="${HFA_SETTING:-hfa3}"
 VISUAL_LAYERS="${VISUAL_LAYERS:-5,11,17,23}"
 DEVICE="${DEVICE:-cuda:0}"
+GPU_IDS="${GPU_IDS:-0,1}"
+GPU_IDS="${GPU_IDS//[[:space:]]/}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 
 BASE_EPOCH="${BASE_EPOCH:-15}"
 BASE_BS="${BASE_BS:-16}"
 MARA_EPOCH="${MARA_EPOCH:-30}"
-MARA_BS="${MARA_BS:-4}"
+# Per-GPU batch size. Two GPUs x 2 preserves the previous global batch size of 4.
+MARA_BS="${MARA_BS:-2}"
 GRPO_GROUP_SIZE="${GRPO_GROUP_SIZE:-4}"
 GRPO_UPDATE_EPOCHS="${GRPO_UPDATE_EPOCHS:-3}"
 GRPO_KL_COEF="${GRPO_KL_COEF:-0.01}"
 MARA_STEPS="${MARA_STEPS:-3}"
 MARA_STEP_COST="${MARA_STEP_COST:-0.001}"
 MARA_REFINE_COST="${MARA_REFINE_COST:-0.002}"
-MARA_DELTA_SCALE="${MARA_DELTA_SCALE:-0.25}"
-MARA_GATE_MAX="${MARA_GATE_MAX:-0.25}"
-MARA_GATE_INIT_BIAS="${MARA_GATE_INIT_BIAS:--3.5}"
+MARA_DELTA_SCALE="${MARA_DELTA_SCALE:-0.50}"
+MARA_GATE_MAX="${MARA_GATE_MAX:-0.35}"
+MARA_GATE_INIT_BIAS="${MARA_GATE_INIT_BIAS:--2.0}"
 GAIN_ACCEPT_THRESHOLD="${GAIN_ACCEPT_THRESHOLD:-0.0}"
 GAIN_GATE_TEMPERATURE="${GAIN_GATE_TEMPERATURE:-1.0}"
 GAIN_LOSS_CLIP="${GAIN_LOSS_CLIP:-1.0}"
 GAIN_CLS_WEIGHT="${GAIN_CLS_WEIGHT:-0.5}"
 GAIN_SAFETY_MARGIN="${GAIN_SAFETY_MARGIN:-0.0}"
-GAIN_ACCEPT_PROBABILITY="${GAIN_ACCEPT_PROBABILITY:-0.55}"
+GAIN_ACCEPT_PROBABILITY="${GAIN_ACCEPT_PROBABILITY:-0.50}"
 GAIN_CONSISTENCY_TEMPERATURE="${GAIN_CONSISTENCY_TEMPERATURE:-0.05}"
 GAIN_WARMUP_EPOCHS="${GAIN_WARMUP_EPOCHS:-5}"
 DISABLE_GAIN_GATE="${DISABLE_GAIN_GATE:-0}"
@@ -45,7 +49,7 @@ NEGATIVE_ADVANTAGE_SCALE="${NEGATIVE_ADVANTAGE_SCALE:-1.0}"
 ADVANTAGE_CLIP="${ADVANTAGE_CLIP:-5.0}"
 W_BASE_CONSISTENCY="${W_BASE_CONSISTENCY:-0.05}"
 W_GRPO="${W_GRPO:-0.5}"
-W_GATE_SPARSE="${W_GATE_SPARSE:-0.01}"
+W_GATE_SPARSE="${W_GATE_SPARSE:-0.001}"
 W_GAIN_VALUE="${W_GAIN_VALUE:-0.05}"
 W_GAIN_CONSISTENCY="${W_GAIN_CONSISTENCY:-0.05}"
 W_OP_AUX="${W_OP_AUX:-0.1}"
@@ -58,7 +62,7 @@ BASE_CKPT="${BASE_CKPT:-}"
 
 TEST_DATASETS="${TEST_DATASETS:-mvtec btad mpdd}"
 TEST_BS="${TEST_BS:-16}"
-TEST_EVAL_LATEST_ONLY="${TEST_EVAL_LATEST_ONLY:-1}"
+TEST_EVAL_LATEST_ONLY="${TEST_EVAL_LATEST_ONLY:-0}"
 TEST_NORM_MODE="${TEST_NORM_MODE:-none}"
 TEST_SAVE_VIS="${TEST_SAVE_VIS:-0}"
 TEST_TRICK_NAME="${TEST_TRICK_NAME:-mara_grpo_final}"
@@ -76,6 +80,7 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "[$(date +'%F %T')] Start MARA training pipeline"
 echo "Log: ${LOG_FILE}"
 echo "Dataset=${DATASET}, Device=${DEVICE}, HFA=${HFA_SETTING}, visual_layers=${VISUAL_LAYERS}"
+echo "Distributed MARA: GPU_IDS=${GPU_IDS}, processes=${NPROC_PER_NODE}, per_gpu_batch=${MARA_BS}"
 echo "MARA gate: max=${MARA_GATE_MAX}, init_bias=${MARA_GATE_INIT_BIAS}, sparse_weight=${W_GATE_SPARSE}"
 echo "GRPO: group=${GRPO_GROUP_SIZE}, replay_updates=${GRPO_UPDATE_EPOCHS}, kl_coef=${GRPO_KL_COEF}, weight=${W_GRPO}"
 echo "Gain gate: disabled=${DISABLE_GAIN_GATE}, warmup=${GAIN_WARMUP_EPOCHS}, target_threshold=${GAIN_ACCEPT_THRESHOLD}, safety_margin=${GAIN_SAFETY_MARGIN}, accept_probability=${GAIN_ACCEPT_PROBABILITY}"
@@ -112,13 +117,25 @@ fi
 echo "Base checkpoint: ${BASE_CKPT}"
 
 if [[ "${RUN_MARA}" == "1" ]]; then
-  echo "===== Stage 2: Train MARA-GRPO refinement agent ====="
+  echo "===== Stage 2: Train MARA-GRPO refinement agent with DDP ====="
+  IFS=',' read -r -a MARA_GPU_LIST <<< "${GPU_IDS}"
+  if (( ${#MARA_GPU_LIST[@]} != NPROC_PER_NODE )); then
+    echo "[ERROR] GPU_IDS contains ${#MARA_GPU_LIST[@]} GPUs but NPROC_PER_NODE=${NPROC_PER_NODE}."
+    exit 1
+  fi
+
   GAIN_GATE_FLAG=()
   if [[ "${DISABLE_GAIN_GATE}" == "1" ]]; then
     GAIN_GATE_FLAG=(--disable_gain_gate)
   fi
 
-  python train_mara.py \
+  if command -v torchrun >/dev/null 2>&1; then
+    MARA_LAUNCHER=(torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}")
+  else
+    MARA_LAUNCHER=(python -m torch.distributed.run --standalone --nproc_per_node="${NPROC_PER_NODE}")
+  fi
+
+  CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${MARA_LAUNCHER[@]}" train_mara.py \
     --result_path "${MARA_RESULT_PATH}" \
     --base_ckpt "${BASE_CKPT}" \
     --device "${DEVICE}" \
@@ -171,7 +188,7 @@ if [[ "${RUN_TEST}" == "1" ]]; then
 
   MARA_CKPT="${MARA_CKPT_PATH}" \
   TRICK_NAME="${TEST_TRICK_NAME}" \
-  DEVICE="${DEVICE}" \
+  GPU_IDS="${GPU_IDS}" \
   DATASETS="${TEST_DATASETS}" \
   BATCH_SIZE="${TEST_BS}" \
   EVAL_LATEST_ONLY="${TEST_EVAL_LATEST_ONLY}" \

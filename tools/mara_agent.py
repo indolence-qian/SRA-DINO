@@ -733,6 +733,10 @@ class MARAAgent(nn.Module):
             "mean_reward": rewards.sum(dim=1).mean().detach(),
         }
 
+    def forward(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
+        """DDP entry point for differentiable GRPO trajectory replay."""
+        return self.rollout(*args, **kwargs)
+
     def infer(
         self,
         base_prob: torch.Tensor,
