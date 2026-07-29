@@ -10,7 +10,7 @@ import torch
 from tqdm import tqdm
 
 from Datasets import DATASET_CLASSES, DATASET_REGISTRY
-from tools.mara_agent import MARAAgent, MARAConfig
+from tools.mara_agent import MARAAgent, MARAConfig, quality_score
 from tools.utils_up import get_anomaly_map
 from tools.visualization import visualization
 from train_mara import (
@@ -90,9 +90,14 @@ def config_from_payload(payload: Dict, args) -> MARAConfig:
         }
     mara_state = payload.get("mara_agent", {})
     has_gain_regressor = any(str(key).startswith("gain_head.") for key in mara_state.keys())
+    has_gain_lower = any(str(key).startswith("gain_lower_head.") for key in mara_state.keys())
     has_gain_classifier = any(str(key).startswith("gain_accept_head.") for key in mara_state.keys())
     if mara_state and not (has_gain_regressor and has_gain_classifier):
         cfg_dict["use_gain_gate"] = False
+    if mara_state:
+        cfg_dict["use_gain_lower_bound"] = bool(
+            cfg_dict.get("use_gain_lower_bound", True) and has_gain_lower
+        )
     valid_keys = MARAConfig.__dataclass_fields__.keys()
     cfg = MARAConfig(**{k: v for k, v in cfg_dict.items() if k in valid_keys})
     if args.gain_safety_margin is not None:
@@ -193,7 +198,11 @@ def evaluate_category(
     attempt_values = []
     reject_values = []
     gain_values = []
+    gain_lower_values = []
     accept_values = []
+    quality_gain_values = []
+    accepted_negative_count = 0
+    accepted_count = 0
     gt_masks = []
     img_paths = []
 
@@ -225,6 +234,16 @@ def evaluate_category(
                 layer_maps=layer_maps,
                 sample=args.sample_policy,
             )
+            labels = image_info["is_anomaly"].to(device).long()
+            base_quality = quality_score(base_map, base_logits, mask, labels, mara_agent.cfg)
+            mara_quality = quality_score(
+                output["final_prob"], output["final_logits"], mask, labels, mara_agent.cfg
+            )
+            quality_gain = mara_quality - base_quality
+            quality_gain_values.append(quality_gain.detach().cpu().numpy())
+            executed = output.get("refine_steps", torch.zeros_like(quality_gain)) > 0
+            accepted_negative_count += int(((quality_gain < 0) & executed).sum().item())
+            accepted_count += int(executed.sum().item())
 
             base_maps.append(base_map[:, 1].detach().cpu().numpy())
             mara_maps.append(output["final_prob"][:, 1].detach().cpu().numpy())
@@ -248,6 +267,12 @@ def evaluate_category(
                     values = values[refined_mask]
                 if values.numel() > 0:
                     gain_values.append(values.detach().cpu().numpy())
+            if "predicted_gain_lower" in output:
+                values = output["predicted_gain_lower"]
+                if refined_mask is not None:
+                    values = values[refined_mask]
+                if values.numel() > 0:
+                    gain_lower_values.append(values.detach().cpu().numpy())
             if "accept_score" in output:
                 values = output["accept_score"]
                 if refined_mask is not None:
@@ -283,7 +308,12 @@ def evaluate_category(
     row["refine_attempts_mean"] = float(np.concatenate(attempt_values).mean()) if attempt_values else 0.0
     row["rejected_steps_mean"] = float(np.concatenate(reject_values).mean()) if reject_values else 0.0
     row["pred_gain_mean"] = float(np.concatenate(gain_values).mean()) if gain_values else 0.0
+    row["pred_gain_lower_mean"] = float(np.concatenate(gain_lower_values).mean()) if gain_lower_values else 0.0
     row["accept_mean"] = float(np.concatenate(accept_values).mean()) if accept_values else 0.0
+    quality_gains = np.concatenate(quality_gain_values) if quality_gain_values else np.zeros(1, dtype=np.float32)
+    row["quality_gain_mean"] = float(quality_gains.mean())
+    row["base_degradation_rate"] = float((quality_gains < 0).mean())
+    row["negative_gain_accept_rate"] = float(accepted_negative_count / max(1, accepted_count))
     return row
 
 
@@ -301,7 +331,11 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
     means["mean_refine_attempts"] = float(np.mean([r["refine_attempts_mean"] for r in rows]))
     means["mean_rejected_steps"] = float(np.mean([r["rejected_steps_mean"] for r in rows]))
     means["mean_pred_gain"] = float(np.mean([r["pred_gain_mean"] for r in rows]))
+    means["mean_pred_gain_lower"] = float(np.mean([r["pred_gain_lower_mean"] for r in rows]))
     means["mean_accept"] = float(np.mean([r["accept_mean"] for r in rows]))
+    means["mean_quality_gain"] = float(np.mean([r["quality_gain_mean"] for r in rows]))
+    means["mean_base_degradation_rate"] = float(np.mean([r["base_degradation_rate"] for r in rows]))
+    means["mean_negative_gain_accept_rate"] = float(np.mean([r["negative_gain_accept_rate"] for r in rows]))
 
     metric_file = os.path.join(result_dir, "metric_mara.txt")
     with open(metric_file, "a", encoding="utf-8") as f:
@@ -312,7 +346,7 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
             f"{'Base_F1':>10s}{'MARA_F1':>10s}{'D_F1':>10s}"
             f"{'Gate':>10s}{'GateROI':>10s}{'Changed':>10s}"
             f"{'Attempt':>10s}{'Refine':>10s}{'Reject':>10s}"
-            f"{'GainPred':>10s}{'Accept':>10s}"
+            f"{'GainPred':>10s}{'GainQ10':>10s}{'Accept':>10s}"
             f"{'Base_P-AUC':>12s}{'MARA_P-AUC':>12s}{'D_P-AUC':>10s}"
             f"{'Base_I-AUC':>12s}{'MARA_I-AUC':>12s}{'D_I-AUC':>10s}\n"
         )
@@ -324,7 +358,7 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
                 f"{row['gate_mean']:>10.5f}{row['gate_roi_mean']:>10.5f}"
                 f"{row['changed_ratio_mean']:>10.5f}{row['refine_attempts_mean']:>10.5f}"
                 f"{row['refine_steps_mean']:>10.5f}{row['rejected_steps_mean']:>10.5f}"
-                f"{row['pred_gain_mean']:>10.5f}{row['accept_mean']:>10.5f}"
+                f"{row['pred_gain_mean']:>10.5f}{row['pred_gain_lower_mean']:>10.5f}{row['accept_mean']:>10.5f}"
                 f"{row['base_P_AUROC']:>12.5f}{row['mara_P_AUROC']:>12.5f}{row['delta_P_AUROC']:>10.5f}"
                 f"{row['base_I_AUROC']:>12.5f}{row['mara_I_AUROC']:>12.5f}{row['delta_I_AUROC']:>10.5f}\n"
             )
@@ -335,9 +369,14 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
             f"{means['mean_gate']:>10.5f}{means['mean_gate_roi']:>10.5f}"
             f"{means['mean_changed_ratio']:>10.5f}{means['mean_refine_attempts']:>10.5f}"
             f"{means['mean_refine_steps']:>10.5f}{means['mean_rejected_steps']:>10.5f}"
-            f"{means['mean_pred_gain']:>10.5f}{means['mean_accept']:>10.5f}"
+            f"{means['mean_pred_gain']:>10.5f}{means['mean_pred_gain_lower']:>10.5f}{means['mean_accept']:>10.5f}"
             f"{means['mean_base_P_AUROC']:>12.5f}{means['mean_mara_P_AUROC']:>12.5f}{means['mean_delta_P_AUROC']:>10.5f}"
             f"{means['mean_base_I_AUROC']:>12.5f}{means['mean_mara_I_AUROC']:>12.5f}{means['mean_delta_I_AUROC']:>10.5f}\n\n"
+        )
+        f.write(
+            f"Safety: quality_gain={means['mean_quality_gain']:.6f}, "
+            f"base_degradation_rate={means['mean_base_degradation_rate']:.6f}, "
+            f"negative_gain_accept_rate={means['mean_negative_gain_accept_rate']:.6f}\n\n"
         )
 
     csv_file = os.path.join(result_dir, f"{epoch_name}_mara_metrics.csv")
@@ -352,7 +391,11 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
         fieldnames.append("refine_attempts_mean")
         fieldnames.append("rejected_steps_mean")
         fieldnames.append("pred_gain_mean")
+        fieldnames.append("pred_gain_lower_mean")
         fieldnames.append("accept_mean")
+        fieldnames.append("quality_gain_mean")
+        fieldnames.append("base_degradation_rate")
+        fieldnames.append("negative_gain_accept_rate")
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)

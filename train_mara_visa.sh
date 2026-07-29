@@ -42,7 +42,11 @@ GAIN_CLS_WEIGHT="${GAIN_CLS_WEIGHT:-0.5}"
 GAIN_SAFETY_MARGIN="${GAIN_SAFETY_MARGIN:-0.0}"
 GAIN_ACCEPT_PROBABILITY="${GAIN_ACCEPT_PROBABILITY:-0.50}"
 GAIN_CONSISTENCY_TEMPERATURE="${GAIN_CONSISTENCY_TEMPERATURE:-0.05}"
+GAIN_LOWER_QUANTILE="${GAIN_LOWER_QUANTILE:-0.10}"
+GAIN_LOWER_WEIGHT="${GAIN_LOWER_WEIGHT:-1.0}"
+DISABLE_GAIN_LOWER_BOUND="${DISABLE_GAIN_LOWER_BOUND:-0}"
 GAIN_WARMUP_EPOCHS="${GAIN_WARMUP_EPOCHS:-5}"
+DISABLE_FORCE_REFINE_WARMUP="${DISABLE_FORCE_REFINE_WARMUP:-0}"
 DISABLE_GAIN_GATE="${DISABLE_GAIN_GATE:-0}"
 BASE_ANCHOR_MARGIN="${BASE_ANCHOR_MARGIN:-0.0}"
 NEGATIVE_ADVANTAGE_SCALE="${NEGATIVE_ADVANTAGE_SCALE:-1.0}"
@@ -83,7 +87,8 @@ echo "Dataset=${DATASET}, Device=${DEVICE}, HFA=${HFA_SETTING}, visual_layers=${
 echo "Distributed MARA: GPU_IDS=${GPU_IDS}, processes=${NPROC_PER_NODE}, per_gpu_batch=${MARA_BS}"
 echo "MARA gate: max=${MARA_GATE_MAX}, init_bias=${MARA_GATE_INIT_BIAS}, sparse_weight=${W_GATE_SPARSE}"
 echo "GRPO: group=${GRPO_GROUP_SIZE}, replay_updates=${GRPO_UPDATE_EPOCHS}, kl_coef=${GRPO_KL_COEF}, weight=${W_GRPO}"
-echo "Gain gate: disabled=${DISABLE_GAIN_GATE}, warmup=${GAIN_WARMUP_EPOCHS}, target_threshold=${GAIN_ACCEPT_THRESHOLD}, safety_margin=${GAIN_SAFETY_MARGIN}, accept_probability=${GAIN_ACCEPT_PROBABILITY}"
+echo "Gain gate: disabled=${DISABLE_GAIN_GATE}, warmup=${GAIN_WARMUP_EPOCHS}, force_refine_warmup=$((1 - DISABLE_FORCE_REFINE_WARMUP)), target_threshold=${GAIN_ACCEPT_THRESHOLD}, safety_margin=${GAIN_SAFETY_MARGIN}, accept_probability=${GAIN_ACCEPT_PROBABILITY}"
+echo "Gain lower bound: disabled=${DISABLE_GAIN_LOWER_BOUND}, quantile=${GAIN_LOWER_QUANTILE}, weight=${GAIN_LOWER_WEIGHT}"
 
 BASE_RESULT_PATH="./checkpoint/base_${DATASET}_${HFA_SETTING}_${TS}"
 MARA_RESULT_PATH="./checkpoint/mara_${DATASET}_${HFA_SETTING}_${TS}"
@@ -129,6 +134,16 @@ if [[ "${RUN_MARA}" == "1" ]]; then
     GAIN_GATE_FLAG=(--disable_gain_gate)
   fi
 
+  GAIN_LOWER_FLAG=()
+  if [[ "${DISABLE_GAIN_LOWER_BOUND}" == "1" ]]; then
+    GAIN_LOWER_FLAG=(--disable_gain_lower_bound)
+  fi
+
+  WARMUP_REFINE_FLAG=()
+  if [[ "${DISABLE_FORCE_REFINE_WARMUP}" == "1" ]]; then
+    WARMUP_REFINE_FLAG=(--disable_force_refine_warmup)
+  fi
+
   if command -v torchrun >/dev/null 2>&1; then
     MARA_LAUNCHER=(torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}")
   else
@@ -161,6 +176,8 @@ if [[ "${RUN_MARA}" == "1" ]]; then
     --gain_safety_margin "${GAIN_SAFETY_MARGIN}" \
     --gain_accept_probability "${GAIN_ACCEPT_PROBABILITY}" \
     --gain_consistency_temperature "${GAIN_CONSISTENCY_TEMPERATURE}" \
+    --gain_lower_quantile "${GAIN_LOWER_QUANTILE}" \
+    --gain_lower_weight "${GAIN_LOWER_WEIGHT}" \
     --gain_warmup_epochs "${GAIN_WARMUP_EPOCHS}" \
     --base_anchor_margin "${BASE_ANCHOR_MARGIN}" \
     --negative_advantage_scale "${NEGATIVE_ADVANTAGE_SCALE}" \
@@ -172,7 +189,9 @@ if [[ "${RUN_MARA}" == "1" ]]; then
     --w_gain_consistency "${W_GAIN_CONSISTENCY}" \
     --w_op_aux "${W_OP_AUX}" \
     --reward_conf_weight "${REWARD_CONF_WEIGHT}" \
-    "${GAIN_GATE_FLAG[@]}"
+    "${GAIN_GATE_FLAG[@]}" \
+    "${GAIN_LOWER_FLAG[@]}" \
+    "${WARMUP_REFINE_FLAG[@]}"
 fi
 
 if [[ "${RUN_TEST}" == "1" ]]; then

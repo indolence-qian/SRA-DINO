@@ -44,6 +44,9 @@ class MARAConfig:
     hard_gain_gate: bool = True
     stop_on_gain_reject: bool = True
     gain_consistency_temperature: float = 0.05
+    use_gain_lower_bound: bool = True
+    gain_lower_quantile: float = 0.10
+    gain_lower_weight: float = 1.0
 
 
 def _resize_map(x: torch.Tensor, size: int, mode: str = "bilinear") -> torch.Tensor:
@@ -205,6 +208,44 @@ def _group_relative_advantages(
     return advantage.reshape_as(returns).clamp(-clip, clip)
 
 
+def _baseline_anchored_advantages(
+    returns: torch.Tensor,
+    active_mask: torch.Tensor,
+    base_trajectory_mask: torch.Tensor,
+    group_size: int,
+    margin: float,
+    negative_scale: float,
+    clip: float,
+) -> torch.Tensor:
+    """Normalize returns around the strict no-refinement trajectory.
+
+    Unlike group mean centering, this preserves the sign of each trajectory's
+    absolute improvement over Base: a trajectory below Base cannot receive a
+    positive advantage merely because the other sampled trajectories are worse.
+    """
+    if returns.shape[0] % group_size != 0:
+        raise ValueError(f"Rollout batch {returns.shape[0]} is not divisible by group_size={group_size}.")
+
+    returns_g = returns.view(-1, group_size, returns.shape[1])
+    active_g = active_mask.view(-1, group_size, active_mask.shape[1]).float()
+    base_g = base_trajectory_mask.view(-1, group_size).float()
+    base_count = base_g.sum(dim=1, keepdim=True)
+    if not torch.all(base_count == 1):
+        raise ValueError("Each trajectory group must contain exactly one Base anchor.")
+
+    base_returns = (returns_g * base_g.unsqueeze(-1)).sum(dim=1, keepdim=True)
+    anchored = returns_g - base_returns - float(margin)
+
+    # Use only trainable (non-Base) active trajectories to determine scale.
+    policy_mask = active_g * (1.0 - base_g.unsqueeze(-1))
+    count = policy_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+    scale = ((anchored.square() * policy_mask).sum(dim=1, keepdim=True) / count).sqrt().clamp_min(1e-3)
+    advantage = anchored / scale
+    advantage = torch.where(advantage >= 0, advantage, advantage * negative_scale)
+    advantage = advantage * active_g
+    return advantage.reshape_as(returns).clamp(-clip, clip)
+
+
 class MARAAgent(nn.Module):
     """Multi-step Anomaly Refinement Agent with GRPO-style policy training."""
 
@@ -250,6 +291,11 @@ class MARAAgent(nn.Module):
             nn.Flatten(),
             nn.Linear(cfg.hidden_dim, 1),
         )
+        self.gain_lower_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(cfg.hidden_dim, 1),
+        )
         self.gain_accept_head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -263,6 +309,8 @@ class MARAAgent(nn.Module):
         nn.init.zeros_(self.score_head[-1].bias)
         nn.init.zeros_(self.gain_head[-1].weight)
         nn.init.zeros_(self.gain_head[-1].bias)
+        nn.init.zeros_(self.gain_lower_head[-1].weight)
+        nn.init.zeros_(self.gain_lower_head[-1].bias)
         nn.init.zeros_(self.gain_accept_head[-1].weight)
         nn.init.zeros_(self.gain_accept_head[-1].bias)
 
@@ -345,12 +393,13 @@ class MARAAgent(nn.Module):
         if forced_op is not None:
             op_action = torch.where(forced_op >= 0, forced_op.long(), op_action)
 
-        logprob = (
-            region_dist.log_prob(region_action)
-            + layer_dist.log_prob(layer_action)
-            + op_dist.log_prob(op_action)
-        )
-        entropy = region_dist.entropy() + layer_dist.entropy() + op_dist.entropy()
+        # Hierarchical policy: ROI/layer only affect the transition when op=refine.
+        # Masking their terms for stop actions avoids irrelevant policy gradients.
+        refine_action = (op_action == 1).to(region_logits.dtype)
+        conditional_logprob = region_dist.log_prob(region_action) + layer_dist.log_prob(layer_action)
+        conditional_entropy = region_dist.entropy() + layer_dist.entropy()
+        logprob = op_dist.log_prob(op_action) + refine_action * conditional_logprob
+        entropy = op_dist.entropy() + refine_action * conditional_entropy
         logprob = logprob * active.float()
         entropy = entropy * active.float()
 
@@ -393,6 +442,7 @@ class MARAAgent(nn.Module):
         refiner_in = torch.cat([state, selected_layer, selected_mask], dim=1)
         hidden = self.refiner(refiner_in)
         predicted_gain = self.gain_head(hidden).squeeze(1)
+        predicted_gain_lower = self.gain_lower_head(hidden).squeeze(1)
         accept_logit = self.gain_accept_head(hidden).squeeze(1)
         if self.cfg.use_gain_gate:
             temperature = max(float(self.cfg.gain_gate_temperature), 1e-6)
@@ -427,8 +477,9 @@ class MARAAgent(nn.Module):
         # segmentation/classification gradients from pushing every gain positive.
         if self.cfg.use_gain_gate and apply_gain_gate:
             if self.cfg.hard_gain_gate and hard_gain_gate:
+                safety_gain = predicted_gain_lower if self.cfg.use_gain_lower_bound else predicted_gain
                 gain_accepted = (
-                    (predicted_gain.detach() > self.cfg.gain_safety_margin)
+                    (safety_gain.detach() > self.cfg.gain_safety_margin)
                     & (accept_score.detach() >= self.cfg.gain_accept_probability)
                 )
                 accept_weight = gain_accepted.to(current_prob.dtype).view(bsz, 1, 1, 1)
@@ -465,6 +516,7 @@ class MARAAgent(nn.Module):
             "next_cumulative_gate": next_cumulative_gate,
             "update_gate": update_gate,
             "predicted_gain": predicted_gain,
+            "predicted_gain_lower": predicted_gain_lower,
             "accept_logit": accept_logit,
             "accept_score": accept_score,
             "gain_accepted": gain_accepted,
@@ -485,6 +537,7 @@ class MARAAgent(nn.Module):
         sample: bool = True,
         trajectory: Optional[Dict[str, torch.Tensor]] = None,
         apply_gain_gate: bool = True,
+        force_refine: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """Sample a behavior trajectory or replay fixed actions for a GRPO update."""
         cfg = self.cfg
@@ -521,12 +574,25 @@ class MARAAgent(nn.Module):
             dtype=current_prob.dtype,
         )
         active = torch.ones(current_prob.shape[0], device=current_prob.device, dtype=torch.bool)
+        has_base_trajectory = (
+            group_size > 1
+            and cfg.include_base_trajectory
+            and not cfg.force_first_refine
+        )
+        if trajectory is not None and "base_trajectory_mask" in trajectory:
+            base_trajectory_mask = trajectory["base_trajectory_mask"].to(active.device).bool()
+            has_base_trajectory = bool(base_trajectory_mask.any().item())
+        elif has_base_trajectory:
+            base_trajectory_mask = torch.arange(active.shape[0], device=active.device) % group_size == 0
+        else:
+            base_trajectory_mask = torch.zeros_like(active)
 
         logprob_steps = []
         entropy_steps = []
         reward_steps = []
         gate_steps = []
         predicted_gain_steps = []
+        predicted_gain_lower_steps = []
         accept_logit_steps = []
         accept_steps = []
         op_logit_steps = []
@@ -550,18 +616,13 @@ class MARAAgent(nn.Module):
                     "op": trajectory["op_actions"][:, step_idx],
                 }
             forced_op = None
-            base_anchor = torch.zeros_like(active)
-            if (
-                trajectory is None
-                and sample
-                and step_idx == 0
-                and group_size > 1
-                and cfg.include_base_trajectory
-                and not cfg.force_first_refine
-            ):
-                base_anchor = torch.arange(active.shape[0], device=active.device) % group_size == 0
+            if trajectory is None and sample and force_refine:
                 forced_op = torch.full_like(labels_g, -1)
-                forced_op[base_anchor] = 0
+                forced_op[active & (~base_trajectory_mask)] = 1
+                forced_op[base_trajectory_mask] = 0
+            elif trajectory is None and sample and step_idx == 0 and has_base_trajectory:
+                forced_op = torch.full_like(labels_g, -1)
+                forced_op[base_trajectory_mask] = 0
             policy_out = self._policy(
                 state,
                 global_logits,
@@ -601,6 +662,8 @@ class MARAAgent(nn.Module):
             step_cost = cfg.step_cost * active_before.float()
             refine_cost = cfg.refine_cost * refine_mask
             reward = (q_after - q_before - step_cost - refine_cost) * active_before.float()
+            # The Base trajectory is a strict no-refinement, zero-return anchor.
+            reward = reward.masked_fill(base_trajectory_mask, 0.0)
             counterfactual_gain = (q_candidate - q_before - cfg.refine_cost).clamp(
                 -cfg.gain_loss_clip,
                 cfg.gain_loss_clip,
@@ -611,13 +674,14 @@ class MARAAgent(nn.Module):
             reward_steps.append(reward)
             gate_steps.append(refine_out["update_gate"].mean(dim=(1, 2, 3)))
             predicted_gain_steps.append(refine_out["predicted_gain"])
+            predicted_gain_lower_steps.append(refine_out["predicted_gain_lower"])
             accept_logit_steps.append(refine_out["accept_logit"])
             accept_steps.append(refine_out["accept_score"])
             op_logit_steps.append(policy_out["op_logits"])
             gain_target_steps.append(counterfactual_gain)
             gain_weight_steps.append(active_before.float())
             active_steps.append(active_before.float())
-            policy_weight_steps.append(active_before.float() * (~base_anchor).float())
+            policy_weight_steps.append(active_before.float() * (~base_trajectory_mask).float())
             region_action_steps.append(policy_out["region_action"])
             layer_action_steps.append(policy_out["layer_action"])
             op_action_steps.append(policy_out["op_action"])
@@ -628,19 +692,31 @@ class MARAAgent(nn.Module):
         logprobs = torch.stack(logprob_steps, dim=1)
         active_mask = torch.stack(active_steps, dim=1)
         policy_mask = torch.stack(policy_weight_steps, dim=1)
-        returns_to_go = _discounted_returns(rewards, cfg.gamma) - cfg.base_anchor_margin
+        returns_to_go = _discounted_returns(rewards, cfg.gamma)
         base_quality = quality_steps[0]
         final_quality = quality_steps[-1]
-        quality_gain = final_quality - base_quality - cfg.base_anchor_margin
+        quality_gain = final_quality - base_quality
+        anchored_quality_gain = quality_gain - cfg.base_anchor_margin
 
         if trajectory is None:
-            advantages = _group_relative_advantages(
-                returns=returns_to_go,
-                active_mask=active_mask,
-                group_size=group_size,
-                negative_scale=cfg.negative_advantage_scale,
-                clip=cfg.advantage_clip,
-            ).detach()
+            if has_base_trajectory:
+                advantages = _baseline_anchored_advantages(
+                    returns=returns_to_go,
+                    active_mask=active_mask,
+                    base_trajectory_mask=base_trajectory_mask,
+                    group_size=group_size,
+                    margin=cfg.base_anchor_margin,
+                    negative_scale=cfg.negative_advantage_scale,
+                    clip=cfg.advantage_clip,
+                ).detach()
+            else:
+                advantages = _group_relative_advantages(
+                    returns=returns_to_go,
+                    active_mask=active_mask,
+                    group_size=group_size,
+                    negative_scale=cfg.negative_advantage_scale,
+                    clip=cfg.advantage_clip,
+                ).detach()
             trajectory = {
                 "region_actions": torch.stack(region_action_steps, dim=1).detach(),
                 "layer_actions": torch.stack(layer_action_steps, dim=1).detach(),
@@ -650,6 +726,7 @@ class MARAAgent(nn.Module):
                 "returns_to_go": returns_to_go.detach(),
                 "active_mask": active_mask.detach(),
                 "policy_mask": policy_mask.detach(),
+                "base_trajectory_mask": base_trajectory_mask.detach(),
             }
         else:
             advantages = trajectory["advantages"].to(logprobs.device)
@@ -673,6 +750,7 @@ class MARAAgent(nn.Module):
         entropy_mean = (entropy_all * policy_mask).sum() / policy_denom
         gate_l1 = torch.stack(gate_steps, dim=1).mean()
         predicted_gain_all = torch.stack(predicted_gain_steps, dim=1)
+        predicted_gain_lower_all = torch.stack(predicted_gain_lower_steps, dim=1)
         accept_logits_all = torch.stack(accept_logit_steps, dim=1)
         accept_all = torch.stack(accept_steps, dim=1)
         op_logits_all = torch.stack(op_logit_steps, dim=1)
@@ -680,6 +758,9 @@ class MARAAgent(nn.Module):
         gain_weights = torch.stack(gain_weight_steps, dim=1)
         gain_denom = gain_weights.sum().clamp_min(1.0)
         gain_reg = F.smooth_l1_loss(predicted_gain_all, gain_targets, reduction="none")
+        quantile = min(max(float(cfg.gain_lower_quantile), 1e-3), 1.0 - 1e-3)
+        lower_error = gain_targets - predicted_gain_lower_all
+        gain_lower = torch.maximum(quantile * lower_error, (quantile - 1.0) * lower_error)
         gain_class_target = (gain_targets > cfg.gain_accept_threshold).float()
         temperature = max(float(cfg.gain_gate_temperature), 1e-6)
         gain_cls = F.binary_cross_entropy_with_logits(
@@ -687,7 +768,15 @@ class MARAAgent(nn.Module):
             gain_class_target,
             reduction="none",
         )
-        gain_loss = ((gain_reg + cfg.gain_cls_weight * gain_cls) * gain_weights).sum() / gain_denom
+        gain_loss = (
+            (
+                gain_reg
+                + cfg.gain_lower_weight * gain_lower
+                + cfg.gain_cls_weight * gain_cls
+            )
+            * gain_weights
+        ).sum() / gain_denom
+        gain_lower_loss = (gain_lower * gain_weights).sum() / gain_denom
         consistency_temperature = max(float(cfg.gain_consistency_temperature), 1e-6)
         gain_sign_probability = torch.sigmoid(
             (predicted_gain_all - cfg.gain_accept_threshold) / consistency_temperature
@@ -703,8 +792,23 @@ class MARAAgent(nn.Module):
         ).view_as(gain_targets)
         op_aux_loss = (op_aux_per_step * gain_weights).sum() / gain_denom
         predicted_gain = (predicted_gain_all * gain_weights).sum() / gain_denom
+        predicted_gain_lower = (predicted_gain_lower_all * gain_weights).sum() / gain_denom
         accept_mean = (accept_all * gain_weights).sum() / gain_denom
         positive_rate = (gain_class_target * gain_weights).sum() / gain_denom
+        refine_attempt_all = (torch.stack(op_action_steps, dim=1) == 1).float() * gain_weights
+        safety_gain_all = predicted_gain_lower_all if cfg.use_gain_lower_bound else predicted_gain_all
+        would_accept = (
+            (safety_gain_all.detach() > cfg.gain_safety_margin)
+            & (accept_all.detach() >= cfg.gain_accept_probability)
+        ).float()
+        accepted_refine = would_accept * refine_attempt_all
+        negative_accept_rate = (
+            accepted_refine * (gain_targets < 0).float()
+        ).sum() / accepted_refine.sum().clamp_min(1.0)
+        trajectory_weight = (~base_trajectory_mask).float()
+        degradation_rate = (
+            (quality_gain < 0).float() * trajectory_weight
+        ).sum() / trajectory_weight.sum().clamp_min(1.0)
 
         final_prob = _resize_map(current_prob, out_hw[0])
         if final_prob.shape[-2:] != out_hw:
@@ -721,15 +825,20 @@ class MARAAgent(nn.Module):
             "advantage": advantages.detach(),
             "gate_l1": gate_l1,
             "gain_loss": gain_loss,
+            "gain_lower_loss": gain_lower_loss,
             "gain_consistency_loss": gain_consistency_loss,
             "op_aux_loss": op_aux_loss,
             "trajectory": trajectory,
             "mean_quality": quality_steps[-1].mean().detach(),
             "mean_base_quality": base_quality.mean().detach(),
             "mean_quality_gain": quality_gain.mean().detach(),
+            "mean_anchored_quality_gain": anchored_quality_gain.mean().detach(),
             "mean_predicted_gain": predicted_gain.detach(),
+            "mean_predicted_gain_lower": predicted_gain_lower.detach(),
             "mean_accept_score": accept_mean.detach(),
             "mean_counterfactual_positive": positive_rate.detach(),
+            "negative_accept_rate": negative_accept_rate.detach(),
+            "base_degradation_rate": degradation_rate.detach(),
             "mean_reward": rewards.sum(dim=1).mean().detach(),
         }
 
@@ -769,6 +878,7 @@ class MARAAgent(nn.Module):
         )
         active = torch.ones(current_prob.shape[0], device=current_prob.device, dtype=torch.bool)
         predicted_gain_steps = []
+        predicted_gain_lower_steps = []
         accept_steps = []
         refine_attempt_steps = []
         refine_execute_steps = []
@@ -796,6 +906,7 @@ class MARAAgent(nn.Module):
             active = refine_out["next_active"]
             cumulative_gate = refine_out["next_cumulative_gate"]
             predicted_gain_steps.append(refine_out["predicted_gain"])
+            predicted_gain_lower_steps.append(refine_out["predicted_gain_lower"])
             accept_steps.append(refine_out["accept_score"])
             refine_attempt_steps.append(refine_out["refine_attempt"])
             refine_execute_steps.append(refine_out["execute_weight"])
@@ -813,6 +924,9 @@ class MARAAgent(nn.Module):
         predicted_gain = (
             torch.stack(predicted_gain_steps, dim=1) * refine_attempts
         ).sum(dim=1) / refine_denom
+        predicted_gain_lower = (
+            torch.stack(predicted_gain_lower_steps, dim=1) * refine_attempts
+        ).sum(dim=1) / refine_denom
         accept_score = (
             torch.stack(accept_steps, dim=1) * refine_attempts
         ).sum(dim=1) / refine_denom
@@ -825,6 +939,7 @@ class MARAAgent(nn.Module):
             "final_logits": global_logits,
             "gate_map": gate_map,
             "predicted_gain": predicted_gain,
+            "predicted_gain_lower": predicted_gain_lower,
             "accept_score": accept_score,
             "refine_steps": refine_executes.sum(dim=1),
             "refine_attempts": refine_attempts.sum(dim=1),

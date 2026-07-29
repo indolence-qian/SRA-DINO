@@ -277,6 +277,9 @@ def build_mara_config(args) -> MARAConfig:
         gain_accept_probability=args.gain_accept_probability,
         hard_gain_gate=not args.disable_hard_gain_gate,
         gain_consistency_temperature=args.gain_consistency_temperature,
+        use_gain_lower_bound=not args.disable_gain_lower_bound,
+        gain_lower_quantile=args.gain_lower_quantile,
+        gain_lower_weight=args.gain_lower_weight,
     )
 
 
@@ -344,14 +347,19 @@ def train_one_epoch(
         "entropy": [],
         "gate": [],
         "gain_value": [],
+        "gain_lower": [],
         "gain_consistency": [],
         "op_aux": [],
         "pred_gain": [],
+        "pred_gain_lower": [],
         "accept": [],
         "gain_positive": [],
+        "unsafe_accept": [],
+        "degrade": [],
         "reward": [],
         "quality": [],
         "gain": [],
+        "anchor_gain": [],
     }
 
     for idx, image_info in enumerate(train_loader):
@@ -396,6 +404,7 @@ def train_one_epoch(
                 group_size=group_size,
                 sample=True,
                 apply_gain_gate=apply_gain_gate,
+                force_refine=not apply_gain_gate and not args.disable_force_refine_warmup,
             )
         trajectory = behavior["trajectory"]
         batch_meters = {key: [] for key in meters}
@@ -438,6 +447,7 @@ def train_one_epoch(
             entropy = rollout["entropy"]
             gate_loss = rollout["gate_l1"]
             gain_value_loss = rollout["gain_loss"]
+            gain_lower_loss = rollout["gain_lower_loss"]
             gain_consistency_loss = rollout["gain_consistency_loss"]
             op_aux_loss = rollout["op_aux_loss"]
             rl_scale = 1.0 if apply_gain_gate else 0.0
@@ -470,14 +480,19 @@ def train_one_epoch(
                 "entropy": entropy,
                 "gate": gate_loss,
                 "gain_value": gain_value_loss,
+                "gain_lower": gain_lower_loss,
                 "gain_consistency": gain_consistency_loss,
                 "op_aux": op_aux_loss,
                 "pred_gain": rollout["mean_predicted_gain"],
+                "pred_gain_lower": rollout["mean_predicted_gain_lower"],
                 "accept": rollout["mean_accept_score"],
                 "gain_positive": rollout["mean_counterfactual_positive"],
+                "unsafe_accept": rollout["negative_accept_rate"],
+                "degrade": rollout["base_degradation_rate"],
                 "reward": rollout["mean_reward"],
                 "quality": rollout["mean_quality"],
                 "gain": rollout["mean_quality_gain"],
+                "anchor_gain": rollout["mean_anchored_quality_gain"],
             }
             for key, value in values.items():
                 batch_meters[key].append(float(value.detach().item()))
@@ -494,10 +509,13 @@ def train_one_epoch(
                 f"| grpo {meters['grpo'][-1]:.4f} | kl {meters['kl'][-1]:.5f} "
                 f"| clip {meters['clip_frac'][-1]:.3f} | gate {meters['gate'][-1]:.4f} "
                 f"| gain_v {meters['gain_value'][-1]:.4f} | gain_c {meters['gain_consistency'][-1]:.4f} "
-                f"| op_aux {meters['op_aux'][-1]:.4f} | pred_g {meters['pred_gain'][-1]:.4f} "
+                f"| gain_q {meters['gain_lower'][-1]:.4f} | op_aux {meters['op_aux'][-1]:.4f} "
+                f"| pred_g {meters['pred_gain'][-1]:.4f}/{meters['pred_gain_lower'][-1]:.4f} "
                 f"| accept {meters['accept'][-1]:.4f} | cf_pos {meters['gain_positive'][-1]:.4f} "
+                f"| unsafe {meters['unsafe_accept'][-1]:.4f} | degrade {meters['degrade'][-1]:.4f} "
                 f"| entropy {meters['entropy'][-1]:.4f} | reward {meters['reward'][-1]:.4f} "
-                f"| gain {meters['gain'][-1]:.4f} | quality {meters['quality'][-1]:.4f}",
+                f"| gain {meters['gain'][-1]:.4f}/{meters['anchor_gain'][-1]:.4f} "
+                f"| quality {meters['quality'][-1]:.4f}",
                 end="\r",
                 flush=True,
             )
@@ -624,14 +642,19 @@ def run_train(args) -> None:
                     f"clip_frac={meters['clip_frac']:.6f}\t"
                     f"gate={meters['gate']:.6f}\t"
                     f"gain_value={meters['gain_value']:.6f}\t"
+                    f"gain_lower={meters['gain_lower']:.6f}\t"
                     f"gain_consistency={meters['gain_consistency']:.6f}\t"
                     f"op_aux={meters['op_aux']:.6f}\t"
                     f"pred_gain={meters['pred_gain']:.6f}\t"
+                    f"pred_gain_lower={meters['pred_gain_lower']:.6f}\t"
                     f"accept={meters['accept']:.6f}\t"
                     f"gain_positive={meters['gain_positive']:.6f}\t"
+                    f"unsafe_accept={meters['unsafe_accept']:.6f}\t"
+                    f"degrade={meters['degrade']:.6f}\t"
                     f"entropy={meters['entropy']:.6f}\t"
                     f"reward={meters['reward']:.6f}\t"
                     f"gain={meters['gain']:.6f}\t"
+                    f"anchor_gain={meters['anchor_gain']:.6f}\t"
                     f"quality={meters['quality']:.6f}\n"
                 )
 
@@ -639,10 +662,12 @@ def run_train(args) -> None:
                 f"epoch_{epoch}: loss={meters['loss']:.6f}, sup={meters['sup']:.6f}, "
                 f"consistency={meters['consistency']:.6f}, grpo={meters['grpo']:.6f}, "
                 f"kl={meters['kl']:.6f}, clip={meters['clip_frac']:.6f}, gate={meters['gate']:.6f}, "
-                f"gain_value={meters['gain_value']:.6f}, gain_consistency={meters['gain_consistency']:.6f}, "
-                f"op_aux={meters['op_aux']:.6f}, pred_gain={meters['pred_gain']:.6f}, "
-                f"accept={meters['accept']:.6f}, cf_pos={meters['gain_positive']:.6f}, reward={meters['reward']:.6f}, "
-                f"gain={meters['gain']:.6f}, quality={meters['quality']:.6f}, "
+                f"gain_value={meters['gain_value']:.6f}, gain_lower={meters['gain_lower']:.6f}, "
+                f"gain_consistency={meters['gain_consistency']:.6f}, op_aux={meters['op_aux']:.6f}, "
+                f"pred_gain={meters['pred_gain']:.6f}/{meters['pred_gain_lower']:.6f}, "
+                f"accept={meters['accept']:.6f}, cf_pos={meters['gain_positive']:.6f}, "
+                f"unsafe={meters['unsafe_accept']:.6f}, degrade={meters['degrade']:.6f}, reward={meters['reward']:.6f}, "
+                f"gain={meters['gain']:.6f}/{meters['anchor_gain']:.6f}, quality={meters['quality']:.6f}, "
                 f"time={time.time() - start:.2f}s, ckpt={ckpt_path}"
             )
         if args.distributed:
@@ -694,7 +719,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gain_safety_margin", type=float, default=0.0)
     parser.add_argument("--gain_accept_probability", type=float, default=0.50)
     parser.add_argument("--gain_consistency_temperature", type=float, default=0.05)
+    parser.add_argument("--gain_lower_quantile", type=float, default=0.10)
+    parser.add_argument("--gain_lower_weight", type=float, default=1.0)
+    parser.add_argument("--disable_gain_lower_bound", action="store_true")
     parser.add_argument("--gain_warmup_epochs", type=int, default=5)
+    parser.add_argument("--disable_force_refine_warmup", action="store_true")
     parser.add_argument("--disable_hard_gain_gate", action="store_true")
     parser.add_argument("--force_first_refine", action="store_true")
     parser.add_argument("--disable_base_trajectory", action="store_true")
