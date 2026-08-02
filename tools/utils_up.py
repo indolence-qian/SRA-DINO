@@ -336,6 +336,7 @@ def get_anomaly_map(
     visual_layers: Sequence[int] = (5, 11, 17, 23),
     text_source: str = "prompt_learner",
     return_debug: bool = False,
+    return_evidence: bool = False,
 ):
     image = image_info["image"].to(device, non_blocking=True)
     image_path = image_info["image_path"]
@@ -391,6 +392,16 @@ def get_anomaly_map(
             "aw_layers": [],
             "global_margin_layers": [],
         }
+    evidence = None
+    if return_evidence:
+        evidence = {
+            "cross_prob_layers": [],
+            "cross_margin_layers": [],
+            "awareness_layers": [],
+            "normal_similarity_layers": [],
+            "anomaly_similarity_layers": [],
+            "global_margin_layers": [],
+        }
 
     for layer_i in range(num_scales):
         cls_features = _first_tensor(model.cls_token_adapter[layer_i](cls_token[layer_i]))
@@ -425,6 +436,15 @@ def get_anomaly_map(
         if return_debug:
             debug["token_margin_layers"].append(token_margin.detach().cpu())
             debug["cross_prob_layers"].append(cross_prob[:, 1].detach().cpu())
+        if return_evidence:
+            evidence["cross_prob_layers"].append(cross_prob[:, 1].detach())
+            evidence["cross_margin_layers"].append(token_margin.detach())
+            evidence["normal_similarity_layers"].append(
+                cross_logits_tokens[:, :, 0].reshape(batch_size, side, side).detach() / 100.0
+            )
+            evidence["anomaly_similarity_layers"].append(
+                cross_logits_tokens[:, :, 1].reshape(batch_size, side, side).detach() / 100.0
+            )
 
         sum_cross_modal = cross_prob if sum_cross_modal is None else sum_cross_modal + cross_prob
 
@@ -443,6 +463,8 @@ def get_anomaly_map(
 
         if return_debug:
             debug["aw_layers"].append(awareness[:, 1].detach().cpu())
+        if return_evidence:
+            evidence["awareness_layers"].append(awareness[:, 1].detach())
 
         sum_awareness = awareness if sum_awareness is None else sum_awareness + awareness
 
@@ -454,6 +476,10 @@ def get_anomaly_map(
         if return_debug:
             debug["global_margin_layers"].append(
                 (global_score[:, 1] - global_score[:, 0]).detach().cpu()
+            )
+        if return_evidence:
+            evidence["global_margin_layers"].append(
+                (global_score[:, 1] - global_score[:, 0]).detach()
             )
 
         sum_global_score = global_score if sum_global_score is None else sum_global_score + global_score
@@ -468,7 +494,12 @@ def get_anomaly_map(
         debug["final_global_margin"] = (
             global_anomaly_score[:, 1] - global_anomaly_score[:, 0]
         ).detach().cpu()
+        if return_evidence:
+            return anomaly_awareness, mask, anomaly_map_cross_modal, global_anomaly_score, debug, evidence
         return anomaly_awareness, mask, anomaly_map_cross_modal, global_anomaly_score, debug
+
+    if return_evidence:
+        return anomaly_awareness, mask, anomaly_map_cross_modal, global_anomaly_score, evidence
 
     return anomaly_awareness, mask, anomaly_map_cross_modal, global_anomaly_score
 

@@ -22,6 +22,8 @@ SAVE_VIS="${SAVE_VIS:-0}"
 GAIN_SAFETY_MARGIN="${GAIN_SAFETY_MARGIN:-0.0}"
 GAIN_ACCEPT_PROBABILITY="${GAIN_ACCEPT_PROBABILITY:-0.50}"
 DISABLE_HARD_GAIN_GATE="${DISABLE_HARD_GAIN_GATE:-0}"
+DISABLE_EVIDENCE_ORACLE="${DISABLE_EVIDENCE_ORACLE:-0}"
+QUALITY_DEGRADATION_TOLERANCE="${QUALITY_DEGRADATION_TOLERANCE:-0.0001}"
 
 if [[ -z "${MARA_CKPT}" ]]; then
   echo "[ERROR] MARA_CKPT is required."
@@ -49,6 +51,7 @@ echo "Result path: ${RESULT_PATH}"
 echo "Datasets: ${DATASETS}"
 echo "Parallel evaluation GPUs: ${GPU_IDS}"
 echo "Hard gain gate: disabled=${DISABLE_HARD_GAIN_GATE}, safety_margin=${GAIN_SAFETY_MARGIN}, accept_probability=${GAIN_ACCEPT_PROBABILITY}"
+echo "Evidence oracle: disabled=${DISABLE_EVIDENCE_ORACLE}, degradation_tolerance=${QUALITY_DEGRADATION_TOLERANCE}"
 
 LATEST_FLAG=()
 if [[ "${EVAL_LATEST_ONLY}" == "1" ]]; then
@@ -63,6 +66,11 @@ fi
 HARD_GAIN_GATE_FLAG=()
 if [[ "${DISABLE_HARD_GAIN_GATE}" == "1" ]]; then
   HARD_GAIN_GATE_FLAG=(--disable_hard_gain_gate)
+fi
+
+EVIDENCE_ORACLE_FLAG=()
+if [[ "${DISABLE_EVIDENCE_ORACLE}" == "1" ]]; then
+  EVIDENCE_ORACLE_FLAG=(--disable_evidence_oracle)
 fi
 
 IFS=',' read -r -a GPU_LIST <<< "${GPU_IDS}"
@@ -94,9 +102,11 @@ for ((worker_idx = 0; worker_idx < ${#GPU_LIST[@]}; worker_idx++)); do
         --norm_mode "${NORM_MODE}" \
         --gain_safety_margin "${GAIN_SAFETY_MARGIN}" \
         --gain_accept_probability "${GAIN_ACCEPT_PROBABILITY}" \
+        --quality_degradation_tolerance "${QUALITY_DEGRADATION_TOLERANCE}" \
         "${LATEST_FLAG[@]}" \
         "${SAVE_VIS_FLAG[@]}" \
-        "${HARD_GAIN_GATE_FLAG[@]}"
+        "${HARD_GAIN_GATE_FLAG[@]}" \
+        "${EVIDENCE_ORACLE_FLAG[@]}"
 
       METRIC_FILE="${RESULT_PATH}/${ds}/metric_mara.txt"
       if [[ -f "${METRIC_FILE}" ]]; then

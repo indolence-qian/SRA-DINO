@@ -11,6 +11,8 @@ from torch.distributions import Categorical
 @dataclass
 class MARAConfig:
     num_layers: int = 4
+    evidence_channels: int = 0
+    global_evidence_dim: int = 0
     map_size: int = 128
     num_regions: int = 16
     roi_size: int = 32
@@ -47,6 +49,7 @@ class MARAConfig:
     use_gain_lower_bound: bool = True
     gain_lower_quantile: float = 0.10
     gain_lower_weight: float = 1.0
+    quality_degradation_tolerance: float = 1e-4
 
 
 def _resize_map(x: torch.Tensor, size: int, mode: str = "bilinear") -> torch.Tensor:
@@ -55,6 +58,33 @@ def _resize_map(x: torch.Tensor, size: int, mode: str = "bilinear") -> torch.Ten
     if mode == "nearest":
         return F.interpolate(x, size=(size, size), mode=mode)
     return F.interpolate(x, size=(size, size), mode=mode, align_corners=False)
+
+
+def _compose_high_res_probability(
+    base_prob: torch.Tensor,
+    proposal_logits_lr: torch.Tensor,
+    cumulative_gate_lr: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fuse a low-resolution MARA proposal into the original Base map.
+
+    Anchoring at the original resolution guarantees that a zero MARA gate is
+    an exact identity operation instead of a downsample/upsample approximation.
+    """
+    out_hw = base_prob.shape[-2:]
+    proposal_prob_lr = torch.softmax(proposal_logits_lr, dim=1)
+    if proposal_prob_lr.shape[-2:] == out_hw:
+        proposal_prob = proposal_prob_lr
+        gate = cumulative_gate_lr
+    else:
+        proposal_prob = F.interpolate(
+            proposal_prob_lr, size=out_hw, mode="bilinear", align_corners=False
+        )
+        gate = F.interpolate(
+            cumulative_gate_lr, size=out_hw, mode="bilinear", align_corners=False
+        )
+    gate = gate.clamp(0.0, 1.0)
+    final_prob = base_prob * (1.0 - gate) + proposal_prob * gate
+    return final_prob, gate
 
 
 def _prob_to_logits(prob: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -252,7 +282,7 @@ class MARAAgent(nn.Module):
     def __init__(self, cfg: MARAConfig):
         super().__init__()
         self.cfg = cfg
-        state_channels = 4 + cfg.num_layers
+        state_channels = 4 + cfg.num_layers + cfg.evidence_channels
         self.state_encoder = nn.Sequential(
             nn.Conv2d(state_channels, cfg.hidden_dim, kernel_size=3, padding=1),
             nn.GroupNorm(8, cfg.hidden_dim),
@@ -267,7 +297,7 @@ class MARAAgent(nn.Module):
             nn.Linear(cfg.hidden_dim, 1),
         )
         self.global_head = nn.Sequential(
-            nn.Linear(cfg.hidden_dim + 3, cfg.hidden_dim),
+            nn.Linear(cfg.hidden_dim + 3 + cfg.global_evidence_dim, cfg.hidden_dim),
             nn.GELU(),
         )
         self.layer_head = nn.Linear(cfg.hidden_dim, cfg.num_layers)
@@ -320,6 +350,7 @@ class MARAAgent(nn.Module):
         base_prob: torch.Tensor,
         layer_maps: torch.Tensor,
         step_idx: int,
+        evidence_maps: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         bsz, _, height, width = current_prob.shape
         uncertainty = _entropy_2class(current_prob)
@@ -329,16 +360,30 @@ class MARAAgent(nn.Module):
             device=current_prob.device,
             dtype=current_prob.dtype,
         )
-        return torch.cat(
-            [
-                current_prob[:, 1:2],
-                uncertainty,
-                base_prob[:, 1:2],
-                step_plane,
-                layer_maps,
-            ],
-            dim=1,
-        )
+        state_parts = [
+            current_prob[:, 1:2],
+            uncertainty,
+            base_prob[:, 1:2],
+            step_plane,
+            layer_maps,
+        ]
+        if self.cfg.evidence_channels > 0:
+            if evidence_maps is None:
+                evidence_maps = torch.zeros(
+                    bsz,
+                    self.cfg.evidence_channels,
+                    height,
+                    width,
+                    device=current_prob.device,
+                    dtype=current_prob.dtype,
+                )
+            if evidence_maps.shape[1] != self.cfg.evidence_channels:
+                raise ValueError(
+                    f"Expected {self.cfg.evidence_channels} evidence channels, "
+                    f"got {evidence_maps.shape[1]}."
+                )
+            state_parts.append(evidence_maps)
+        return torch.cat(state_parts, dim=1)
 
     def _policy(
         self,
@@ -349,6 +394,7 @@ class MARAAgent(nn.Module):
         sample: bool,
         actions: Optional[Dict[str, torch.Tensor]] = None,
         forced_op: Optional[torch.Tensor] = None,
+        global_evidence: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         cfg = self.cfg
         encoded = self.state_encoder(state)
@@ -367,7 +413,22 @@ class MARAAgent(nn.Module):
         image_prob = torch.softmax(global_logits, dim=-1)[:, 1:2]
         step_feat = torch.full_like(image_prob, float(step_idx) / float(max(1, cfg.max_steps)))
         active_feat = active.float().unsqueeze(1)
-        global_features = self.global_head(torch.cat([pooled, image_prob, step_feat, active_feat], dim=1))
+        global_parts = [pooled, image_prob, step_feat, active_feat]
+        if cfg.global_evidence_dim > 0:
+            if global_evidence is None:
+                global_evidence = torch.zeros(
+                    pooled.shape[0],
+                    cfg.global_evidence_dim,
+                    device=pooled.device,
+                    dtype=pooled.dtype,
+                )
+            if global_evidence.shape[1] != cfg.global_evidence_dim:
+                raise ValueError(
+                    f"Expected {cfg.global_evidence_dim} global evidence values, "
+                    f"got {global_evidence.shape[1]}."
+                )
+            global_parts.append(global_evidence.to(dtype=pooled.dtype))
+        global_features = self.global_head(torch.cat(global_parts, dim=1))
         layer_logits = self.layer_head(global_features)
         op_logits = self.op_head(global_features)
         if step_idx == 0 and cfg.force_first_refine:
@@ -533,6 +594,8 @@ class MARAAgent(nn.Module):
         layer_maps: Optional[torch.Tensor],
         mask: torch.Tensor,
         labels: torch.Tensor,
+        evidence_maps: Optional[torch.Tensor] = None,
+        global_evidence: Optional[torch.Tensor] = None,
         group_size: Optional[int] = None,
         sample: bool = True,
         trajectory: Optional[Dict[str, torch.Tensor]] = None,
@@ -542,8 +605,7 @@ class MARAAgent(nn.Module):
         """Sample a behavior trajectory or replay fixed actions for a GRPO update."""
         cfg = self.cfg
         group_size = int(group_size or cfg.group_size)
-        out_hw = base_prob.shape[-2:]
-
+        base_prob_original = base_prob.detach()
         base_prob_lr = _resize_map(base_prob, cfg.map_size).detach()
         if layer_maps is None:
             layer_maps_lr = base_prob_lr[:, 1:2].repeat(1, cfg.num_layers, 1, 1)
@@ -551,6 +613,24 @@ class MARAAgent(nn.Module):
             layer_maps_lr = _resize_map(layer_maps, cfg.map_size).detach()
             if layer_maps_lr.shape[1] != cfg.num_layers:
                 raise ValueError(f"Expected {cfg.num_layers} layer maps, got {layer_maps_lr.shape[1]}.")
+
+        evidence_maps_lr = None
+        if cfg.evidence_channels > 0 and evidence_maps is not None:
+            evidence_maps_lr = _resize_map(evidence_maps, cfg.map_size).detach()
+            if evidence_maps_lr.shape[1] != cfg.evidence_channels:
+                raise ValueError(
+                    f"Expected {cfg.evidence_channels} evidence channels, "
+                    f"got {evidence_maps_lr.shape[1]}."
+                )
+        if cfg.global_evidence_dim <= 0:
+            global_evidence = None
+        else:
+            global_evidence = None if global_evidence is None else global_evidence.detach()
+        if global_evidence is not None and global_evidence.shape[1] != cfg.global_evidence_dim:
+            raise ValueError(
+                f"Expected {cfg.global_evidence_dim} global evidence values, "
+                f"got {global_evidence.shape[1]}."
+            )
 
         base_logits = base_logits.detach()
         mask = mask.detach()
@@ -561,6 +641,17 @@ class MARAAgent(nn.Module):
         logits_g = base_logits.repeat_interleave(group_size, dim=0)
         mask_g = mask.repeat_interleave(group_size, dim=0)
         labels_g = labels.repeat_interleave(group_size, dim=0)
+        base_prob_original_g = base_prob_original.repeat_interleave(group_size, dim=0)
+        evidence_maps_g = (
+            None
+            if evidence_maps_lr is None
+            else evidence_maps_lr.repeat_interleave(group_size, dim=0)
+        )
+        global_evidence_g = (
+            None
+            if global_evidence is None
+            else global_evidence.repeat_interleave(group_size, dim=0)
+        )
 
         current_logits = _prob_to_logits(base_prob_g)
         current_prob = base_prob_g
@@ -607,7 +698,13 @@ class MARAAgent(nn.Module):
 
         for step_idx in range(cfg.max_steps):
             q_before = quality_score(current_prob, global_logits, mask_g, labels_g, cfg).detach()
-            state = self._make_state(current_prob, base_prob_g, layer_maps_g, step_idx)
+            state = self._make_state(
+                current_prob,
+                base_prob_g,
+                layer_maps_g,
+                step_idx,
+                evidence_maps=evidence_maps_g,
+            )
             fixed_actions = None
             if trajectory is not None:
                 fixed_actions = {
@@ -631,6 +728,7 @@ class MARAAgent(nn.Module):
                 sample=sample,
                 actions=fixed_actions,
                 forced_op=forced_op,
+                global_evidence=global_evidence_g,
             )
             active_before = active
             refine_out = self._refine(
@@ -803,16 +901,18 @@ class MARAAgent(nn.Module):
         ).float()
         accepted_refine = would_accept * refine_attempt_all
         negative_accept_rate = (
-            accepted_refine * (gain_targets < 0).float()
+            accepted_refine * (gain_targets < -cfg.quality_degradation_tolerance).float()
         ).sum() / accepted_refine.sum().clamp_min(1.0)
         trajectory_weight = (~base_trajectory_mask).float()
         degradation_rate = (
-            (quality_gain < 0).float() * trajectory_weight
+            (quality_gain < -cfg.quality_degradation_tolerance).float() * trajectory_weight
         ).sum() / trajectory_weight.sum().clamp_min(1.0)
 
-        final_prob = _resize_map(current_prob, out_hw[0])
-        if final_prob.shape[-2:] != out_hw:
-            final_prob = F.interpolate(final_prob, size=out_hw, mode="bilinear", align_corners=False)
+        final_prob, _ = _compose_high_res_probability(
+            base_prob_original_g,
+            current_logits,
+            cumulative_gate,
+        )
 
         return {
             "final_prob": final_prob,
@@ -851,12 +951,13 @@ class MARAAgent(nn.Module):
         base_prob: torch.Tensor,
         base_logits: torch.Tensor,
         layer_maps: Optional[torch.Tensor] = None,
+        evidence_maps: Optional[torch.Tensor] = None,
+        global_evidence: Optional[torch.Tensor] = None,
         sample: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """Run deterministic MARA refinement for evaluation without using labels or masks."""
         cfg = self.cfg
-        out_hw = base_prob.shape[-2:]
-
+        base_prob_original = base_prob
         base_prob_lr = _resize_map(base_prob, cfg.map_size)
         if layer_maps is None:
             layer_maps_lr = base_prob_lr[:, 1:2].repeat(1, cfg.num_layers, 1, 1)
@@ -864,6 +965,22 @@ class MARAAgent(nn.Module):
             layer_maps_lr = _resize_map(layer_maps, cfg.map_size)
             if layer_maps_lr.shape[1] != cfg.num_layers:
                 raise ValueError(f"Expected {cfg.num_layers} layer maps, got {layer_maps_lr.shape[1]}.")
+
+        evidence_maps_lr = None
+        if cfg.evidence_channels > 0 and evidence_maps is not None:
+            evidence_maps_lr = _resize_map(evidence_maps, cfg.map_size)
+            if evidence_maps_lr.shape[1] != cfg.evidence_channels:
+                raise ValueError(
+                    f"Expected {cfg.evidence_channels} evidence channels, "
+                    f"got {evidence_maps_lr.shape[1]}."
+                )
+        if cfg.global_evidence_dim <= 0:
+            global_evidence = None
+        elif global_evidence is not None and global_evidence.shape[1] != cfg.global_evidence_dim:
+            raise ValueError(
+                f"Expected {cfg.global_evidence_dim} global evidence values, "
+                f"got {global_evidence.shape[1]}."
+            )
 
         current_logits = _prob_to_logits(base_prob_lr)
         current_prob = base_prob_lr
@@ -884,8 +1001,21 @@ class MARAAgent(nn.Module):
         refine_execute_steps = []
 
         for step_idx in range(cfg.max_steps):
-            state = self._make_state(current_prob, base_prob_lr, layer_maps_lr, step_idx)
-            policy_out = self._policy(state, global_logits, active, step_idx, sample=sample)
+            state = self._make_state(
+                current_prob,
+                base_prob_lr,
+                layer_maps_lr,
+                step_idx,
+                evidence_maps=evidence_maps_lr,
+            )
+            policy_out = self._policy(
+                state,
+                global_logits,
+                active,
+                step_idx,
+                sample=sample,
+                global_evidence=global_evidence,
+            )
             refine_out = self._refine(
                 base_prob=base_prob_lr,
                 base_logits=base_logits,
@@ -911,12 +1041,23 @@ class MARAAgent(nn.Module):
             refine_attempt_steps.append(refine_out["refine_attempt"])
             refine_execute_steps.append(refine_out["execute_weight"])
 
-        final_prob = _resize_map(current_prob, out_hw[0])
-        if final_prob.shape[-2:] != out_hw:
-            final_prob = F.interpolate(final_prob, size=out_hw, mode="bilinear", align_corners=False)
-        gate_map = _resize_map(cumulative_gate, out_hw[0])
-        if gate_map.shape[-2:] != out_hw:
-            gate_map = F.interpolate(gate_map, size=out_hw, mode="bilinear", align_corners=False)
+        final_prob, gate_map = _compose_high_res_probability(
+            base_prob_original,
+            current_logits,
+            cumulative_gate,
+        )
+        no_change = gate_map.flatten(1).amax(dim=1) <= 1e-8
+        identity_delta = (final_prob - base_prob_original).abs().flatten(1)
+        identity_error_mean = torch.where(
+            no_change,
+            identity_delta.mean(dim=1),
+            torch.zeros_like(no_change, dtype=final_prob.dtype),
+        )
+        identity_error_max = torch.where(
+            no_change,
+            identity_delta.amax(dim=1),
+            torch.zeros_like(no_change, dtype=final_prob.dtype),
+        )
 
         refine_attempts = torch.stack(refine_attempt_steps, dim=1)
         refine_executes = torch.stack(refine_execute_steps, dim=1)
@@ -946,4 +1087,6 @@ class MARAAgent(nn.Module):
             "rejected_steps": (refine_attempts - refine_executes).sum(dim=1),
             "gate_roi_mean": gate_roi_mean,
             "changed_ratio": changed.mean(dim=(1, 2, 3)),
+            "identity_error_mean": identity_error_mean,
+            "identity_error_max": identity_error_max,
         }

@@ -45,9 +45,11 @@ GAIN_CONSISTENCY_TEMPERATURE="${GAIN_CONSISTENCY_TEMPERATURE:-0.05}"
 GAIN_LOWER_QUANTILE="${GAIN_LOWER_QUANTILE:-0.10}"
 GAIN_LOWER_WEIGHT="${GAIN_LOWER_WEIGHT:-1.0}"
 DISABLE_GAIN_LOWER_BOUND="${DISABLE_GAIN_LOWER_BOUND:-0}"
+QUALITY_DEGRADATION_TOLERANCE="${QUALITY_DEGRADATION_TOLERANCE:-0.0001}"
 GAIN_WARMUP_EPOCHS="${GAIN_WARMUP_EPOCHS:-5}"
 DISABLE_FORCE_REFINE_WARMUP="${DISABLE_FORCE_REFINE_WARMUP:-0}"
 DISABLE_GAIN_GATE="${DISABLE_GAIN_GATE:-0}"
+DISABLE_EVIDENCE_BANK="${DISABLE_EVIDENCE_BANK:-0}"
 BASE_ANCHOR_MARGIN="${BASE_ANCHOR_MARGIN:-0.0}"
 NEGATIVE_ADVANTAGE_SCALE="${NEGATIVE_ADVANTAGE_SCALE:-1.0}"
 ADVANTAGE_CLIP="${ADVANTAGE_CLIP:-5.0}"
@@ -73,6 +75,8 @@ TEST_TRICK_NAME="${TEST_TRICK_NAME:-mara_grpo_final}"
 TEST_GAIN_SAFETY_MARGIN="${TEST_GAIN_SAFETY_MARGIN:-${GAIN_SAFETY_MARGIN}}"
 TEST_GAIN_ACCEPT_PROBABILITY="${TEST_GAIN_ACCEPT_PROBABILITY:-${GAIN_ACCEPT_PROBABILITY}}"
 TEST_DISABLE_HARD_GAIN_GATE="${TEST_DISABLE_HARD_GAIN_GATE:-0}"
+TEST_DISABLE_EVIDENCE_ORACLE="${TEST_DISABLE_EVIDENCE_ORACLE:-0}"
+TEST_QUALITY_DEGRADATION_TOLERANCE="${TEST_QUALITY_DEGRADATION_TOLERANCE:-${QUALITY_DEGRADATION_TOLERANCE}}"
 
 TS="$(date +'%Y%m%d_%H%M%S')"
 LOG_DIR="./logs/${TRICK_NAME}"
@@ -89,6 +93,8 @@ echo "MARA gate: max=${MARA_GATE_MAX}, init_bias=${MARA_GATE_INIT_BIAS}, sparse_
 echo "GRPO: group=${GRPO_GROUP_SIZE}, replay_updates=${GRPO_UPDATE_EPOCHS}, kl_coef=${GRPO_KL_COEF}, weight=${W_GRPO}"
 echo "Gain gate: disabled=${DISABLE_GAIN_GATE}, warmup=${GAIN_WARMUP_EPOCHS}, force_refine_warmup=$((1 - DISABLE_FORCE_REFINE_WARMUP)), target_threshold=${GAIN_ACCEPT_THRESHOLD}, safety_margin=${GAIN_SAFETY_MARGIN}, accept_probability=${GAIN_ACCEPT_PROBABILITY}"
 echo "Gain lower bound: disabled=${DISABLE_GAIN_LOWER_BOUND}, quantile=${GAIN_LOWER_QUANTILE}, weight=${GAIN_LOWER_WEIGHT}"
+echo "Quality degradation tolerance: ${QUALITY_DEGRADATION_TOLERANCE}"
+echo "Stage-one evidence bank: disabled=${DISABLE_EVIDENCE_BANK}"
 
 BASE_RESULT_PATH="./checkpoint/base_${DATASET}_${HFA_SETTING}_${TS}"
 MARA_RESULT_PATH="./checkpoint/mara_${DATASET}_${HFA_SETTING}_${TS}"
@@ -144,6 +150,11 @@ if [[ "${RUN_MARA}" == "1" ]]; then
     WARMUP_REFINE_FLAG=(--disable_force_refine_warmup)
   fi
 
+  EVIDENCE_BANK_FLAG=()
+  if [[ "${DISABLE_EVIDENCE_BANK}" == "1" ]]; then
+    EVIDENCE_BANK_FLAG=(--disable_evidence_bank)
+  fi
+
   if command -v torchrun >/dev/null 2>&1; then
     MARA_LAUNCHER=(torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}")
   else
@@ -178,6 +189,7 @@ if [[ "${RUN_MARA}" == "1" ]]; then
     --gain_consistency_temperature "${GAIN_CONSISTENCY_TEMPERATURE}" \
     --gain_lower_quantile "${GAIN_LOWER_QUANTILE}" \
     --gain_lower_weight "${GAIN_LOWER_WEIGHT}" \
+    --quality_degradation_tolerance "${QUALITY_DEGRADATION_TOLERANCE}" \
     --gain_warmup_epochs "${GAIN_WARMUP_EPOCHS}" \
     --base_anchor_margin "${BASE_ANCHOR_MARGIN}" \
     --negative_advantage_scale "${NEGATIVE_ADVANTAGE_SCALE}" \
@@ -191,7 +203,8 @@ if [[ "${RUN_MARA}" == "1" ]]; then
     --reward_conf_weight "${REWARD_CONF_WEIGHT}" \
     "${GAIN_GATE_FLAG[@]}" \
     "${GAIN_LOWER_FLAG[@]}" \
-    "${WARMUP_REFINE_FLAG[@]}"
+    "${WARMUP_REFINE_FLAG[@]}" \
+    "${EVIDENCE_BANK_FLAG[@]}"
 fi
 
 if [[ "${RUN_TEST}" == "1" ]]; then
@@ -216,6 +229,8 @@ if [[ "${RUN_TEST}" == "1" ]]; then
   GAIN_SAFETY_MARGIN="${TEST_GAIN_SAFETY_MARGIN}" \
   GAIN_ACCEPT_PROBABILITY="${TEST_GAIN_ACCEPT_PROBABILITY}" \
   DISABLE_HARD_GAIN_GATE="${TEST_DISABLE_HARD_GAIN_GATE}" \
+  DISABLE_EVIDENCE_ORACLE="${TEST_DISABLE_EVIDENCE_ORACLE}" \
+  QUALITY_DEGRADATION_TOLERANCE="${TEST_QUALITY_DEGRADATION_TOLERANCE}" \
   bash test_mara_final.sh
 fi
 

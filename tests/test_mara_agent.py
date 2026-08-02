@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from tools.mara_agent import MARAAgent, MARAConfig, _baseline_anchored_advantages
+from tools.mara_evidence import build_mara_evidence
 
 
 class BaselineAnchoredAdvantageTests(unittest.TestCase):
@@ -157,6 +158,70 @@ class HierarchicalPolicyTests(unittest.TestCase):
         self.assertGreater(self._grad_norm(agent.layer_head), 0.0)
         self.assertGreater(self._grad_norm(agent.op_head), 0.0)
         self.assertGreater(self._grad_norm(agent.gain_lower_head), 0.0)
+
+    def test_zero_gate_is_exact_identity_at_original_resolution(self):
+        agent = MARAAgent(self.cfg).eval()
+        base_prob = torch.softmax(torch.randn(2, 2, 32, 32), dim=1)
+        base_logits = torch.randn(2, 2)
+        layer_maps = torch.rand(2, self.cfg.num_layers, 32, 32)
+
+        with torch.no_grad():
+            output = agent.infer(base_prob, base_logits, layer_maps)
+
+        self.assertEqual(float(output["gate_map"].max()), 0.0)
+        self.assertTrue(torch.equal(output["final_prob"], base_prob))
+        self.assertEqual(float(output["identity_error_mean"].max()), 0.0)
+        self.assertEqual(float(output["identity_error_max"].max()), 0.0)
+
+
+class EvidenceBankTests(unittest.TestCase):
+    def test_compact_stage_one_evidence_shapes_and_agent_consumption(self):
+        torch.manual_seed(1)
+        num_layers = 2
+        batch_size = 2
+        base_prob = torch.softmax(torch.randn(batch_size, 2, 32, 32), dim=1)
+        evidence = {
+            "cross_prob_layers": [torch.rand(batch_size, 32, 32) for _ in range(num_layers)],
+            "cross_margin_layers": [torch.randn(batch_size, 8, 8) * 20 for _ in range(num_layers)],
+            "awareness_layers": [torch.rand(batch_size, 32, 32) for _ in range(num_layers)],
+            "normal_similarity_layers": [torch.rand(batch_size, 8, 8) * 2 - 1 for _ in range(num_layers)],
+            "anomaly_similarity_layers": [torch.rand(batch_size, 8, 8) * 2 - 1 for _ in range(num_layers)],
+            "global_margin_layers": [torch.randn(batch_size) * 20 for _ in range(num_layers)],
+        }
+        packed = build_mara_evidence(
+            evidence=evidence,
+            fallback_prob=base_prob,
+            num_layers=num_layers,
+            map_size=8,
+            include_full_resolution_oracle=True,
+        )
+
+        self.assertEqual(tuple(packed["layer_maps"].shape), (batch_size, num_layers, 8, 8))
+        self.assertEqual(tuple(packed["extra_maps"].shape), (batch_size, 4 * num_layers + 2, 8, 8))
+        self.assertEqual(tuple(packed["global_evidence"].shape), (batch_size, num_layers))
+        self.assertEqual(tuple(packed["oracle_maps"].shape), (batch_size, 2 * num_layers, 32, 32))
+        self.assertTrue(torch.isfinite(packed["extra_maps"]).all())
+
+        cfg = MARAConfig(
+            num_layers=num_layers,
+            evidence_channels=4 * num_layers + 2,
+            global_evidence_dim=num_layers,
+            map_size=8,
+            num_regions=4,
+            roi_size=4,
+            hidden_dim=8,
+            max_steps=1,
+            group_size=2,
+        )
+        agent = MARAAgent(cfg)
+        output = agent.infer(
+            base_prob=base_prob,
+            base_logits=torch.randn(batch_size, 2),
+            layer_maps=packed["layer_maps"],
+            evidence_maps=packed["extra_maps"],
+            global_evidence=packed["global_evidence"],
+        )
+        self.assertEqual(tuple(output["final_prob"].shape), tuple(base_prob.shape))
 
 
 if __name__ == "__main__":

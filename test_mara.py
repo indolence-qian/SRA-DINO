@@ -7,17 +7,18 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from Datasets import DATASET_CLASSES, DATASET_REGISTRY
 from tools.mara_agent import MARAAgent, MARAConfig, quality_score
+from tools.mara_evidence import build_mara_evidence
 from tools.utils_up import get_anomaly_map
 from tools.visualization import visualization
 from train_mara import (
     HFA_CHOICES,
     apply_base_runtime_config,
     create_visual_backbone_for_mara,
-    layer_maps_from_debug,
     normalize_layers_obj,
 )
 from train_up import (
@@ -115,19 +116,22 @@ def apply_payload_runtime_config(payload: Dict, args) -> None:
 
 def build_models_from_checkpoint(args, device: torch.device, payload: Dict):
     apply_payload_runtime_config(payload, args)
+    mara_cfg = config_from_payload(payload, args)
     print(
         "Runtime config: "
         f"visual_backbone={args.visual_backbone}, "
         f"visual_layers={args.visual_layers}, "
         f"hfa_setting={args.hfa_setting_runtime}, "
         f"hfa_layers={args.hfa_layers_runtime}, "
-        f"hfa_bottleneck={args.hfa_bottleneck_runtime}"
+        f"hfa_bottleneck={args.hfa_bottleneck_runtime}, "
+        f"evidence_channels={mara_cfg.evidence_channels}, "
+        f"global_evidence_dim={mara_cfg.global_evidence_dim}"
     )
     clip_model = create_clip_model(args, device)
     prompt_learner = create_prompt_learner(clip_model, device)
     dino_model, dino_adapters = create_visual_backbone_for_mara(args, device)
     model = create_adapter_model(clip_model, device, args.visual_backbone)
-    mara_agent = MARAAgent(config_from_payload(payload, args)).to(device)
+    mara_agent = MARAAgent(mara_cfg).to(device)
 
     clip_model.eval()
     prompt_learner.eval()
@@ -191,6 +195,7 @@ def evaluate_category(
 ):
     base_maps = []
     mara_maps = []
+    oracle_maps = []
     gate_values = []
     gate_roi_values = []
     changed_values = []
@@ -203,13 +208,15 @@ def evaluate_category(
     quality_gain_values = []
     accepted_negative_count = 0
     accepted_count = 0
+    identity_mean_values = []
+    identity_max_values = []
     gt_masks = []
     img_paths = []
 
     loader = prepare_data(args.dataset, category, args)
     with torch.no_grad():
         for batch_idx, image_info in enumerate(tqdm(loader)):
-            _, mask, base_map, base_logits, debug = get_anomaly_map(
+            _, mask, base_map, base_logits, stage1_evidence = get_anomaly_map(
                 clip_model=clip_model,
                 image_info=image_info,
                 device=device,
@@ -220,18 +227,24 @@ def evaluate_category(
                 visual_backbone=args.visual_backbone,
                 visual_layers=args.visual_layers,
                 text_source=args.text_source,
-                return_debug=True,
+                return_evidence=True,
             )
-            layer_maps = layer_maps_from_debug(
-                debug=debug,
-                device=device,
+            mara_evidence = build_mara_evidence(
+                evidence=stage1_evidence,
                 fallback_prob=base_map,
                 num_layers=len(args.visual_layers),
+                map_size=mara_agent.cfg.map_size,
+                include_full_resolution_oracle=not args.disable_evidence_oracle,
             )
+            del stage1_evidence
+            layer_maps = mara_evidence["layer_maps"]
+            use_evidence_bank = mara_agent.cfg.evidence_channels > 0
             output = mara_agent.infer(
                 base_prob=base_map,
                 base_logits=base_logits,
                 layer_maps=layer_maps,
+                evidence_maps=mara_evidence["extra_maps"] if use_evidence_bank else None,
+                global_evidence=mara_evidence["global_evidence"] if use_evidence_bank else None,
                 sample=args.sample_policy,
             )
             labels = image_info["is_anomaly"].to(device).long()
@@ -242,11 +255,43 @@ def evaluate_category(
             quality_gain = mara_quality - base_quality
             quality_gain_values.append(quality_gain.detach().cpu().numpy())
             executed = output.get("refine_steps", torch.zeros_like(quality_gain)) > 0
-            accepted_negative_count += int(((quality_gain < 0) & executed).sum().item())
+            accepted_negative_count += int(
+                ((quality_gain < -args.quality_degradation_tolerance) & executed).sum().item()
+            )
             accepted_count += int(executed.sum().item())
+
+            if args.disable_evidence_oracle:
+                oracle_map = base_map[:, 1]
+            else:
+                candidates = mara_evidence["oracle_maps"]
+                if candidates.shape[-2:] != base_map.shape[-2:]:
+                    candidates = F.interpolate(
+                        candidates,
+                        size=base_map.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                candidates = torch.cat([base_map[:, 1:2], candidates], dim=1)
+                candidate_quality = []
+                for candidate_idx in range(candidates.shape[1]):
+                    candidate_anomaly = candidates[:, candidate_idx].clamp(0.0, 1.0)
+                    candidate_prob = torch.stack([1.0 - candidate_anomaly, candidate_anomaly], dim=1)
+                    candidate_quality.append(
+                        quality_score(candidate_prob, base_logits, mask, labels, mara_agent.cfg)
+                    )
+                best_candidate = torch.stack(candidate_quality, dim=1).argmax(dim=1)
+                oracle_map = candidates.gather(
+                    1,
+                    best_candidate.view(-1, 1, 1, 1).expand(
+                        -1, 1, candidates.shape[-2], candidates.shape[-1]
+                    ),
+                )[:, 0]
 
             base_maps.append(base_map[:, 1].detach().cpu().numpy())
             mara_maps.append(output["final_prob"][:, 1].detach().cpu().numpy())
+            oracle_maps.append(oracle_map.detach().cpu().numpy())
+            identity_mean_values.append(output["identity_error_mean"].detach().cpu().numpy())
+            identity_max_values.append(output["identity_error_max"].detach().cpu().numpy())
             if "gate_map" in output:
                 gate_values.append(output["gate_map"].detach().mean(dim=(1, 2, 3)).cpu().numpy())
             if "gate_roi_mean" in output:
@@ -285,9 +330,11 @@ def evaluate_category(
 
     base_maps = np.concatenate(base_maps, axis=0).astype(np.float32)
     mara_maps = np.concatenate(mara_maps, axis=0).astype(np.float32)
+    oracle_maps = np.concatenate(oracle_maps, axis=0).astype(np.float32)
     gt_masks = np.concatenate(gt_masks, axis=0).astype(np.uint8)
     base_eval = normalize_maps(base_maps, mode=args.norm_mode)
     mara_eval = normalize_maps(mara_maps, mode=args.norm_mode)
+    oracle_eval = normalize_maps(oracle_maps, mode=args.norm_mode)
 
     if args.save_vis:
         vis_dir = os.path.join(result_dir, "visualization")
@@ -296,11 +343,14 @@ def evaluate_category(
 
     base_metrics = compute_metrics(gt_masks, base_eval, args)
     mara_metrics = compute_metrics(gt_masks, mara_eval, args)
+    oracle_metrics = compute_metrics(gt_masks, oracle_eval, args)
     row = {"category": category}
     for metric_name in ("F1", "I_AUROC", "P_AUROC", "PRO"):
         row[f"base_{metric_name}"] = base_metrics[metric_name]
         row[f"mara_{metric_name}"] = mara_metrics[metric_name]
         row[f"delta_{metric_name}"] = mara_metrics[metric_name] - base_metrics[metric_name]
+        row[f"oracle_{metric_name}"] = oracle_metrics[metric_name]
+        row[f"oracle_delta_{metric_name}"] = oracle_metrics[metric_name] - base_metrics[metric_name]
     row["gate_mean"] = float(np.concatenate(gate_values).mean()) if gate_values else 0.0
     row["gate_roi_mean"] = float(np.concatenate(gate_roi_values).mean()) if gate_roi_values else 0.0
     row["changed_ratio_mean"] = float(np.concatenate(changed_values).mean()) if changed_values else 0.0
@@ -312,8 +362,12 @@ def evaluate_category(
     row["accept_mean"] = float(np.concatenate(accept_values).mean()) if accept_values else 0.0
     quality_gains = np.concatenate(quality_gain_values) if quality_gain_values else np.zeros(1, dtype=np.float32)
     row["quality_gain_mean"] = float(quality_gains.mean())
-    row["base_degradation_rate"] = float((quality_gains < 0).mean())
+    row["base_degradation_rate"] = float(
+        (quality_gains < -args.quality_degradation_tolerance).mean()
+    )
     row["negative_gain_accept_rate"] = float(accepted_negative_count / max(1, accepted_count))
+    row["identity_error_mean"] = float(np.concatenate(identity_mean_values).mean())
+    row["identity_error_max"] = float(np.concatenate(identity_max_values).max())
     return row
 
 
@@ -321,7 +375,7 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
     os.makedirs(result_dir, exist_ok=True)
     metric_names = ("F1", "I_AUROC", "P_AUROC", "PRO")
     means = {"epoch": epoch_name}
-    for prefix in ("base", "mara", "delta"):
+    for prefix in ("base", "mara", "delta", "oracle", "oracle_delta"):
         for metric_name in metric_names:
             means[f"mean_{prefix}_{metric_name}"] = float(np.mean([r[f"{prefix}_{metric_name}"] for r in rows]))
     means["mean_gate"] = float(np.mean([r["gate_mean"] for r in rows]))
@@ -336,6 +390,8 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
     means["mean_quality_gain"] = float(np.mean([r["quality_gain_mean"] for r in rows]))
     means["mean_base_degradation_rate"] = float(np.mean([r["base_degradation_rate"] for r in rows]))
     means["mean_negative_gain_accept_rate"] = float(np.mean([r["negative_gain_accept_rate"] for r in rows]))
+    means["mean_identity_error"] = float(np.mean([r["identity_error_mean"] for r in rows]))
+    means["max_identity_error"] = float(np.max([r["identity_error_max"] for r in rows]))
 
     metric_file = os.path.join(result_dir, "metric_mara.txt")
     with open(metric_file, "a", encoding="utf-8") as f:
@@ -376,14 +432,43 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
         f.write(
             f"Safety: quality_gain={means['mean_quality_gain']:.6f}, "
             f"base_degradation_rate={means['mean_base_degradation_rate']:.6f}, "
-            f"negative_gain_accept_rate={means['mean_negative_gain_accept_rate']:.6f}\n\n"
+            f"negative_gain_accept_rate={means['mean_negative_gain_accept_rate']:.6f}, "
+            f"identity_error={means['mean_identity_error']:.8f}/{means['max_identity_error']:.8f}\n\n"
+        )
+        f.write("Evidence Oracle (GT diagnostic only; not a deployable result)\n")
+        f.write(
+            f"{'Classname':<18s}"
+            f"{'Base_PRO':>10s}{'Oracle_PRO':>12s}{'D_PRO':>10s}"
+            f"{'Base_P-AUC':>12s}{'Oracle_P-AUC':>14s}{'D_P-AUC':>10s}\n"
+        )
+        for row in rows:
+            f.write(
+                f"{row['category']:<18s}"
+                f"{row['base_PRO']:>10.5f}{row['oracle_PRO']:>12.5f}{row['oracle_delta_PRO']:>10.5f}"
+                f"{row['base_P_AUROC']:>12.5f}{row['oracle_P_AUROC']:>14.5f}"
+                f"{row['oracle_delta_P_AUROC']:>10.5f}\n"
+            )
+        f.write(
+            f"{'Mean':<18s}"
+            f"{means['mean_base_PRO']:>10.5f}{means['mean_oracle_PRO']:>12.5f}"
+            f"{means['mean_oracle_delta_PRO']:>10.5f}"
+            f"{means['mean_base_P_AUROC']:>12.5f}{means['mean_oracle_P_AUROC']:>14.5f}"
+            f"{means['mean_oracle_delta_P_AUROC']:>10.5f}\n\n"
         )
 
     csv_file = os.path.join(result_dir, f"{epoch_name}_mara_metrics.csv")
     with open(csv_file, "w", newline="", encoding="utf-8") as f:
         fieldnames = ["category"]
         for metric_name in metric_names:
-            fieldnames.extend([f"base_{metric_name}", f"mara_{metric_name}", f"delta_{metric_name}"])
+            fieldnames.extend(
+                [
+                    f"base_{metric_name}",
+                    f"mara_{metric_name}",
+                    f"delta_{metric_name}",
+                    f"oracle_{metric_name}",
+                    f"oracle_delta_{metric_name}",
+                ]
+            )
         fieldnames.append("gate_mean")
         fieldnames.append("gate_roi_mean")
         fieldnames.append("changed_ratio_mean")
@@ -396,6 +481,8 @@ def write_results(result_dir: str, epoch_name: str, rows: List[Dict]) -> Dict:
         fieldnames.append("quality_gain_mean")
         fieldnames.append("base_degradation_rate")
         fieldnames.append("negative_gain_accept_rate")
+        fieldnames.append("identity_error_mean")
+        fieldnames.append("identity_error_max")
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
@@ -436,6 +523,8 @@ def main():
     parser.add_argument("--gain_safety_margin", type=float, default=None)
     parser.add_argument("--gain_accept_probability", type=float, default=None)
     parser.add_argument("--disable_hard_gain_gate", action="store_true")
+    parser.add_argument("--disable_evidence_oracle", action="store_true")
+    parser.add_argument("--quality_degradation_tolerance", type=float, default=1e-4)
 
     parser.add_argument("--norm_mode", type=str, default="none", choices=["none", "per_image", "per_class"])
     parser.add_argument("--pro_num_th", type=int, default=1000)
@@ -514,14 +603,16 @@ def main():
             f"refine={summary['mean_refine_steps']:.3f}, "
             f"reject={summary['mean_rejected_steps']:.3f}, "
             f"pred_gain={summary['mean_pred_gain']:.5f}, "
-            f"accept={summary['mean_accept']:.5f}"
+            f"accept={summary['mean_accept']:.5f}, "
+            f"oracle_dPRO={summary['mean_oracle_delta_PRO']:.5f}, "
+            f"identity_max={summary['max_identity_error']:.8f}"
         )
 
     ranking_file = os.path.join(dataset_result_dir, "mara_epoch_ranking.csv")
     with open(ranking_file, "w", newline="", encoding="utf-8") as f:
         metric_names = ("F1", "I_AUROC", "P_AUROC", "PRO")
         fieldnames = ["epoch"]
-        for prefix in ("base", "mara", "delta"):
+        for prefix in ("base", "mara", "delta", "oracle", "oracle_delta"):
             fieldnames.extend([f"mean_{prefix}_{metric_name}" for metric_name in metric_names])
         fieldnames.append("mean_gate")
         fieldnames.append("mean_gate_roi")
@@ -530,7 +621,13 @@ def main():
         fieldnames.append("mean_refine_attempts")
         fieldnames.append("mean_rejected_steps")
         fieldnames.append("mean_pred_gain")
+        fieldnames.append("mean_pred_gain_lower")
         fieldnames.append("mean_accept")
+        fieldnames.append("mean_quality_gain")
+        fieldnames.append("mean_base_degradation_rate")
+        fieldnames.append("mean_negative_gain_accept_rate")
+        fieldnames.append("mean_identity_error")
+        fieldnames.append("max_identity_error")
         fieldnames.append("ckpt_path")
         writer = csv.DictWriter(
             f,
@@ -553,7 +650,9 @@ def main():
         f"Refine={best['mean_refine_steps']:.3f}, "
         f"Reject={best['mean_rejected_steps']:.3f}, "
         f"PredGain={best['mean_pred_gain']:.5f}, "
-        f"Accept={best['mean_accept']:.5f}"
+        f"Accept={best['mean_accept']:.5f}, "
+        f"OracleDeltaPRO={best['mean_oracle_delta_PRO']:.5f}, "
+        f"IdentityMax={best['max_identity_error']:.8f}"
     )
     print(f"Best checkpoint file: {best['ckpt_path']}")
 

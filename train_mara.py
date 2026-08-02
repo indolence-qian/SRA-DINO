@@ -14,6 +14,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from tools.loss import BinaryDiceLoss, FocalLoss
 from tools.mara_agent import MARAAgent, MARAConfig
+from tools.mara_evidence import build_mara_evidence
 from tools.bottleneckAdapter import install_bottleneck_adapters_into_dino
 from tools.utils_up import get_anomaly_map
 from train_up import (
@@ -243,8 +244,12 @@ def layer_maps_from_debug(debug, device: torch.device, fallback_prob: torch.Tens
 
 
 def build_mara_config(args) -> MARAConfig:
+    evidence_channels = 0 if args.disable_evidence_bank else 4 * len(args.visual_layers) + 2
+    global_evidence_dim = 0 if args.disable_evidence_bank else len(args.visual_layers)
     return MARAConfig(
         num_layers=len(args.visual_layers),
+        evidence_channels=evidence_channels,
+        global_evidence_dim=global_evidence_dim,
         map_size=args.mara_map_size,
         num_regions=args.mara_regions,
         roi_size=args.mara_roi_size,
@@ -280,6 +285,7 @@ def build_mara_config(args) -> MARAConfig:
         use_gain_lower_bound=not args.disable_gain_lower_bound,
         gain_lower_quantile=args.gain_lower_quantile,
         gain_lower_weight=args.gain_lower_weight,
+        quality_degradation_tolerance=args.quality_degradation_tolerance,
     )
 
 
@@ -364,7 +370,7 @@ def train_one_epoch(
 
     for idx, image_info in enumerate(train_loader):
         with torch.no_grad():
-            anomaly_awareness, mask, base_map, base_logits, debug = get_anomaly_map(
+            _, mask, base_map, base_logits, stage1_evidence = get_anomaly_map(
                 clip_model=clip_model,
                 image_info=image_info,
                 device=device,
@@ -375,16 +381,20 @@ def train_one_epoch(
                 visual_backbone=args.visual_backbone,
                 visual_layers=args.visual_layers,
                 text_source=args.text_source,
-                return_debug=True,
+                return_evidence=True,
             )
 
         labels = image_info["is_anomaly"].to(device).long()
-        layer_maps = layer_maps_from_debug(
-            debug=debug,
-            device=device,
+        mara_evidence = build_mara_evidence(
+            evidence=stage1_evidence,
             fallback_prob=base_map,
             num_layers=len(args.visual_layers),
+            map_size=args.mara_map_size,
         )
+        del stage1_evidence
+        layer_maps = mara_evidence["layer_maps"]
+        evidence_maps = None if args.disable_evidence_bank else mara_evidence["extra_maps"]
+        global_evidence = None if args.disable_evidence_bank else mara_evidence["global_evidence"]
 
         group_size = args.grpo_group_size
         mask_g = mask.repeat_interleave(group_size, dim=0)
@@ -401,6 +411,8 @@ def train_one_epoch(
                 layer_maps=layer_maps,
                 mask=mask,
                 labels=labels,
+                evidence_maps=evidence_maps,
+                global_evidence=global_evidence,
                 group_size=group_size,
                 sample=True,
                 apply_gain_gate=apply_gain_gate,
@@ -416,6 +428,8 @@ def train_one_epoch(
                 layer_maps=layer_maps,
                 mask=mask,
                 labels=labels,
+                evidence_maps=evidence_maps,
+                global_evidence=global_evidence,
                 group_size=group_size,
                 sample=False,
                 trajectory=trajectory,
@@ -548,6 +562,7 @@ def run_train(args) -> None:
             f"hfa_setting={args.hfa_setting_runtime}, "
             f"hfa_layers={args.hfa_layers_runtime}, "
             f"hfa_bottleneck={args.hfa_bottleneck_runtime}, "
+            f"evidence_bank={not args.disable_evidence_bank}, "
             f"world_size={args.world_size}, per_gpu_batch={args.batch_size}, "
             f"global_batch={args.batch_size * args.world_size}"
         )
@@ -708,6 +723,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mara_regions", type=int, default=16)
     parser.add_argument("--mara_roi_size", type=int, default=32)
     parser.add_argument("--mara_hidden_dim", type=int, default=64)
+    parser.add_argument("--disable_evidence_bank", action="store_true")
     parser.add_argument("--mara_delta_scale", type=float, default=0.50)
     parser.add_argument("--mara_gate_max", type=float, default=0.35)
     parser.add_argument("--mara_gate_init_bias", type=float, default=-2.0)
@@ -721,6 +737,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gain_consistency_temperature", type=float, default=0.05)
     parser.add_argument("--gain_lower_quantile", type=float, default=0.10)
     parser.add_argument("--gain_lower_weight", type=float, default=1.0)
+    parser.add_argument("--quality_degradation_tolerance", type=float, default=1e-4)
     parser.add_argument("--disable_gain_lower_bound", action="store_true")
     parser.add_argument("--gain_warmup_epochs", type=int, default=5)
     parser.add_argument("--disable_force_refine_warmup", action="store_true")
