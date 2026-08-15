@@ -17,6 +17,7 @@ from torch.optim.lr_scheduler import LambdaLR
 import math
 from Datasets import DATASET_REGISTRY, DATASET_CLASSES
 from tools.bottleneckAdapter import install_bottleneck_adapters_into_dino
+from tools.semantic_anchor import build_semantic_anchor_aligner
 
 from tools.promptLearner import AnomalyCLIP_PromptLearner
 
@@ -140,7 +141,7 @@ def train_epoch(
     optimizer, loss_focal, loss_dice, epoch,
     anomaly_awareness_loss_list, seg_loss_list, global_anomaly_loss_list, loss_list,
     clip_model, start_time, train_data, prompt_learner,
-    reward_state
+    reward_state, semantic_anchor_aligner, semantic_anchor_loss_list, args
 ):
     for idx, image_info in enumerate(train_data):
         anomaly_map, mask, anomaly_map_cross_modal, global_anomaly_score = get_anomaly_map(
@@ -189,17 +190,32 @@ def train_epoch(
 
         global_anomaly_loss = (ce_per_sample * w_cls).mean()
 
+        if semantic_anchor_aligner is not None:
+            anchor_out = semantic_anchor_aligner(prompt_learner.ctx_pos, prompt_learner.ctx_neg)
+            semantic_anchor_loss = anchor_out["loss"]
+        else:
+            semantic_anchor_loss = logits.new_zeros(())
+            anchor_out = {
+                "normal_similarity": logits.new_zeros(()),
+                "anomaly_similarity": logits.new_zeros(()),
+                "cross_similarity": logits.new_zeros(()),
+            }
+
         # ★关键：对分割 dice loss 做样本级加权（真正增强像素分割作用）
         seg_dice = (seg_dice_per * w_seg).mean()
         seg_loss = seg_focal + seg_dice
 
-        loss = 0.25 * anomaly_awareness_loss + 0.5 * seg_loss + 0.25 * global_anomaly_loss
+        global_objective = global_anomaly_loss + args.semantic_anchor_weight * semantic_anchor_loss
+        loss = 0.25 * anomaly_awareness_loss + 0.5 * seg_loss + 0.25 * global_objective
 
         print(
-            f"Epoch {epoch+1}/{10} | Batch {idx+1}/{len(train_data)} "
+            f"Epoch {epoch+1}/{args.epoch} | Batch {idx+1}/{len(train_data)} "
             f"| loss: {loss.item():.4f} | aw: {anomaly_awareness_loss.item():.4f} "
             f"| seg(focal+dice_w): {seg_focal.item():.4f}+{seg_dice.item():.4f}={seg_loss.item():.4f} "
             f"| global(w): {global_anomaly_loss.item():.4f} "
+            f"| anchor: {semantic_anchor_loss.item():.4f} "
+            f"| anchor_sim(n/a/x): {anchor_out['normal_similarity'].item():.3f}/"
+            f"{anchor_out['anomaly_similarity'].item():.3f}/{anchor_out['cross_similarity'].item():.3f} "
             f"| reward_mean: {r_mean:.3f} | baseline: {baseline:.3f} "
             f"| dice mean: {dice_per.mean().item():.3f} "
             f"| w_seg mean/min/max: {w_seg.mean().item():.3f}/{w_seg.min().item():.3f}/{w_seg.max().item():.3f} "
@@ -211,6 +227,7 @@ def train_epoch(
         anomaly_awareness_loss_list.append(anomaly_awareness_loss.item())
         seg_loss_list.append(seg_loss.item())
         global_anomaly_loss_list.append(global_anomaly_loss.item())
+        semantic_anchor_loss_list.append(semantic_anchor_loss.item())
         loss_list.append(loss.item())
 
         optimizer.zero_grad()
@@ -262,6 +279,21 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=0.00001, help="lr")
     parser.add_argument("--hfa_setting", type=str, default="hfa4",help="HFA setting: none/l5/l11/l17/l23/hfa1/hfa2/hfa3/hfa4")
     parser.add_argument("--hfa_bottleneck", type=int, default=256,help="bottleneck dim for HFA")
+    parser.add_argument(
+        "--semantic_anchor_path",
+        type=str,
+        default="./asset/gemini_semantic_anchors.pt",
+        help="fixed external normal/anomaly anchor file; generated without CLIP",
+    )
+    parser.add_argument(
+        "--semantic_anchor_weight",
+        type=float,
+        default=0.0,
+        help="anchor loss weight inside the global objective; 0 disables it",
+    )
+    parser.add_argument("--semantic_anchor_margin", type=float, default=0.20)
+    parser.add_argument("--semantic_anchor_separation_weight", type=float, default=0.50)
+    parser.add_argument("--semantic_anchor_projector_lr", type=float, default=1e-6)
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -312,6 +344,26 @@ if __name__ == "__main__":
     prompt_learner.train()
     clip_model.to(device)
 
+    semantic_anchor_aligner = None
+    semantic_anchor_metadata = {}
+    if args.semantic_anchor_weight > 0:
+        semantic_anchor_aligner, semantic_anchor_metadata = build_semantic_anchor_aligner(
+            path=args.semantic_anchor_path,
+            prompt_learner=prompt_learner,
+            device=device,
+            margin=args.semantic_anchor_margin,
+            separation_weight=args.semantic_anchor_separation_weight,
+        )
+        semantic_anchor_aligner.train()
+        print(
+            "==> External semantic anchors enabled: "
+            f"path={args.semantic_anchor_path}, "
+            f"generator={semantic_anchor_metadata.get('generator_model', 'unknown')}, "
+            f"embedding={semantic_anchor_metadata.get('embedding_model', 'unknown')}, "
+            f"dim={semantic_anchor_metadata.get('dimension')}, "
+            f"weight={args.semantic_anchor_weight}"
+        )
+
     # AD-DINOv3
     model = model_adapter(c_in=1024, device=device)
     model.to(device)
@@ -339,6 +391,11 @@ if __name__ == "__main__":
     adapter_params = [p for p in model.parameters() if p.requires_grad]
     prompt_params  = [p for p in prompt_learner.parameters() if p.requires_grad]
     dino_adapter_params = [p for p in dino_adapters.parameters() if p.requires_grad] if dino_adapters is not None else []
+    semantic_anchor_params = (
+        [p for p in semantic_anchor_aligner.parameters() if p.requires_grad]
+        if semantic_anchor_aligner is not None
+        else []
+    )
 
     optim_groups = [
         {"params": adapter_params, "lr": 1e-5, "weight_decay": 1e-2},
@@ -347,6 +404,12 @@ if __name__ == "__main__":
 
     if len(dino_adapter_params) > 0:
         optim_groups.insert(1, {"params": dino_adapter_params, "lr": 5e-6, "weight_decay": 1e-2})
+    if len(semantic_anchor_params) > 0:
+        optim_groups.append({
+            "params": semantic_anchor_params,
+            "lr": args.semantic_anchor_projector_lr,
+            "weight_decay": 1e-2,
+        })
 
     optimizer = torch.optim.AdamW(
         optim_groups,
@@ -385,13 +448,23 @@ if __name__ == "__main__":
             prompt_learner.eval()
             for p in prompt_learner.parameters():
                 p.requires_grad_(False)
+            if semantic_anchor_aligner is not None:
+                semantic_anchor_aligner.eval()
+                for p in semantic_anchor_aligner.parameters():
+                    p.requires_grad_(False)
         
         start_time = time.time()
         awareness_loss_list, seg_loss_list, loss_list, global_anomaly_loss_list = [], [], [], []
+        semantic_anchor_loss_list = []
 
         # train_epoch(optimizer, loss_focal, loss_dice, epoch, awareness_loss_list, seg_loss_list, global_anomaly_loss_list, loss_list, clip_model, start_time, train_data, prompt_learner)
         
-        reward_state = train_epoch(optimizer, loss_focal, loss_dice, epoch, awareness_loss_list, seg_loss_list, global_anomaly_loss_list, loss_list, clip_model, start_time, train_data, prompt_learner, reward_state)
+        reward_state = train_epoch(
+            optimizer, loss_focal, loss_dice, epoch,
+            awareness_loss_list, seg_loss_list, global_anomaly_loss_list, loss_list,
+            clip_model, start_time, train_data, prompt_learner, reward_state,
+            semantic_anchor_aligner, semantic_anchor_loss_list, args,
+        )
         print()
         # scheduler.step()
 
@@ -404,7 +477,19 @@ if __name__ == "__main__":
             'hfa_setting': args.hfa_setting,
             'hfa_layers': hfa_layers,
             'hfa_bottleneck': args.hfa_bottleneck,
+            'semantic_anchor_config': {
+                'enabled': semantic_anchor_aligner is not None,
+                'path': args.semantic_anchor_path,
+                'weight': args.semantic_anchor_weight,
+                'margin': args.semantic_anchor_margin,
+                'separation_weight': args.semantic_anchor_separation_weight,
+                'projector_lr': args.semantic_anchor_projector_lr,
+                'metadata': semantic_anchor_metadata,
+            },
         }
+
+        if semantic_anchor_aligner is not None:
+            ckpt['semantic_anchor_aligner'] = semantic_anchor_aligner.state_dict()
 
         if dino_adapters is not None:
             ckpt['dino_adapters'] = dino_adapters.state_dict()
@@ -417,6 +502,7 @@ if __name__ == "__main__":
                 f"awareness_loss={np.mean(awareness_loss_list):.6f}\t"
                 f"seg_loss={np.mean(seg_loss_list):.6f}\t"
                 f"global_anomaly_loss={np.mean(global_anomaly_loss_list):.6f}\t"
+                f"semantic_anchor_loss={np.mean(semantic_anchor_loss_list):.6f}\t"
                 f"total_loss={np.mean(loss_list):.6f}\n"
             )
         print(
@@ -424,5 +510,6 @@ if __name__ == "__main__":
             f"awareness_loss={np.mean(awareness_loss_list):.6f}, "
             f"seg_loss={np.mean(seg_loss_list):.6f}, "
             f"global_anomaly_loss={np.mean(global_anomaly_loss_list):.6f}, "
+            f"semantic_anchor_loss={np.mean(semantic_anchor_loss_list):.6f}, "
             f"total_loss={np.mean(loss_list):.6f}"
         )

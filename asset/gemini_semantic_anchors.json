@@ -1,0 +1,18 @@
+{
+  "format_version": 1,
+  "labels": [
+    "normal",
+    "anomaly"
+  ],
+  "descriptions": {
+    "normal": "The object exhibits a geometrically intact and structurally complete form, featuring continuous surfaces, uniform textures, consistent coloration, and expected material continuity free from any foreign matter or missing regions.",
+    "anomaly": "The object exhibits geometric deformation, surface damage, or material discontinuities like cracks and chips, featuring irregular textures, localized discoloration, missing or extra regions, or foreign matter contamination."
+  },
+  "provider": "google-gemini",
+  "generator_model": "gemini-3.5-flash",
+  "embedding_model": "gemini-embedding-2",
+  "embedding_dimensions": 768,
+  "created_at": "2026-08-15T07:03:55.682182+00:00",
+  "clip_encoded": false,
+  "raw_generation": "{\n  \"normal\": \"The object exhibits a geometrically intact and structurally complete form, featuring continuous surfaces, uniform textures, consistent coloration, and expected material continuity free from any foreign matter or missing regions.\",\n  \"anomaly\": \"The object exhibits geometric deformation, surface damage, or material discontinuities like cracks and chips, featuring irregular textures, localized discoloration, missing or extra regions, or foreign matter contamination.\"\n}"
+}

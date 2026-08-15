@@ -23,6 +23,16 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 
 BASE_EPOCH="${BASE_EPOCH:-15}"
 BASE_BS="${BASE_BS:-16}"
+SEMANTIC_ANCHOR_PATH="${SEMANTIC_ANCHOR_PATH:-./asset/gemini_semantic_anchors.pt}"
+if [[ -f "${SEMANTIC_ANCHOR_PATH}" ]]; then
+  DEFAULT_SEMANTIC_ANCHOR_WEIGHT="0.20"
+else
+  DEFAULT_SEMANTIC_ANCHOR_WEIGHT="0.0"
+fi
+SEMANTIC_ANCHOR_WEIGHT="${SEMANTIC_ANCHOR_WEIGHT:-${DEFAULT_SEMANTIC_ANCHOR_WEIGHT}}"
+SEMANTIC_ANCHOR_MARGIN="${SEMANTIC_ANCHOR_MARGIN:-0.20}"
+SEMANTIC_ANCHOR_SEPARATION_WEIGHT="${SEMANTIC_ANCHOR_SEPARATION_WEIGHT:-0.50}"
+SEMANTIC_ANCHOR_PROJECTOR_LR="${SEMANTIC_ANCHOR_PROJECTOR_LR:-0.000001}"
 MARA_EPOCH="${MARA_EPOCH:-30}"
 # Per-GPU batch size. Two GPUs x 2 preserves the previous global batch size of 4.
 MARA_BS="${MARA_BS:-2}"
@@ -95,6 +105,7 @@ echo "Gain gate: disabled=${DISABLE_GAIN_GATE}, warmup=${GAIN_WARMUP_EPOCHS}, fo
 echo "Gain lower bound: disabled=${DISABLE_GAIN_LOWER_BOUND}, quantile=${GAIN_LOWER_QUANTILE}, weight=${GAIN_LOWER_WEIGHT}"
 echo "Quality degradation tolerance: ${QUALITY_DEGRADATION_TOLERANCE}"
 echo "Stage-one evidence bank: disabled=${DISABLE_EVIDENCE_BANK}"
+echo "External semantic anchor: path=${SEMANTIC_ANCHOR_PATH}, weight=${SEMANTIC_ANCHOR_WEIGHT}, margin=${SEMANTIC_ANCHOR_MARGIN}, separation=${SEMANTIC_ANCHOR_SEPARATION_WEIGHT}"
 
 BASE_RESULT_PATH="./checkpoint/base_${DATASET}_${HFA_SETTING}_${TS}"
 MARA_RESULT_PATH="./checkpoint/mara_${DATASET}_${HFA_SETTING}_${TS}"
@@ -107,7 +118,12 @@ if [[ "${RUN_BASE}" == "1" ]]; then
     --dataset "${DATASET}" \
     --epoch "${BASE_EPOCH}" \
     --batch_size "${BASE_BS}" \
-    --hfa_setting "${HFA_SETTING}"
+    --hfa_setting "${HFA_SETTING}" \
+    --semantic_anchor_path "${SEMANTIC_ANCHOR_PATH}" \
+    --semantic_anchor_weight "${SEMANTIC_ANCHOR_WEIGHT}" \
+    --semantic_anchor_margin "${SEMANTIC_ANCHOR_MARGIN}" \
+    --semantic_anchor_separation_weight "${SEMANTIC_ANCHOR_SEPARATION_WEIGHT}" \
+    --semantic_anchor_projector_lr "${SEMANTIC_ANCHOR_PROJECTOR_LR}"
 
   BASE_CKPT="$(find "${BASE_RESULT_PATH}/ckpt" -maxdepth 1 -name '*.pth' -printf '%f\n' \
     | sort -V \
