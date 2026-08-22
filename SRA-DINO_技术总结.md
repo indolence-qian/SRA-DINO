@@ -1,17 +1,17 @@
 # SRA-DINO 最新技术总结
 
-> 更新日期：2026-08-15
+> 更新日期：2026-08-22
 > 对应代码：当前工作区最新实现
 
 ## 1. 项目概述
 
-SRA-DINO 是一个面向零样本异常检测的两阶段框架：第一阶段利用冻结的 DINOv3 和 CLIP 建立基础检测器，并用外部大模型语义锚点约束随机初始化的正常/异常提示 token；第二阶段冻结基础模型，由 MARA Agent 根据异常图、不确定性和多层证据进行多步局部精炼。
+SRA-DINO 是一个面向零样本异常检测的两阶段框架：第一阶段利用冻结的 DINOv3 和 CLIP 建立基础检测器，Gemini 负责生成多类型正常/异常描述，再由同一个冻结 CLIP 编码为同空间语义 Teacher 并约束可学习提示；第二阶段冻结基础模型，由 MARA Agent 根据异常图、不确定性和多层证据进行多步局部精炼。
 
 项目的核心目标是：**保留可靠的基础预测，只对预计具有正增益的局部区域进行受约束修改。**
 
 ```mermaid
 flowchart LR
-    S["Gemini 3.5 Flash 语义描述<br/>Gemini Embedding 2 固定锚点"] --> B
+    S["Gemini 多类型语义描述<br/>冻结 CLIP 同空间 Teacher"] --> B
     I["输入图像"] --> B["阶段一：DINOv3 + CLIP + HFA"]
     B --> P["基础异常图与图像级分数"]
     B --> E["多层紧凑证据库"]
@@ -44,18 +44,22 @@ flowchart LR
 
 多层结果平均后形成基础异常图和图像级分数。第一阶段联合优化异常感知、像素分割与图像分类；奖励引导的分类困难样本重加权处于启用状态，分割权重 `w_seg` 当前固定为 1。
 
-### 2.3 外部大模型语义锚点
+### 2.3 CLIP 同空间多语义锚点
 
-正常/异常提示上下文 `ctx_pos`、`ctx_neg` 仍为可学习参数，但增加固定语义先验：Gemini 3.5 Flash 生成类别无关的正常/异常描述，再由 Gemini Embedding 2 生成两个 768 维数值锚点并保存到 `asset/gemini_semantic_anchors.pt`。锚点不经过 CLIP，训练时不调用外部 API。
+正常/异常提示上下文 `ctx_pos`、`ctx_neg` 仍为可学习参数。Gemini 3.5 Flash 只负责提供可审计的自然语言描述，当前语义库分别包含 6 条正常和 6 条异常描述，覆盖结构完整、表面纹理、缺失/多余部件、形变、污染和异物等模式。训练启动时使用项目中同一个冻结 CLIP 文本编码器把描述库编码为 Teacher bank；历史 Gemini Embedding 数值仅保留为来源记录，不进入训练坐标。
 
-由于提示 token 与外部嵌入不在同一向量空间，使用低学习率线性投影器 $P$ 对齐。分别对两类 token 求均值得到原型 $u_n,u_a$，损失为：
+可学习提示先经过完整 CLIP Transformer 和 EOS 投影得到检测实际使用的最终文本特征 $t_n,t_a$。定义 Teacher bank 中心 $a_n,a_a$、提示方向 $d_p=\operatorname{norm}(t_a-t_n)$ 和 Teacher 方向 $d_t=\operatorname{norm}(a_a-a_n)$，锚点损失为：
 
 $$
-\mathcal L_{anchor}=\frac{1}{2}\sum_{c\in\{n,a\}}[1-\cos(P(u_c),z_c)]
-+\lambda_{sep}\frac{1}{2}\sum_c\max(0,m+\cos(P(u_c),z_{\bar c})-\cos(P(u_c),z_c)).
+\mathcal L_{anchor}=\lambda_{dir}[1-\cos(d_p,d_t)]
++\frac{\lambda_{pair}}{2}\sum_{c\in\{n,a\}}[1-\cos(t_c,a_c)]
++\lambda_{sep}\max(0,m_{adapt}-[1-\cos(t_n,t_a)])
++\lambda_{bank}\mathcal L_{multi+}.
 $$
 
-第一项拉近同类语义，第二项要求正确锚点相似度至少比错误锚点高出 margin。外部锚点注册为固定 buffer，仅更新提示 token 和投影器；提示冻结时投影器同步冻结。锚点文件必须显式记录 `clip_encoded=false`，否则训练拒绝加载。
+其中 $\mathcal L_{multi+}$ 把同类多描述作为正样本、异类描述作为负样本；$m_{adapt}$ 综合 Teacher 间隔和语义初始化后的提示间隔，并由配置上限 $m$ 截断，避免配对项把正常/异常提示拉得过近。模块没有额外可训练 projector，梯度直接通过冻结 CLIP Transformer 回传到提示 token。
+
+P1 还使用多描述的 CLIP token embedding 交错初始化 20 个正常/异常 context token，替代完全随机初始化；可通过 `--disable_semantic_anchor_init` 单独关闭以进行消融。
 
 ## 3. 阶段一紧凑证据库
 
@@ -201,7 +205,7 @@ $\mathcal L_{safe}$ 包括门控稀疏、增益回归/分位数/分类、增益�
 
 当前代码已实现以下能力：
 
-1. **提示语义约束**：随机提示 token 被正常/异常外部固定锚点持续校正；
+1. **提示语义约束**：语义初始化后的提示由冻结 CLIP 同空间多描述 Teacher 持续校正；
 2. **证据增强决策**：MARA 同时利用多层异常概率、跨模态 margin、正常/异常相似度、异常感知和跨层分歧；
 3. **安全多步精炼**：Base 锚定优势、反事实增益和分位数硬门共同限制退化；
 4. **零门控严格恒等**：未执行修改时，最终输出与原始分辨率 Base 结果完全一致；
@@ -232,9 +236,10 @@ $\mathcal L_{safe}$ 包括门控稀疏、增益回归/分位数/分类、增益�
 | 基础训练数据 | VisA |
 | HFA | `hfa3`：11/17/23 层 |
 | 特征/证据层 | 5/11/17/23 |
-| 语义锚点 | Gemini 3.5 Flash + Gemini Embedding 2，768 维，非 CLIP |
+| 语义锚点 | Gemini 描述库 + 冻结 CLIP 同空间 Teacher，正常/异常各 6 条 |
 | 锚点权重 / margin | 0.20 / 0.20（锚点文件存在时） |
-| 分离权重 / 投影器 LR | 0.50 / $10^{-6}$ |
+| 方向 / 配对 / 多正样本 / 分离权重 | 1.00 / 0.10 / 0.25 / 0.50 |
+| 多正样本温度 / 语义初始化 | 0.07 / 默认开启 |
 | MARA epoch | 30 |
 | DDP 进程数 | 2 |
 | 每 GPU batch | 2 |
@@ -251,7 +256,7 @@ $\mathcal L_{safe}$ 包括门控稀疏、增益回归/分位数/分类、增益�
 
 ## 9. 核心创新点
 
-1. **外部大模型双语义锚点**：以非 CLIP 固定向量约束正常/异常提示，并用同类拉近、异类 margin 分离共同抑制提示漂移；
+1. **CLIP 同空间多语义锚点**：由外部大模型生成多类型描述，再用冻结 CLIP 构建 Teacher bank，通过方向、配对和多正样本约束直接校正最终提示特征；
 2. **阶段一多源紧凑证据复用**：把冻结基础检测器的多层概率、语义 margin、相似度、异常感知和跨层分歧统一提供给第二阶段；
 3. **证据条件的层级 MARA 策略**：联合决定是否修改、修改区域和参考层，而不是固定平均多层结果；
 4. **严格 Base 锚定 GRPO**：使用同图像零修改轨迹确定优势符号，直接优化相对基础模型的增益；
@@ -267,8 +272,8 @@ $\mathcal L_{safe}$ 包括门控稀疏、增益回归/分位数/分类、增益�
 - 证据源通过通道拼接进入状态，当前离散动作只显式选择层级跨模态异常图，尚未单独选择“相似度/异常感知/分歧”等证据类型；
 - 候选 ROI 是固定尺寸 Top-K 方框，没有 NMS、多尺度或边界候选；
 - 紧凑证据库不包含原始高维 Patch 特征，当前仍以分数图证据和局部 logit 残差精炼为主；
-- Gemini 锚点空间与 CLIP 提示 token 空间并不共享坐标系，当前由低学习率投影器完成跨空间对齐；
-- 当前固定锚点已生成，正常/异常锚点余弦相似度为 0.810722；该损失的实际收益仍需通过消融实验验证；
+- 多描述 Teacher 仍是类别无关语义，是否应进一步加入类别条件描述需要通过跨数据集消融确定；
+- 语义初始化、方向损失和多正样本损失的实际收益仍需分别与 `anchor_weight=0` 对照验证；
 - 仓库未包含最新 MARA checkpoint 或评估结果文件，因此本文只总结已实现能力，不声明具体数值提升。
 
 ## 11. 代码索引
@@ -276,9 +281,9 @@ $\mathcal L_{safe}$ 包括门控稀疏、增益回归/分位数/分类、增益�
 | 文件 | 职责 |
 |---|---|
 | `train.py` | 第一阶段基础检测器训练 |
-| `tools/semantic_anchor.py` | 外部锚点加载、跨空间投影和双锚点损失 |
-| `tools/build_gemini_semantic_anchors.py` | Gemini 描述生成及 Gemini Embedding 2 锚点构建 |
-| `tests/test_semantic_anchor.py` | 锚点损失、反向传播和来源校验测试 |
+| `tools/semantic_anchor.py` | 描述库加载、冻结 CLIP Teacher 编码、语义初始化和多锚点损失 |
+| `tools/build_gemini_semantic_anchors.py` | Gemini 描述生成、多类型描述库及来源记录构建 |
+| `tests/test_semantic_anchor.py` | 同空间方向损失、梯度、margin 和描述库测试 |
 | `tools/utils_up.py` | 阶段一多层异常输出与证据导出 |
 | `tools/mara_evidence.py` | 紧凑证据库构建、归一化与 Oracle 候选 |
 | `tools/mara_agent.py` | MARA 状态、层级策略、Refiner、GRPO 和安全门控 |
@@ -288,4 +293,4 @@ $\mathcal L_{safe}$ 包括门控稀疏、增益回归/分位数/分类、增益�
 
 ## 12. 总结
 
-最新 SRA-DINO 在阶段一加入外部大模型正常/异常固定语义锚点，使随机提示 token 获得显式语义方向；阶段二继续以紧凑证据、Base 锚定 GRPO 和反事实分位数门控执行保守局部精炼。两阶段分别解决“基础语义稳定性”和“动态修改安全性”。
+最新 SRA-DINO 在阶段一以 Gemini 多类型描述和冻结 CLIP 同空间 Teacher 初始化并校正最终提示特征，消除了外部嵌入空间与 CLIP 空间之间不可辨识的自由投影；阶段二继续以紧凑证据、Base 锚定 GRPO 和反事实分位数门控执行保守局部精炼。两阶段分别解决“基础语义稳定性”和“动态修改安全性”。

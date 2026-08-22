@@ -2,8 +2,9 @@
 
 Default pipeline:
   1. Gemini 3.5 Flash generates two category-independent descriptions.
-  2. Gemini Embedding 2 encodes each description into a 768-D vector.
-  3. Normalized vectors and auditable metadata are saved locally.
+  2. The descriptions are expanded with auditable normal/anomaly subtype banks.
+  3. Legacy Gemini embeddings are retained for provenance only. P0/P1 training
+     re-encodes the text banks with the frozen project CLIP model.
 
 The API key is read only from ``GEMINI_API_KEY``. Training never calls Gemini;
 it only loads the generated ``.pt`` file.
@@ -23,6 +24,22 @@ import torch.nn.functional as F
 
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+NORMAL_SUBTYPE_DESCRIPTIONS = [
+    "An intact and complete object with regular geometry and correctly aligned components.",
+    "A clean continuous surface with uniform texture, color, and material appearance.",
+    "A defect-free object without cracks, scratches, holes, chips, or deformation.",
+    "All expected regions are present with no missing, extra, or displaced parts.",
+    "The object is free from stains, residue, contamination, and foreign matter.",
+]
+
+ANOMALY_SUBTYPE_DESCRIPTIONS = [
+    "A cracked, scratched, chipped, broken, or otherwise damaged surface.",
+    "A deformed, distorted, misaligned, or structurally incomplete object.",
+    "An object containing missing, extra, loose, or displaced components.",
+    "Irregular texture, localized discoloration, holes, or material discontinuity.",
+    "Visible stain, residue, contamination, embedded debris, or foreign matter.",
+]
 
 
 def _raise_for_api_error(response: httpx.Response) -> None:
@@ -205,6 +222,10 @@ def main() -> None:
         "labels": ["normal", "anomaly"],
         "anchors": anchors.cpu(),
         "descriptions": {"normal": normal_text, "anomaly": anomaly_text},
+        "description_banks": {
+            "normal": [normal_text, *NORMAL_SUBTYPE_DESCRIPTIONS],
+            "anomaly": [anomaly_text, *ANOMALY_SUBTYPE_DESCRIPTIONS],
+        },
         "provider": "google-gemini",
         "generator_model": generator_model,
         "embedding_model": args.embedding_model,

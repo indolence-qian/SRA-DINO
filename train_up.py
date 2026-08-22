@@ -27,7 +27,7 @@ from Datasets import DATASET_REGISTRY
 from tools.bottleneckAdapter import install_bottleneck_adapters_into_dino
 from tools.loss import BinaryDiceLoss, FocalLoss
 from tools.promptLearner import AnomalyCLIP_PromptLearner
-from tools.semantic_anchor import build_semantic_anchor_aligner
+from tools.semantic_anchor import build_semantic_anchor_aligner, encode_prompt_features
 
 try:
     from tools.utils_up import (
@@ -269,15 +269,6 @@ def build_optimizer(
             "weight_decay": args.prompt_weight_decay,
         })
 
-    if semantic_anchor_aligner is not None:
-        anchor_params = [param for param in semantic_anchor_aligner.parameters() if param.requires_grad]
-        if anchor_params:
-            param_groups.append({
-                "params": anchor_params,
-                "lr": args.semantic_anchor_projector_lr,
-                "weight_decay": args.adapter_weight_decay,
-            })
-
     if not param_groups:
         raise RuntimeError("No trainable parameters were found for the optimizer.")
 
@@ -309,7 +300,12 @@ def save_checkpoint(
             "weight": args.semantic_anchor_weight,
             "margin": args.semantic_anchor_margin,
             "separation_weight": args.semantic_anchor_separation_weight,
-            "projector_lr": args.semantic_anchor_projector_lr,
+            "direction_weight": args.semantic_anchor_direction_weight,
+            "pair_weight": args.semantic_anchor_pair_weight,
+            "bank_weight": args.semantic_anchor_bank_weight,
+            "bank_temperature": args.semantic_anchor_bank_temperature,
+            "semantic_init": not args.disable_semantic_anchor_init,
+            "projector_lr": None,
             "metadata": semantic_anchor_metadata,
         },
     }
@@ -1091,7 +1087,12 @@ def train_epoch(
 
         global_anomaly_loss = (ce_per_sample * w_cls).mean()
         if semantic_anchor_aligner is not None:
-            anchor_out = semantic_anchor_aligner(prompt_learner.ctx_pos, prompt_learner.ctx_neg)
+            learned_prompt_features = encode_prompt_features(
+                clip_model=clip_model,
+                prompt_learner=prompt_learner,
+                device=device,
+            )
+            anchor_out = semantic_anchor_aligner(learned_prompt_features)
             semantic_anchor_loss = anchor_out["loss"]
         else:
             semantic_anchor_loss = logits.new_zeros(())
@@ -1099,6 +1100,9 @@ def train_epoch(
                 "normal_similarity": logits.new_zeros(()),
                 "anomaly_similarity": logits.new_zeros(()),
                 "cross_similarity": logits.new_zeros(()),
+                "direction_similarity": logits.new_zeros(()),
+                "prompt_pair_similarity": logits.new_zeros(()),
+                "adaptive_margin": logits.new_zeros(()),
             }
         seg_dice = (seg_dice_per * w_seg).mean()
         seg_loss = seg_focal + seg_dice
@@ -1133,6 +1137,8 @@ def train_epoch(
             f"| anchor: {semantic_anchor_loss.item():.4f} "
             f"| anchor_sim(n/a/x): {anchor_out['normal_similarity'].item():.3f}/"
             f"{anchor_out['anomaly_similarity'].item():.3f}/{anchor_out['cross_similarity'].item():.3f} "
+            f"| anchor_dir/pair/margin: {anchor_out['direction_similarity'].item():.3f}/"
+            f"{anchor_out['prompt_pair_similarity'].item():.3f}/{anchor_out['adaptive_margin'].item():.3f} "
             f"| reward_mean: {r_mean:.3f} | baseline: {baseline:.3f} "
             f"| dice mean: {dice_per.mean().item():.3f} "
             f"| w_seg mean/min/max: {w_seg.mean().item():.3f}/{w_seg.min().item():.3f}/{w_seg.max().item():.3f}",
@@ -1181,17 +1187,27 @@ def run_train(args) -> None:
         semantic_anchor_aligner, semantic_anchor_metadata = build_semantic_anchor_aligner(
             path=args.semantic_anchor_path,
             prompt_learner=prompt_learner,
+            clip_model=clip_model,
             device=device,
             margin=args.semantic_anchor_margin,
             separation_weight=args.semantic_anchor_separation_weight,
+            direction_weight=args.semantic_anchor_direction_weight,
+            pair_weight=args.semantic_anchor_pair_weight,
+            bank_weight=args.semantic_anchor_bank_weight,
+            bank_temperature=args.semantic_anchor_bank_temperature,
+            initialize_context=not args.disable_semantic_anchor_init,
         )
         semantic_anchor_aligner.train()
         print(
             "External semantic anchors enabled: "
             f"path={args.semantic_anchor_path}, "
             f"generator={semantic_anchor_metadata.get('generator_model', 'unknown')}, "
-            f"embedding={semantic_anchor_metadata.get('embedding_model', 'unknown')}, "
-            f"dim={semantic_anchor_metadata.get('dimension')}, "
+            f"space={semantic_anchor_metadata.get('anchor_space', 'unknown')}, "
+            f"banks={semantic_anchor_metadata.get('normal_bank_size', 0)}/"
+            f"{semantic_anchor_metadata.get('anomaly_bank_size', 0)}, "
+            f"teacher_pair={semantic_anchor_metadata.get('teacher_pair_similarity', 0.0):.4f}, "
+            f"adaptive_margin={semantic_anchor_metadata.get('adaptive_margin', 0.0):.4f}, "
+            f"semantic_init={semantic_anchor_metadata.get('semantic_context_initialized', False)}, "
             f"weight={args.semantic_anchor_weight}"
         )
 
@@ -1624,7 +1640,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--semantic_anchor_path",
         type=str,
         default="./asset/gemini_semantic_anchors.pt",
-        help="fixed external normal/anomaly anchor file; generated without CLIP",
+        help="Gemini description asset; text banks are re-encoded by the frozen CLIP teacher",
     )
     parser.add_argument(
         "--semantic_anchor_weight",
@@ -1634,7 +1650,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--semantic_anchor_margin", type=float, default=0.20)
     parser.add_argument("--semantic_anchor_separation_weight", type=float, default=0.50)
-    parser.add_argument("--semantic_anchor_projector_lr", type=float, default=1e-6)
+    parser.add_argument("--semantic_anchor_direction_weight", type=float, default=1.00)
+    parser.add_argument("--semantic_anchor_pair_weight", type=float, default=0.10)
+    parser.add_argument("--semantic_anchor_bank_weight", type=float, default=0.25)
+    parser.add_argument("--semantic_anchor_bank_temperature", type=float, default=0.07)
+    parser.add_argument("--disable_semantic_anchor_init", action="store_true")
+    parser.add_argument(
+        "--semantic_anchor_projector_lr",
+        type=float,
+        default=1e-6,
+        help="deprecated compatibility option; P0/P1 no longer trains a projector",
+    )
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--min_lr_ratio", type=float, default=0.05)
     parser.add_argument("--prompt_stop_epoch", type=int, default=10)

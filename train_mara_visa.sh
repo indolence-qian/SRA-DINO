@@ -32,7 +32,11 @@ fi
 SEMANTIC_ANCHOR_WEIGHT="${SEMANTIC_ANCHOR_WEIGHT:-${DEFAULT_SEMANTIC_ANCHOR_WEIGHT}}"
 SEMANTIC_ANCHOR_MARGIN="${SEMANTIC_ANCHOR_MARGIN:-0.20}"
 SEMANTIC_ANCHOR_SEPARATION_WEIGHT="${SEMANTIC_ANCHOR_SEPARATION_WEIGHT:-0.50}"
-SEMANTIC_ANCHOR_PROJECTOR_LR="${SEMANTIC_ANCHOR_PROJECTOR_LR:-0.000001}"
+SEMANTIC_ANCHOR_DIRECTION_WEIGHT="${SEMANTIC_ANCHOR_DIRECTION_WEIGHT:-1.00}"
+SEMANTIC_ANCHOR_PAIR_WEIGHT="${SEMANTIC_ANCHOR_PAIR_WEIGHT:-0.10}"
+SEMANTIC_ANCHOR_BANK_WEIGHT="${SEMANTIC_ANCHOR_BANK_WEIGHT:-0.25}"
+SEMANTIC_ANCHOR_BANK_TEMPERATURE="${SEMANTIC_ANCHOR_BANK_TEMPERATURE:-0.07}"
+DISABLE_SEMANTIC_ANCHOR_INIT="${DISABLE_SEMANTIC_ANCHOR_INIT:-0}"
 MARA_EPOCH="${MARA_EPOCH:-30}"
 # Per-GPU batch size. Two GPUs x 2 preserves the previous global batch size of 4.
 MARA_BS="${MARA_BS:-2}"
@@ -105,13 +109,17 @@ echo "Gain gate: disabled=${DISABLE_GAIN_GATE}, warmup=${GAIN_WARMUP_EPOCHS}, fo
 echo "Gain lower bound: disabled=${DISABLE_GAIN_LOWER_BOUND}, quantile=${GAIN_LOWER_QUANTILE}, weight=${GAIN_LOWER_WEIGHT}"
 echo "Quality degradation tolerance: ${QUALITY_DEGRADATION_TOLERANCE}"
 echo "Stage-one evidence bank: disabled=${DISABLE_EVIDENCE_BANK}"
-echo "External semantic anchor: path=${SEMANTIC_ANCHOR_PATH}, weight=${SEMANTIC_ANCHOR_WEIGHT}, margin=${SEMANTIC_ANCHOR_MARGIN}, separation=${SEMANTIC_ANCHOR_SEPARATION_WEIGHT}"
+echo "CLIP-space semantic anchors: path=${SEMANTIC_ANCHOR_PATH}, weight=${SEMANTIC_ANCHOR_WEIGHT}, margin=${SEMANTIC_ANCHOR_MARGIN}, direction=${SEMANTIC_ANCHOR_DIRECTION_WEIGHT}, pair=${SEMANTIC_ANCHOR_PAIR_WEIGHT}, bank=${SEMANTIC_ANCHOR_BANK_WEIGHT}, temperature=${SEMANTIC_ANCHOR_BANK_TEMPERATURE}, init_disabled=${DISABLE_SEMANTIC_ANCHOR_INIT}"
 
 BASE_RESULT_PATH="./checkpoint/base_${DATASET}_${HFA_SETTING}_${TS}"
 MARA_RESULT_PATH="./checkpoint/mara_${DATASET}_${HFA_SETTING}_${TS}"
 
 if [[ "${RUN_BASE}" == "1" ]]; then
   echo "===== Stage 1: Train base SRA-DINOv3 detector ====="
+  SEMANTIC_ANCHOR_INIT_FLAG=()
+  if [[ "${DISABLE_SEMANTIC_ANCHOR_INIT}" == "1" ]]; then
+    SEMANTIC_ANCHOR_INIT_FLAG=(--disable_semantic_anchor_init)
+  fi
   python train.py \
     --result_path "${BASE_RESULT_PATH}" \
     --device "${DEVICE}" \
@@ -123,7 +131,11 @@ if [[ "${RUN_BASE}" == "1" ]]; then
     --semantic_anchor_weight "${SEMANTIC_ANCHOR_WEIGHT}" \
     --semantic_anchor_margin "${SEMANTIC_ANCHOR_MARGIN}" \
     --semantic_anchor_separation_weight "${SEMANTIC_ANCHOR_SEPARATION_WEIGHT}" \
-    --semantic_anchor_projector_lr "${SEMANTIC_ANCHOR_PROJECTOR_LR}"
+    --semantic_anchor_direction_weight "${SEMANTIC_ANCHOR_DIRECTION_WEIGHT}" \
+    --semantic_anchor_pair_weight "${SEMANTIC_ANCHOR_PAIR_WEIGHT}" \
+    --semantic_anchor_bank_weight "${SEMANTIC_ANCHOR_BANK_WEIGHT}" \
+    --semantic_anchor_bank_temperature "${SEMANTIC_ANCHOR_BANK_TEMPERATURE}" \
+    "${SEMANTIC_ANCHOR_INIT_FLAG[@]}"
 
   BASE_CKPT="$(find "${BASE_RESULT_PATH}/ckpt" -maxdepth 1 -name '*.pth' -printf '%f\n' \
     | sort -V \

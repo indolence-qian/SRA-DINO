@@ -8,6 +8,24 @@
     "normal": "The object exhibits a geometrically intact and structurally complete form, featuring continuous surfaces, uniform textures, consistent coloration, and expected material continuity free from any foreign matter or missing regions.",
     "anomaly": "The object exhibits geometric deformation, surface damage, or material discontinuities like cracks and chips, featuring irregular textures, localized discoloration, missing or extra regions, or foreign matter contamination."
   },
+  "description_banks": {
+    "normal": [
+      "The object exhibits a geometrically intact and structurally complete form, featuring continuous surfaces, uniform textures, consistent coloration, and expected material continuity free from any foreign matter or missing regions.",
+      "An intact and complete object with regular geometry and correctly aligned components.",
+      "A clean continuous surface with uniform texture, color, and material appearance.",
+      "A defect-free object without cracks, scratches, holes, chips, or deformation.",
+      "All expected regions are present with no missing, extra, or displaced parts.",
+      "The object is free from stains, residue, contamination, and foreign matter."
+    ],
+    "anomaly": [
+      "The object exhibits geometric deformation, surface damage, or material discontinuities like cracks and chips, featuring irregular textures, localized discoloration, missing or extra regions, or foreign matter contamination.",
+      "A cracked, scratched, chipped, broken, or otherwise damaged surface.",
+      "A deformed, distorted, misaligned, or structurally incomplete object.",
+      "An object containing missing, extra, loose, or displaced components.",
+      "Irregular texture, localized discoloration, holes, or material discontinuity.",
+      "Visible stain, residue, contamination, embedded debris, or foreign matter."
+    ]
+  },
   "provider": "google-gemini",
   "generator_model": "gemini-3.5-flash",
   "embedding_model": "gemini-embedding-2",
