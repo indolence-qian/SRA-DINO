@@ -14,12 +14,16 @@ set -euo pipefail
 
 TRICK_NAME="${TRICK_NAME:-mara_grpo}"
 DATASET="${DATASET:-visa}"
+TRAIN_SPLIT="${TRAIN_SPLIT:-test}"
 HFA_SETTING="${HFA_SETTING:-hfa3}"
 VISUAL_LAYERS="${VISUAL_LAYERS:-5,11,17,23}"
 DEVICE="${DEVICE:-cuda:0}"
 GPU_IDS="${GPU_IDS:-0,1}"
 GPU_IDS="${GPU_IDS//[[:space:]]/}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+DINO_REPO_DIR="${DINO_REPO_DIR:-./dinov3}"
+DINO_MODEL_NAME="${DINO_MODEL_NAME:-dinov3_vitl16}"
+DINO_WEIGHTS="${DINO_WEIGHTS:-./dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth}"
 
 BASE_EPOCH="${BASE_EPOCH:-15}"
 BASE_BS="${BASE_BS:-16}"
@@ -101,7 +105,7 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 
 echo "[$(date +'%F %T')] Start MARA training pipeline"
 echo "Log: ${LOG_FILE}"
-echo "Dataset=${DATASET}, Device=${DEVICE}, HFA=${HFA_SETTING}, visual_layers=${VISUAL_LAYERS}"
+echo "Dataset=${DATASET}/${TRAIN_SPLIT}, Device=${DEVICE}, HFA=${HFA_SETTING}, visual_layers=${VISUAL_LAYERS}"
 echo "Distributed MARA: GPU_IDS=${GPU_IDS}, processes=${NPROC_PER_NODE}, per_gpu_batch=${MARA_BS}"
 echo "MARA gate: max=${MARA_GATE_MAX}, init_bias=${MARA_GATE_INIT_BIAS}, sparse_weight=${W_GATE_SPARSE}"
 echo "GRPO: group=${GRPO_GROUP_SIZE}, replay_updates=${GRPO_UPDATE_EPOCHS}, kl_coef=${GRPO_KL_COEF}, weight=${W_GRPO}"
@@ -194,11 +198,15 @@ if [[ "${RUN_MARA}" == "1" ]]; then
     --base_ckpt "${BASE_CKPT}" \
     --device "${DEVICE}" \
     --dataset "${DATASET}" \
+    --train_split "${TRAIN_SPLIT}" \
     --batch_size "${MARA_BS}" \
     --epoch "${MARA_EPOCH}" \
     --visual_backbone dino \
     --visual_layers "${VISUAL_LAYERS}" \
     --hfa_setting "${HFA_SETTING}" \
+    --dino_repo_dir "${DINO_REPO_DIR}" \
+    --dino_model_name "${DINO_MODEL_NAME}" \
+    --dino_weights "${DINO_WEIGHTS}" \
     --mara_steps "${MARA_STEPS}" \
     --grpo_group_size "${GRPO_GROUP_SIZE}" \
     --grpo_update_epochs "${GRPO_UPDATE_EPOCHS}" \
@@ -259,6 +267,9 @@ if [[ "${RUN_TEST}" == "1" ]]; then
   DISABLE_HARD_GAIN_GATE="${TEST_DISABLE_HARD_GAIN_GATE}" \
   DISABLE_EVIDENCE_ORACLE="${TEST_DISABLE_EVIDENCE_ORACLE}" \
   QUALITY_DEGRADATION_TOLERANCE="${TEST_QUALITY_DEGRADATION_TOLERANCE}" \
+  DINO_REPO_DIR="${DINO_REPO_DIR}" \
+  DINO_MODEL_NAME="${DINO_MODEL_NAME}" \
+  DINO_WEIGHTS="${DINO_WEIGHTS}" \
   bash test_mara_final.sh
 fi
 

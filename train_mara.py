@@ -16,6 +16,12 @@ from tools.loss import BinaryDiceLoss, FocalLoss
 from tools.mara_agent import MARAAgent, MARAConfig
 from tools.mara_evidence import build_mara_evidence
 from tools.bottleneckAdapter import install_bottleneck_adapters_into_dino
+from tools.dino_single_tower import (
+    DinoSingleTowerDetector,
+    config_from_checkpoint as single_tower_config_from_checkpoint,
+    create_dino_single_tower,
+    forward_dino_single_batch,
+)
 from tools.utils_up import get_anomaly_map
 from train_up import (
     build_warmup_cosine_scheduler,
@@ -144,8 +150,19 @@ def load_checkpoint_payload(ckpt_path: str) -> Dict:
 
 
 def apply_base_runtime_config(args, payload: Dict) -> None:
+    args.base_arch = str(payload.get("base_arch", "clip_dino"))
+    args.evidence_feature_channels = 0
+    if args.base_arch == "dino_single":
+        single_config = single_tower_config_from_checkpoint(payload)
+        args.evidence_feature_channels = int(single_config.evidence_channels)
     if payload.get("visual_backbone"):
         args.visual_backbone = payload["visual_backbone"]
+    if payload.get("dino_repo_dir"):
+        args.dino_repo_dir = payload["dino_repo_dir"]
+    if payload.get("dino_model_name"):
+        args.dino_model_name = payload["dino_model_name"]
+    if payload.get("dino_weights"):
+        args.dino_weights = payload["dino_weights"]
     if payload.get("visual_layers"):
         args.visual_layers = normalize_layers_obj(payload["visual_layers"])
 
@@ -173,6 +190,23 @@ def apply_base_runtime_config(args, payload: Dict) -> None:
     args.hfa_setting_runtime = hfa_setting or getattr(args, "hfa_setting", "custom")
     args.hfa_layers_runtime = tuple(hfa_layers)
     args.hfa_bottleneck_runtime = int(args.dino_bottleneck)
+
+
+def create_single_tower_from_checkpoint(
+    args,
+    device: torch.device,
+    payload: Dict,
+) -> DinoSingleTowerDetector:
+    config = single_tower_config_from_checkpoint(payload)
+    detector = create_dino_single_tower(
+        config=config,
+        repo_dir=args.dino_repo_dir,
+        model_name=args.dino_model_name,
+        weights=args.dino_weights,
+        device=device,
+    )
+    detector.load_checkpoint_fields(payload, strict=True)
+    return detector
 
 
 def create_visual_backbone_for_mara(args, device: torch.device):
@@ -244,7 +278,12 @@ def layer_maps_from_debug(debug, device: torch.device, fallback_prob: torch.Tens
 
 
 def build_mara_config(args) -> MARAConfig:
-    evidence_channels = 0 if args.disable_evidence_bank else 4 * len(args.visual_layers) + 2
+    feature_channels = int(getattr(args, "evidence_feature_channels", 0))
+    evidence_channels = (
+        0
+        if args.disable_evidence_bank
+        else (4 + feature_channels) * len(args.visual_layers) + 2
+    )
     global_evidence_dim = 0 if args.disable_evidence_bank else len(args.visual_layers)
     return MARAConfig(
         num_layers=len(args.visual_layers),
@@ -293,9 +332,10 @@ def save_mara_checkpoint(
     epoch: int,
     save_dir: str,
     mara_agent: MARAAgent,
-    model: torch.nn.Module,
-    prompt_learner: torch.nn.Module,
+    model: Optional[torch.nn.Module],
+    prompt_learner: Optional[torch.nn.Module],
     dino_adapters: Optional[torch.nn.Module],
+    single_tower: Optional[DinoSingleTowerDetector],
     optimizer: torch.optim.Optimizer,
     args,
 ) -> str:
@@ -304,21 +344,34 @@ def save_mara_checkpoint(
     payload = {
         "epoch": epoch,
         "base_ckpt": args.base_ckpt,
+        "base_arch": getattr(args, "base_arch", "clip_dino"),
         "visual_backbone": args.visual_backbone,
         "visual_layers": list(args.visual_layers),
+        "dino_repo_dir": args.dino_repo_dir,
+        "dino_model_name": args.dino_model_name,
+        "dino_weights": args.dino_weights,
         "hfa_setting": getattr(args, "hfa_setting_runtime", args.hfa_setting),
         "hfa_layers": list(getattr(args, "hfa_layers_runtime", ())),
         "hfa_bottleneck": int(getattr(args, "hfa_bottleneck_runtime", args.dino_bottleneck)),
         "mara_agent": mara_agent.state_dict(),
         "mara_config": build_mara_config(args).__dict__,
-        "cls_token_adapter": model.cls_token_adapter.state_dict(),
-        "patch_token_adapter": model.patch_token_adapter.state_dict(),
-        "prompt_adapter": model.prompt_adapter.state_dict(),
-        "prompt_learner": prompt_learner.state_dict(),
         "optimizer": optimizer.state_dict(),
     }
-    if dino_adapters is not None:
-        payload["dino_adapters"] = dino_adapters.state_dict()
+    if single_tower is not None:
+        payload.update(single_tower.checkpoint_fields())
+    else:
+        if model is None or prompt_learner is None:
+            raise ValueError("Legacy CLIP/DINO checkpoint requires model and prompt_learner.")
+        payload.update(
+            {
+                "cls_token_adapter": model.cls_token_adapter.state_dict(),
+                "patch_token_adapter": model.patch_token_adapter.state_dict(),
+                "prompt_adapter": model.prompt_adapter.state_dict(),
+                "prompt_learner": prompt_learner.state_dict(),
+            }
+        )
+        if dino_adapters is not None:
+            payload["dino_adapters"] = dino_adapters.state_dict()
     ckpt_path = os.path.join(save_dir, f"mara_epoch_{epoch}.pth")
     torch.save(payload, ckpt_path)
     return ckpt_path
@@ -329,10 +382,11 @@ def train_one_epoch(
     mara_agent: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler,
-    clip_model: torch.nn.Module,
-    model: torch.nn.Module,
+    clip_model: Optional[torch.nn.Module],
+    model: Optional[torch.nn.Module],
     dino_model: Optional[torch.nn.Module],
-    prompt_learner: torch.nn.Module,
+    prompt_learner: Optional[torch.nn.Module],
+    single_tower: Optional[DinoSingleTowerDetector],
     train_loader,
     device: torch.device,
     args,
@@ -370,19 +424,26 @@ def train_one_epoch(
 
     for idx, image_info in enumerate(train_loader):
         with torch.no_grad():
-            _, mask, base_map, base_logits, stage1_evidence = get_anomaly_map(
-                clip_model=clip_model,
-                image_info=image_info,
-                device=device,
-                model=model,
-                Dino_model=dino_model,
-                prompt_learner=prompt_learner,
-                idx=idx,
-                visual_backbone=args.visual_backbone,
-                visual_layers=args.visual_layers,
-                text_source=args.text_source,
-                return_evidence=True,
-            )
+            if single_tower is not None:
+                mask, base_map, base_logits, stage1_evidence = forward_dino_single_batch(
+                    single_tower,
+                    image_info,
+                    device,
+                )
+            else:
+                _, mask, base_map, base_logits, stage1_evidence = get_anomaly_map(
+                    clip_model=clip_model,
+                    image_info=image_info,
+                    device=device,
+                    model=model,
+                    Dino_model=dino_model,
+                    prompt_learner=prompt_learner,
+                    idx=idx,
+                    visual_backbone=args.visual_backbone,
+                    visual_layers=args.visual_layers,
+                    text_source=args.text_source,
+                    return_evidence=True,
+                )
 
         labels = image_info["is_anomaly"].to(device).long()
         mara_evidence = build_mara_evidence(
@@ -390,6 +451,7 @@ def train_one_epoch(
             fallback_prob=base_map,
             num_layers=len(args.visual_layers),
             map_size=args.mara_map_size,
+            feature_channels_per_layer=int(getattr(args, "evidence_feature_channels", 0)),
         )
         del stage1_evidence
         layer_maps = mara_evidence["layer_maps"]
@@ -557,27 +619,41 @@ def run_train(args) -> None:
     if args.is_main_process:
         print(
             "Runtime config: "
+            f"base_arch={args.base_arch}, "
             f"visual_backbone={args.visual_backbone}, "
             f"visual_layers={args.visual_layers}, "
             f"hfa_setting={args.hfa_setting_runtime}, "
             f"hfa_layers={args.hfa_layers_runtime}, "
             f"hfa_bottleneck={args.hfa_bottleneck_runtime}, "
             f"evidence_bank={not args.disable_evidence_bank}, "
+            f"feature_channels_per_layer={args.evidence_feature_channels}, "
             f"world_size={args.world_size}, per_gpu_batch={args.batch_size}, "
             f"global_batch={args.batch_size * args.world_size}"
         )
 
-    clip_model = create_clip_model(args, device)
-    prompt_learner = create_prompt_learner(clip_model, device)
-    dino_model, dino_adapters = create_visual_backbone_for_mara(args, device)
-    model = create_adapter_model(clip_model, device, args.visual_backbone)
+    single_tower = None
+    clip_model = None
+    prompt_learner = None
+    dino_model = None
+    dino_adapters = None
+    model = None
+    if args.base_arch == "dino_single":
+        single_tower = create_single_tower_from_checkpoint(args, device, base_payload)
+        freeze_module(single_tower)
+        if args.is_main_process:
+            print(f"Loaded language-free DINO single-tower base: {args.base_ckpt}")
+    else:
+        clip_model = create_clip_model(args, device)
+        prompt_learner = create_prompt_learner(clip_model, device)
+        dino_model, dino_adapters = create_visual_backbone_for_mara(args, device)
+        model = create_adapter_model(clip_model, device, args.visual_backbone)
 
-    load_base_checkpoint(args.base_ckpt, model, prompt_learner, dino_adapters, device, payload=base_payload)
-    freeze_module(clip_model)
-    freeze_module(prompt_learner)
-    freeze_module(model)
-    freeze_module(dino_adapters)
-    freeze_module(dino_model)
+        load_base_checkpoint(args.base_ckpt, model, prompt_learner, dino_adapters, device, payload=base_payload)
+        freeze_module(clip_model)
+        freeze_module(prompt_learner)
+        freeze_module(model)
+        freeze_module(dino_adapters)
+        freeze_module(dino_model)
 
     train_loader = prepare_data(
         dataset_name=args.dataset,
@@ -627,6 +703,7 @@ def run_train(args) -> None:
             model=model,
             dino_model=dino_model,
             prompt_learner=prompt_learner,
+            single_tower=single_tower,
             train_loader=train_loader,
             device=device,
             args=args,
@@ -640,6 +717,7 @@ def run_train(args) -> None:
                 model=model,
                 prompt_learner=prompt_learner,
                 dino_adapters=dino_adapters,
+                single_tower=single_tower,
                 optimizer=optimizer,
                 args=args,
             )

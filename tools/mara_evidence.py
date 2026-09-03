@@ -65,6 +65,51 @@ def _stack_global_layers(
     return torch.stack(layers, dim=1)
 
 
+def _stack_feature_layers(
+    evidence: Optional[Dict[str, Any]],
+    key: str,
+    batch_size: int,
+    channels_per_layer: int,
+    num_layers: int,
+    map_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if channels_per_layer <= 0:
+        return torch.zeros(batch_size, 0, map_size, map_size, device=device, dtype=dtype)
+
+    values: List[torch.Tensor] = [] if evidence is None else list(evidence.get(key, []))
+    layers: List[torch.Tensor] = []
+    for value in values[:num_layers]:
+        if not torch.is_tensor(value):
+            value = torch.as_tensor(value)
+        value = value.to(device=device, dtype=dtype)
+        if value.dim() != 4:
+            raise ValueError(
+                f"Expected BxCxHxW feature evidence for {key}, got {tuple(value.shape)}."
+            )
+        if value.shape[1] != channels_per_layer:
+            raise ValueError(
+                f"Expected {channels_per_layer} feature channels per layer, "
+                f"got {value.shape[1]}."
+            )
+        layers.append(_resize_map(value, map_size))
+
+    zero = torch.zeros(
+        batch_size,
+        channels_per_layer,
+        map_size,
+        map_size,
+        device=device,
+        dtype=dtype,
+    )
+    if not layers:
+        layers.append(zero)
+    while len(layers) < num_layers:
+        layers.append(zero)
+    return torch.cat(layers, dim=1)
+
+
 def _normalize_spatial_margin(margin: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     mean = margin.mean(dim=(-2, -1), keepdim=True)
     std = margin.std(dim=(-2, -1), keepdim=True, unbiased=False).clamp_min(eps)
@@ -77,12 +122,13 @@ def build_mara_evidence(
     num_layers: int,
     map_size: int,
     include_full_resolution_oracle: bool = False,
+    feature_channels_per_layer: int = 0,
 ) -> Dict[str, Any]:
     """Pack frozen stage-one evidence into compact MARA decision tensors.
 
-    The returned tensors stay on the current device. Raw 768-D patch features
-    are intentionally excluded in P1; this bank only contains compact score
-    maps and per-layer global margins.
+    The returned tensors stay on the current device. The legacy CLIP/DINO path
+    uses only compact score maps. A DINO single-tower checkpoint can additionally
+    provide a small learned projection of every DINO feature layer.
     """
     device = fallback_prob.device
     dtype = fallback_prob.dtype
@@ -107,6 +153,16 @@ def build_mara_evidence(
     )
     global_margin = _stack_global_layers(
         evidence, "global_margin_layers", batch_size, num_layers, device, dtype
+    )
+    feature_maps = _stack_feature_layers(
+        evidence,
+        "feature_layers",
+        batch_size,
+        feature_channels_per_layer,
+        num_layers,
+        map_size,
+        device,
+        dtype,
     )
 
     cross_margin = _normalize_spatial_margin(cross_margin)
@@ -145,6 +201,7 @@ def build_mara_evidence(
             anomaly_similarity,
             cross_disagreement,
             awareness_disagreement,
+            feature_maps,
         ],
         dim=1,
     ).detach()

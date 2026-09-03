@@ -75,6 +75,23 @@ python test.py --result_path $save_path --dataset $dataset
 # (Optional) we provide bash script for evaluating all the datasets
 bash test.sh
 ```
+
+### 4. Language-Free DINO Single-Tower Experiment
+
+The experimental pipeline removes the CLIP/text tower from the deployed
+detector. It trains multi-layer normal/anomaly visual prototypes on frozen
+DINOv3 features, passes compact DINO feature evidence to MARA-GRPO, and then
+evaluates on unseen datasets.
+
+```bash
+GPU_IDS=0,1 NPROC_PER_NODE=2 bash run_exp.sh
+```
+
+The default protocol trains with labeled VisA source images and evaluates on
+MVTec AD, BTAD, and MPDD. Do not report VisA as an unseen target in this setup.
+Both base training and MARA training use two-GPU DDP; cross-dataset evaluation
+assigns datasets across the two GPUs.
+
 To run the code, please download the pretrained weights and place them in the specified directories:
 
 | ✅ **Pretrained Model** | 🌐 **Source Link** | 📁 **Destination Path** |

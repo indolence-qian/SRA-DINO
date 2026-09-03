@@ -13,11 +13,13 @@ from tqdm import tqdm
 from Datasets import DATASET_CLASSES, DATASET_REGISTRY
 from tools.mara_agent import MARAAgent, MARAConfig, quality_score
 from tools.mara_evidence import build_mara_evidence
+from tools.dino_single_tower import DinoSingleTowerDetector, forward_dino_single_batch
 from tools.utils_up import get_anomaly_map
 from tools.visualization import visualization
 from train_mara import (
     HFA_CHOICES,
     apply_base_runtime_config,
+    create_single_tower_from_checkpoint,
     create_visual_backbone_for_mara,
     normalize_layers_obj,
 )
@@ -119,57 +121,82 @@ def build_models_from_checkpoint(args, device: torch.device, payload: Dict):
     mara_cfg = config_from_payload(payload, args)
     print(
         "Runtime config: "
+        f"base_arch={args.base_arch}, "
         f"visual_backbone={args.visual_backbone}, "
         f"visual_layers={args.visual_layers}, "
         f"hfa_setting={args.hfa_setting_runtime}, "
         f"hfa_layers={args.hfa_layers_runtime}, "
         f"hfa_bottleneck={args.hfa_bottleneck_runtime}, "
+        f"feature_channels_per_layer={args.evidence_feature_channels}, "
         f"evidence_channels={mara_cfg.evidence_channels}, "
         f"global_evidence_dim={mara_cfg.global_evidence_dim}"
     )
-    clip_model = create_clip_model(args, device)
-    prompt_learner = create_prompt_learner(clip_model, device)
-    dino_model, dino_adapters = create_visual_backbone_for_mara(args, device)
-    model = create_adapter_model(clip_model, device, args.visual_backbone)
+    single_tower = None
+    clip_model = None
+    prompt_learner = None
+    dino_model = None
+    dino_adapters = None
+    model = None
+    if args.base_arch == "dino_single":
+        single_tower = create_single_tower_from_checkpoint(args, device, payload)
+        single_tower.eval()
+    else:
+        clip_model = create_clip_model(args, device)
+        prompt_learner = create_prompt_learner(clip_model, device)
+        dino_model, dino_adapters = create_visual_backbone_for_mara(args, device)
+        model = create_adapter_model(clip_model, device, args.visual_backbone)
     mara_agent = MARAAgent(mara_cfg).to(device)
 
-    clip_model.eval()
-    prompt_learner.eval()
-    model.eval()
+    if clip_model is not None:
+        clip_model.eval()
+    if prompt_learner is not None:
+        prompt_learner.eval()
+    if model is not None:
+        model.eval()
     mara_agent.eval()
     if dino_model is not None:
         dino_model.eval()
     if dino_adapters is not None:
         dino_adapters.eval()
 
-    return clip_model, prompt_learner, dino_model, dino_adapters, model, mara_agent
+    return clip_model, prompt_learner, dino_model, dino_adapters, model, mara_agent, single_tower
 
 
 def load_mara_checkpoint(
     ckpt_path: str,
     payload: Dict,
-    model: torch.nn.Module,
-    prompt_learner: torch.nn.Module,
+    model: Optional[torch.nn.Module],
+    prompt_learner: Optional[torch.nn.Module],
     dino_adapters: Optional[torch.nn.Module],
     mara_agent: MARAAgent,
     device: torch.device,
+    single_tower: Optional[DinoSingleTowerDetector] = None,
 ) -> None:
-    model.cls_token_adapter.load_state_dict(payload["cls_token_adapter"], strict=False)
-    model.patch_token_adapter.load_state_dict(payload["patch_token_adapter"], strict=False)
-    model.prompt_adapter.load_state_dict(payload["prompt_adapter"], strict=False)
-    if "prompt_learner" in payload:
-        prompt_learner.load_state_dict(payload["prompt_learner"], strict=False)
-    if dino_adapters is not None and "dino_adapters" in payload:
-        dino_adapters.load_state_dict(payload["dino_adapters"], strict=True)
+    if single_tower is not None:
+        single_tower.load_checkpoint_fields(payload, strict=True)
+    else:
+        if model is None or prompt_learner is None:
+            raise ValueError("Legacy checkpoint requires model and prompt_learner.")
+        model.cls_token_adapter.load_state_dict(payload["cls_token_adapter"], strict=False)
+        model.patch_token_adapter.load_state_dict(payload["patch_token_adapter"], strict=False)
+        model.prompt_adapter.load_state_dict(payload["prompt_adapter"], strict=False)
+        if "prompt_learner" in payload:
+            prompt_learner.load_state_dict(payload["prompt_learner"], strict=False)
+        if dino_adapters is not None and "dino_adapters" in payload:
+            dino_adapters.load_state_dict(payload["dino_adapters"], strict=True)
     missing, unexpected = mara_agent.load_state_dict(payload["mara_agent"], strict=False)
     if missing or unexpected:
         print(f"[WARN] MARA state loaded with missing={missing}, unexpected={unexpected}")
 
-    model.to(device).eval()
-    prompt_learner.to(device).eval()
+    if model is not None:
+        model.to(device).eval()
+    if prompt_learner is not None:
+        prompt_learner.to(device).eval()
     mara_agent.to(device).eval()
     if dino_adapters is not None:
         dino_adapters.to(device).eval()
+    if single_tower is not None:
+        single_tower.to(device).eval()
 
 
 def compute_metrics(gt_masks: np.ndarray, pred_eval: np.ndarray, args) -> Dict[str, float]:
@@ -185,13 +212,14 @@ def compute_metrics(gt_masks: np.ndarray, pred_eval: np.ndarray, args) -> Dict[s
 def evaluate_category(
     args,
     category: str,
-    clip_model: torch.nn.Module,
-    prompt_learner: torch.nn.Module,
+    clip_model: Optional[torch.nn.Module],
+    prompt_learner: Optional[torch.nn.Module],
     dino_model: Optional[torch.nn.Module],
-    model: torch.nn.Module,
+    model: Optional[torch.nn.Module],
     mara_agent: MARAAgent,
     device: torch.device,
     result_dir: str,
+    single_tower: Optional[DinoSingleTowerDetector] = None,
 ):
     base_maps = []
     mara_maps = []
@@ -216,25 +244,33 @@ def evaluate_category(
     loader = prepare_data(args.dataset, category, args)
     with torch.no_grad():
         for batch_idx, image_info in enumerate(tqdm(loader)):
-            _, mask, base_map, base_logits, stage1_evidence = get_anomaly_map(
-                clip_model=clip_model,
-                image_info=image_info,
-                device=device,
-                model=model,
-                Dino_model=dino_model,
-                prompt_learner=prompt_learner,
-                idx=batch_idx,
-                visual_backbone=args.visual_backbone,
-                visual_layers=args.visual_layers,
-                text_source=args.text_source,
-                return_evidence=True,
-            )
+            if single_tower is not None:
+                mask, base_map, base_logits, stage1_evidence = forward_dino_single_batch(
+                    single_tower,
+                    image_info,
+                    device,
+                )
+            else:
+                _, mask, base_map, base_logits, stage1_evidence = get_anomaly_map(
+                    clip_model=clip_model,
+                    image_info=image_info,
+                    device=device,
+                    model=model,
+                    Dino_model=dino_model,
+                    prompt_learner=prompt_learner,
+                    idx=batch_idx,
+                    visual_backbone=args.visual_backbone,
+                    visual_layers=args.visual_layers,
+                    text_source=args.text_source,
+                    return_evidence=True,
+                )
             mara_evidence = build_mara_evidence(
                 evidence=stage1_evidence,
                 fallback_prob=base_map,
                 num_layers=len(args.visual_layers),
                 map_size=mara_agent.cfg.map_size,
                 include_full_resolution_oracle=not args.disable_evidence_oracle,
+                feature_channels_per_layer=int(getattr(args, "evidence_feature_channels", 0)),
             )
             del stage1_evidence
             layer_maps = mara_evidence["layer_maps"]
@@ -545,7 +581,15 @@ def main():
         ckpts = [ckpts[-1]]
 
     first_payload = torch.load(ckpts[0], map_location=device)
-    clip_model, prompt_learner, dino_model, dino_adapters, model, mara_agent = build_models_from_checkpoint(
+    (
+        clip_model,
+        prompt_learner,
+        dino_model,
+        dino_adapters,
+        model,
+        mara_agent,
+        single_tower,
+    ) = build_models_from_checkpoint(
         args=args,
         device=device,
         payload=first_payload,
@@ -570,6 +614,7 @@ def main():
             dino_adapters=dino_adapters,
             mara_agent=mara_agent,
             device=device,
+            single_tower=single_tower,
         )
         print(f"===== Evaluating MARA checkpoint: {ckpt_path} =====")
         rows = [
@@ -583,6 +628,7 @@ def main():
                 mara_agent=mara_agent,
                 device=device,
                 result_dir=os.path.join(dataset_result_dir, epoch_name),
+                single_tower=single_tower,
             )
             for category in categories
         ]

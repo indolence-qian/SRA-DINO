@@ -24,6 +24,9 @@ GAIN_ACCEPT_PROBABILITY="${GAIN_ACCEPT_PROBABILITY:-0.50}"
 DISABLE_HARD_GAIN_GATE="${DISABLE_HARD_GAIN_GATE:-0}"
 DISABLE_EVIDENCE_ORACLE="${DISABLE_EVIDENCE_ORACLE:-0}"
 QUALITY_DEGRADATION_TOLERANCE="${QUALITY_DEGRADATION_TOLERANCE:-0.0001}"
+DINO_REPO_DIR="${DINO_REPO_DIR:-./dinov3}"
+DINO_MODEL_NAME="${DINO_MODEL_NAME:-dinov3_vitl16}"
+DINO_WEIGHTS="${DINO_WEIGHTS:-./dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth}"
 
 if [[ -z "${MARA_CKPT}" ]]; then
   echo "[ERROR] MARA_CKPT is required."
@@ -103,6 +106,9 @@ for ((worker_idx = 0; worker_idx < ${#GPU_LIST[@]}; worker_idx++)); do
         --gain_safety_margin "${GAIN_SAFETY_MARGIN}" \
         --gain_accept_probability "${GAIN_ACCEPT_PROBABILITY}" \
         --quality_degradation_tolerance "${QUALITY_DEGRADATION_TOLERANCE}" \
+        --dino_repo_dir "${DINO_REPO_DIR}" \
+        --dino_model_name "${DINO_MODEL_NAME}" \
+        --dino_weights "${DINO_WEIGHTS}" \
         "${LATEST_FLAG[@]}" \
         "${SAVE_VIS_FLAG[@]}" \
         "${HARD_GAIN_GATE_FLAG[@]}" \
