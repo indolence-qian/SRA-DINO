@@ -3,7 +3,11 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from tools.dino_single_tower import DinoSingleTowerConfig, DinoVisualPrototypeHead
+from tools.dino_single_tower import (
+    DinoSingleTowerConfig,
+    DinoVisualPrototypeHead,
+    collate_anomaly_batch,
+)
 from tools.mara_agent import MARAAgent, MARAConfig
 from tools.mara_evidence import build_mara_evidence
 
@@ -101,6 +105,25 @@ class DinoSingleTowerTests(unittest.TestCase):
         self.assertEqual(restored, self.config)
         self.assertIsInstance(restored.visual_layers, tuple)
         self.assertIsInstance(restored.hfa_layers, tuple)
+
+    def test_collate_normalizes_mixed_boolean_and_float_masks(self):
+        batch = [
+            {
+                "image": torch.zeros(3, 8, 8),
+                "mask": torch.zeros(1, 8, 8, dtype=torch.bool),
+                "is_anomaly": 1,
+                "image_path": "anomaly.png",
+            },
+            {
+                "image": torch.zeros(3, 8, 8),
+                "mask": torch.zeros(1, 8, 8, dtype=torch.float32),
+                "is_anomaly": 0,
+                "image_path": "normal.png",
+            },
+        ]
+        output = collate_anomaly_batch(batch)
+        self.assertEqual(output["mask"].dtype, torch.float32)
+        self.assertEqual(tuple(output["mask"].shape), (2, 1, 8, 8))
 
 
 if __name__ == "__main__":

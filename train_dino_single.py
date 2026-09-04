@@ -23,6 +23,7 @@ from Datasets import DATASET_REGISTRY
 from tools.dino_single_tower import (
     DinoSingleTowerConfig,
     DinoSingleTowerDetector,
+    collate_anomaly_batch,
     create_dino_single_tower,
 )
 from tools.loss import BinaryDiceLoss, FocalLoss
@@ -118,6 +119,7 @@ def build_loader(args) -> Tuple[DataLoader, Optional[DistributedSampler]]:
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         drop_last=False,
+        collate_fn=collate_anomaly_batch,
     )
     if args.is_main_process:
         print(
@@ -159,7 +161,7 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scheduler: LambdaLR,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler: torch.amp.GradScaler,
     device: torch.device,
     args,
 ) -> Dict[str, float]:
@@ -177,7 +179,10 @@ def train_one_epoch(
         labels = image_info["is_anomaly"].to(device, non_blocking=True).long()
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=args.amp and device.type == "cuda"):
+        with torch.amp.autocast(
+            device_type=device.type,
+            enabled=args.amp and device.type == "cuda",
+        ):
             output = detector(image)
             prob = output["prob"]
             mask_bhw = mask[:, 0] if mask.dim() == 4 else mask
@@ -385,7 +390,7 @@ def main() -> None:
         warmup_steps=max(1, int(total_steps * args.warmup_ratio)),
         total_steps=total_steps,
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
 
     try:
         for epoch in range(args.epoch):

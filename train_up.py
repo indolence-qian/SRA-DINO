@@ -25,6 +25,7 @@ from CLIP.adapter import CLIP_Inplanted as model_adapter
 from CLIP.clip import create_model
 from Datasets import DATASET_REGISTRY
 from tools.bottleneckAdapter import install_bottleneck_adapters_into_dino
+from tools.dino_single_tower import collate_anomaly_batch
 from tools.loss import BinaryDiceLoss, FocalLoss
 from tools.promptLearner import AnomalyCLIP_PromptLearner
 from tools.semantic_anchor import build_semantic_anchor_aligner, encode_prompt_features
@@ -133,11 +134,13 @@ def prepare_data(
         imagesize=image_size,
     )
 
+    data_loader_kwargs = dict(loader_kwargs or DEFAULT_LOADER_KWARGS)
+    data_loader_kwargs.setdefault("collate_fn", collate_anomaly_batch)
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        **(loader_kwargs or DEFAULT_LOADER_KWARGS),
+        **data_loader_kwargs,
     )
 
     print(f"Loaded [{dataset_name}] split={split_name} category={category}, size={len(dataset)}")

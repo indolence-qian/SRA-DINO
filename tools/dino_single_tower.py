@@ -17,8 +17,31 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import default_collate
 
 from tools.bottleneckAdapter import install_bottleneck_adapters_into_dino
+
+
+def collate_anomaly_batch(batch: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Collate anomaly samples after normalizing mixed mask dtypes.
+
+    Industrial datasets in this repository return boolean masks for anomalous
+    test images but float zero masks for normal images.  Multiprocess PyTorch
+    collation preallocates shared storage using the first tensor's dtype, so a
+    mixed batch can fail before it reaches the training loop.  Normalizing here
+    keeps the dataset implementations and all downstream losses consistent.
+    """
+
+    normalized = []
+    for sample in batch:
+        item = dict(sample)
+        mask = item.get("mask")
+        if mask is not None:
+            if not torch.is_tensor(mask):
+                mask = torch.as_tensor(mask)
+            item["mask"] = mask.to(dtype=torch.float32)
+        normalized.append(item)
+    return default_collate(normalized)
 
 
 def _extract_tensor(output: Any) -> torch.Tensor:

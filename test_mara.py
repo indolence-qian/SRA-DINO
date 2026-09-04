@@ -13,7 +13,11 @@ from tqdm import tqdm
 from Datasets import DATASET_CLASSES, DATASET_REGISTRY
 from tools.mara_agent import MARAAgent, MARAConfig, quality_score
 from tools.mara_evidence import build_mara_evidence
-from tools.dino_single_tower import DinoSingleTowerDetector, forward_dino_single_batch
+from tools.dino_single_tower import (
+    DinoSingleTowerDetector,
+    collate_anomaly_batch,
+    forward_dino_single_batch,
+)
 from tools.utils_up import get_anomaly_map
 from tools.visualization import visualization
 from train_mara import (
@@ -73,7 +77,11 @@ def prepare_data(dataset_name: str, category: str, args):
         resize=args.image_size,
         imagesize=args.image_size,
     )
-    kwargs = {"num_workers": args.num_workers, "pin_memory": torch.cuda.is_available()}
+    kwargs = {
+        "num_workers": args.num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "collate_fn": collate_anomaly_batch,
+    }
     loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False, **kwargs)
     print(f"Loaded [{dataset_name}] ({category}) test set, size: {len(dataset)}")
     return loader
