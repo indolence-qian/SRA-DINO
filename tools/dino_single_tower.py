@@ -150,12 +150,14 @@ class DinoLayerAdapter(nn.Module):
             nn.Conv2d(embed_dim, evidence_channels, kernel_size=1, bias=False),
             nn.GroupNorm(1, evidence_channels),
         )
+        self.evidence_classifier = nn.Conv2d(evidence_channels, 2, kernel_size=1)
+        self.evidence_mix_logit = nn.Parameter(torch.tensor(-2.0))
 
     def forward(
         self,
         cls_token: torch.Tensor,
         patch_tokens: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if cls_token.dim() == 3:
             cls_token = cls_token[:, 0]
         patch = self.project(self.norm(patch_tokens))
@@ -168,8 +170,9 @@ class DinoLayerAdapter(nn.Module):
         spatial = self.pointwise(F.gelu(self.depthwise(patch_map)))
         patch_map = patch_map + torch.tanh(self.spatial_scale) * self.spatial_norm(spatial)
         evidence = torch.tanh(self.evidence_projector(patch_map))
+        evidence_logits = self.evidence_classifier(evidence)
         patch = patch_map.flatten(2).transpose(1, 2)
-        return cls, patch, evidence
+        return cls, patch, evidence, evidence_logits
 
 
 class ImageConditionedPrototypeBlock(nn.Module):
@@ -314,7 +317,10 @@ class DinoVisualPrototypeHead(nn.Module):
             cls_tokens,
             patch_tokens,
         ):
-            cls_feature, patch_feature, compact_feature = adapter(cls_token, patches)
+            cls_feature, patch_feature, compact_feature, evidence_logits = adapter(
+                cls_token,
+                patches,
+            )
             conditioned = prototype_block(static_prototypes, patch_feature)
             normal = conditioned[:, : self.config.normal_prototypes]
             anomaly = conditioned[:, self.config.normal_prototypes :]
@@ -328,9 +334,14 @@ class DinoVisualPrototypeHead(nn.Module):
             token_logits = scale * torch.stack([normal_score, anomaly_score], dim=-1)
 
             side = int(math.sqrt(patch_feature.shape[1]))
-            lowres_logits = token_logits.transpose(1, 2).reshape(
+            prototype_logits = token_logits.transpose(1, 2).reshape(
                 patch_feature.shape[0], 2, side, side
             )
+            # The compact feature path is trained jointly with the prototype
+            # detector instead of remaining a random, MARA-only projection.
+            lowres_logits = prototype_logits + torch.sigmoid(
+                adapter.evidence_mix_logit
+            ) * evidence_logits
             fullres_logits = F.interpolate(
                 lowres_logits,
                 size=output_size,

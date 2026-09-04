@@ -61,6 +61,12 @@ class DinoSingleTowerTests(unittest.TestCase):
         self.assertGreater(float(self.head.normal_bank.grad.norm()), 0.0)
         self.assertGreater(float(self.head.anomaly_bank.grad.norm()), 0.0)
         self.assertIsNotNone(self.head.layer_adapters[0].project.weight.grad)
+        missing_gradients = [
+            name
+            for name, parameter in self.head.named_parameters()
+            if parameter.requires_grad and parameter.grad is None
+        ]
+        self.assertEqual(missing_gradients, [])
 
     def test_mara_receives_compressed_dino_feature_channels(self):
         output = self.head(self.cls_tokens, self.patch_tokens, output_size=(32, 32))
