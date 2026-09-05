@@ -6,7 +6,9 @@ import torch.nn.functional as F
 from tools.dino_single_tower import (
     DinoSingleTowerConfig,
     DinoVisualPrototypeHead,
+    SemanticDecisionHead,
     collate_anomaly_batch,
+    semantic_global_dim,
 )
 from tools.mara_agent import MARAAgent, MARAConfig
 from tools.mara_evidence import build_mara_evidence
@@ -111,6 +113,48 @@ class DinoSingleTowerTests(unittest.TestCase):
         self.assertEqual(restored, self.config)
         self.assertIsInstance(restored.visual_layers, tuple)
         self.assertIsInstance(restored.hfa_layers, tuple)
+
+    def test_distilled_semantic_evidence_reaches_mara(self):
+        output = self.head(self.cls_tokens, self.patch_tokens, output_size=(32, 32))
+        semantic_head = SemanticDecisionHead(self.config)
+        decision = semantic_head(
+            output["prob"], output["global_logits"], output["evidence"]
+        )
+        output["evidence"].update(
+            {
+                "semantic_prior_map": decision["map_prob"],
+                "semantic_confidence_map": decision["confidence_map"],
+                "semantic_disagreement_map": decision["disagreement_map"],
+                "semantic_global": decision["global_vector"],
+            }
+        )
+        packed = build_mara_evidence(
+            evidence=output["evidence"],
+            fallback_prob=output["prob"],
+            num_layers=2,
+            map_size=8,
+            feature_channels_per_layer=3,
+            semantic_spatial_channels=3,
+            semantic_global_dim=semantic_global_dim(2),
+        )
+        self.assertEqual(tuple(decision["map_prob"].shape), (2, 1, 4, 4))
+        self.assertEqual(tuple(packed["extra_maps"].shape), (2, 19, 8, 8))
+        self.assertEqual(tuple(packed["global_evidence"].shape), (2, 9))
+
+        loss = (
+            decision["map_logits"].mean()
+            + decision["action_logits"].mean()
+            + decision["layer_logits"].mean()
+            + decision["anomaly_logit"].mean()
+            + decision["confidence_logit"].mean()
+        )
+        loss.backward()
+        missing = [
+            name
+            for name, parameter in semantic_head.named_parameters()
+            if parameter.requires_grad and parameter.grad is None
+        ]
+        self.assertEqual(missing, [])
 
     def test_collate_normalizes_mixed_boolean_and_float_masks(self):
         batch = [

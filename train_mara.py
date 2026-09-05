@@ -17,10 +17,12 @@ from tools.mara_agent import MARAAgent, MARAConfig
 from tools.mara_evidence import build_mara_evidence
 from tools.bottleneckAdapter import install_bottleneck_adapters_into_dino
 from tools.dino_single_tower import (
+    SEMANTIC_SPATIAL_CHANNELS,
     DinoSingleTowerDetector,
     config_from_checkpoint as single_tower_config_from_checkpoint,
     create_dino_single_tower,
     forward_dino_single_batch,
+    semantic_global_dim,
 )
 from tools.utils_up import get_anomaly_map
 from train_up import (
@@ -152,9 +154,16 @@ def load_checkpoint_payload(ckpt_path: str) -> Dict:
 def apply_base_runtime_config(args, payload: Dict) -> None:
     args.base_arch = str(payload.get("base_arch", "clip_dino"))
     args.evidence_feature_channels = 0
+    args.evidence_semantic_channels = 0
+    args.evidence_semantic_global_dim = 0
     if args.base_arch == "dino_single":
         single_config = single_tower_config_from_checkpoint(payload)
         args.evidence_feature_channels = int(single_config.evidence_channels)
+        if single_config.semantic_enabled:
+            args.evidence_semantic_channels = SEMANTIC_SPATIAL_CHANNELS
+            args.evidence_semantic_global_dim = semantic_global_dim(
+                len(single_config.visual_layers)
+            )
     if payload.get("visual_backbone"):
         args.visual_backbone = payload["visual_backbone"]
     if payload.get("dino_repo_dir"):
@@ -279,12 +288,16 @@ def layer_maps_from_debug(debug, device: torch.device, fallback_prob: torch.Tens
 
 def build_mara_config(args) -> MARAConfig:
     feature_channels = int(getattr(args, "evidence_feature_channels", 0))
+    semantic_channels = int(getattr(args, "evidence_semantic_channels", 0))
+    semantic_global = int(getattr(args, "evidence_semantic_global_dim", 0))
     evidence_channels = (
         0
         if args.disable_evidence_bank
-        else (4 + feature_channels) * len(args.visual_layers) + 2
+        else (4 + feature_channels) * len(args.visual_layers) + 2 + semantic_channels
     )
-    global_evidence_dim = 0 if args.disable_evidence_bank else len(args.visual_layers)
+    global_evidence_dim = (
+        0 if args.disable_evidence_bank else len(args.visual_layers) + semantic_global
+    )
     return MARAConfig(
         num_layers=len(args.visual_layers),
         evidence_channels=evidence_channels,
@@ -452,6 +465,12 @@ def train_one_epoch(
             num_layers=len(args.visual_layers),
             map_size=args.mara_map_size,
             feature_channels_per_layer=int(getattr(args, "evidence_feature_channels", 0)),
+            semantic_spatial_channels=int(
+                getattr(args, "evidence_semantic_channels", 0)
+            ),
+            semantic_global_dim=int(
+                getattr(args, "evidence_semantic_global_dim", 0)
+            ),
         )
         del stage1_evidence
         layer_maps = mara_evidence["layer_maps"]
@@ -627,6 +646,8 @@ def run_train(args) -> None:
             f"hfa_bottleneck={args.hfa_bottleneck_runtime}, "
             f"evidence_bank={not args.disable_evidence_bank}, "
             f"feature_channels_per_layer={args.evidence_feature_channels}, "
+            f"semantic_channels={args.evidence_semantic_channels}, "
+            f"semantic_global_dim={args.evidence_semantic_global_dim}, "
             f"world_size={args.world_size}, per_gpu_batch={args.batch_size}, "
             f"global_batch={args.batch_size * args.world_size}"
         )

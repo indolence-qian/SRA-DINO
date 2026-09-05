@@ -269,6 +269,8 @@ $\mathcal L_{safe}$ 包括门控稀疏、增益回归/分位数/分类、增益�
 5. **反事实分位数安全门**：以不受门控影响的候选质量训练增益下界，推理只接受保守估计为正的修改；
 6. **原分辨率恒等安全保证**：零门控时绕过低分辨率重采样误差，严格恢复 Base 输出；
 7. **证据 Oracle 与退化指标联合诊断**：区分“证据本身无提升空间”和“Agent 未能正确选择证据”。
+8. **离线 8B FP8 视觉教师蒸馏**：两张 GPU 各加载一份 Qwen3-VL-8B-FP8，对互斥数据分片生成异常概率、ROI、动作、层偏好与置信度；随后卸载 VLM，只把这些决策蒸馏到 DINO 侧轻量语义头。
+9. **语义决策显式供给 MARA**：蒸馏头输出语义先验图、置信图、与 Base 的分歧图，以及动作/层级/图像异常概率向量；MARA 因而能读取比单一异常图更完整的中间决策证据。
 
 这些贡献的重点是“多源证据利用、动态决策和保守安全机制”的组合，而不是单独宣称首次使用 DINOv3、CLIP 或强化学习进行异常检测。
 
@@ -279,6 +281,7 @@ $\mathcal L_{safe}$ 包括门控稀疏、增益回归/分位数/分类、增益�
 - 候选 ROI 是固定尺寸 Top-K 方框，没有 NMS、多尺度或边界候选；
 - CLIP 主线仍不包含原始高维 Patch 特征；DINO 单塔仅传递每层 8 通道学习压缩特征，压缩维度需要进一步消融；
 - DINO 单塔属于新增实验分支，当前代码完成了结构与梯度验证，但尚不能在没有正式跨数据集实验前声明优于 CLIP 主线；
+- Qwen3-VL 是训练期离线 Teacher，不参与最终推理；其伪标签质量、正常参考图选择和 prompt 仍需通过 `RUN_VLM_DISTILL=0` 对照及缓存统计验证；
 - 多描述 Teacher 仍是类别无关语义，是否应进一步加入类别条件描述需要通过跨数据集消融确定；
 - 语义初始化、方向损失和多正样本损失的实际收益仍需分别与 `anchor_weight=0` 对照验证；
 - 仓库未包含最新 MARA checkpoint 或评估结果文件，因此本文只总结已实现能力，不声明具体数值提升。
@@ -289,7 +292,10 @@ $\mathcal L_{safe}$ 包括门控稀疏、增益回归/分位数/分类、增益�
 |---|---|
 | `train.py` | 第一阶段基础检测器训练 |
 | `train_dino_single.py` | DINO 单塔视觉原型检测器双卡训练 |
-| `tools/dino_single_tower.py` | 多层空间适配、图像条件视觉原型、单塔异常图与压缩视觉证据 |
+| `tools/dino_single_tower.py` | 多层空间适配、图像条件视觉原型、单塔异常图、压缩视觉证据与轻量语义决策头 |
+| `tools/vlm_decision.py` | Qwen3-VL prompt、严格 JSON 解析、ROI/热图构造与 vLLM 推理封装 |
+| `build_vlm_decision_cache.py` | 两卡独立 FP8 Teacher 分片缓存、断点续跑与合并 |
+| `train_vlm_distiller.py` | 不读取 GT 的 VLM 决策蒸馏、双卡 DDP 与语义 checkpoint 输出 |
 | `tools/semantic_anchor.py` | 描述库加载、冻结 CLIP Teacher 编码、语义初始化和多锚点损失 |
 | `tools/build_gemini_semantic_anchors.py` | Gemini 描述生成、多类型描述库及来源记录构建 |
 | `tests/test_semantic_anchor.py` | 同空间方向损失、梯度、margin 和描述库测试 |
@@ -299,8 +305,8 @@ $\mathcal L_{safe}$ 包括门控稀疏、增益回归/分位数/分类、增益�
 | `train_mara.py` | 证据生成、轨迹采样/重放、DDP 与联合损失训练 |
 | `test_mara.py` | Base/MARA/Oracle 指标和安全行为评估 |
 | `train_mara_visa.sh` | 两阶段训练与跨数据集评估流水线 |
-| `run_exp.sh` | DINO 单塔 Base、双卡 MARA 与跨数据集测试一体化实验 |
+| `run_exp.sh` | DINO Base、双卡 VLM 缓存、语义蒸馏、MARA 与跨数据集测试一体化实验 |
 
 ## 12. 总结
 
-最新 SRA-DINO 保留 CLIP 同空间 Teacher 主线，同时新增 DINO 单塔对照：直接在视觉空间学习多正常/异常原型，消除跨模态投影，并把压缩 Patch 特征交给 MARA。两条 Base 路线共享 Base 锚定 GRPO 和反事实分位数安全门，从而可以用严格消融判断文本语义与纯视觉密集特征各自的实际贡献。
+最新 SRA-DINO 保留 CLIP 同空间 Teacher 主线，同时新增 DINO 单塔对照：直接在视觉空间学习多正常/异常原型，消除跨模态投影，并把压缩 Patch 特征交给 MARA。单塔实验还可使用 Qwen3-VL-8B-FP8 作为一次性的离线视觉教师，把高层判断蒸馏为轻量语义证据，而不把大模型带入部署。两条 Base 路线共享 Base 锚定 GRPO 和反事实分位数安全门，从而可以用严格消融判断文本语义、纯视觉密集特征与 VLM 决策先验各自的实际贡献。

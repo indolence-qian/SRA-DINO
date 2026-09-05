@@ -123,6 +123,8 @@ def build_mara_evidence(
     map_size: int,
     include_full_resolution_oracle: bool = False,
     feature_channels_per_layer: int = 0,
+    semantic_spatial_channels: int = 0,
+    semantic_global_dim: int = 0,
 ) -> Dict[str, Any]:
     """Pack frozen stage-one evidence into compact MARA decision tensors.
 
@@ -165,6 +167,50 @@ def build_mara_evidence(
         dtype,
     )
 
+    semantic_maps = torch.zeros(
+        batch_size, 0, map_size, map_size, device=device, dtype=dtype
+    )
+    if semantic_spatial_channels > 0:
+        semantic_keys = (
+            "semantic_prior_map",
+            "semantic_confidence_map",
+            "semantic_disagreement_map",
+        )
+        if semantic_spatial_channels != len(semantic_keys):
+            raise ValueError(
+                f"Expected {len(semantic_keys)} semantic spatial channels, "
+                f"got {semantic_spatial_channels}."
+            )
+        values = []
+        for key in semantic_keys:
+            value = None if evidence is None else evidence.get(key)
+            if value is None:
+                value = torch.zeros_like(fallback_anomaly)
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value)
+            value = _as_map(value.to(device=device, dtype=dtype))
+            values.append(_resize_map(value, map_size))
+        semantic_maps = torch.cat(values, dim=1)
+
+    semantic_global = torch.zeros(
+        batch_size, 0, device=device, dtype=dtype
+    )
+    if semantic_global_dim > 0:
+        value = None if evidence is None else evidence.get("semantic_global")
+        if value is None:
+            semantic_global = torch.zeros(
+                batch_size, semantic_global_dim, device=device, dtype=dtype
+            )
+        else:
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value)
+            semantic_global = value.to(device=device, dtype=dtype).reshape(batch_size, -1)
+            if semantic_global.shape[1] != semantic_global_dim:
+                raise ValueError(
+                    f"Expected {semantic_global_dim} semantic global values, "
+                    f"got {semantic_global.shape[1]}."
+                )
+
     cross_margin = _normalize_spatial_margin(cross_margin)
     global_margin = torch.tanh(global_margin / 10.0)
     cross_disagreement = cross_prob.std(dim=1, keepdim=True, unbiased=False)
@@ -202,6 +248,7 @@ def build_mara_evidence(
             cross_disagreement,
             awareness_disagreement,
             feature_maps,
+            semantic_maps,
         ],
         dim=1,
     ).detach()
@@ -209,7 +256,7 @@ def build_mara_evidence(
     return {
         "layer_maps": cross_prob.detach(),
         "extra_maps": extra_maps,
-        "global_evidence": global_margin.detach(),
+        "global_evidence": torch.cat([global_margin, semantic_global], dim=1).detach(),
         "oracle_maps": oracle_maps.detach(),
         "oracle_names": [
             *[f"cross_l{idx}" for idx in range(num_layers)],

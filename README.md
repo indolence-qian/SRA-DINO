@@ -76,21 +76,48 @@ python test.py --result_path $save_path --dataset $dataset
 bash test.sh
 ```
 
-### 4. Language-Free DINO Single-Tower Experiment
+### 4. DINO Single Tower + Qwen3-VL FP8 Teacher
 
-The experimental pipeline removes the CLIP/text tower from the deployed
-detector. It trains multi-layer normal/anomaly visual prototypes on frozen
-DINOv3 features, passes compact DINO feature evidence to MARA-GRPO, and then
-evaluates on unseen datasets.
+The deployed detector remains a language-free DINO single tower. During
+training only, two independent `Qwen3-VL-8B-Instruct-FP8` workers inspect the
+query, a same-category normal reference, the DINO heatmap, and proposed ROIs.
+Their JSON decisions are cached and distilled into a small semantic decision
+head. The 8B VLM is then unloaded before DDP distillation and MARA training, so
+the final detector does not require vLLM or the VLM weights.
 
 ```bash
-GPU_IDS=0,1 NPROC_PER_NODE=2 bash run_exp.sh
+# One-time optional teacher dependencies (Linux CUDA server).
+pip install -r requirements-vlm.txt
+
+# Base -> two FP8 cache workers -> semantic distillation -> MARA -> tests.
+nohup env GPU_IDS=0,1 NPROC_PER_NODE=2 \
+  bash run_exp.sh > nohup_dino_qwen3vl_mara.out 2>&1 &
 ```
 
 The default protocol trains with labeled VisA source images and evaluates on
 MVTec AD, BTAD, and MPDD. Do not report VisA as an unseen target in this setup.
-Both base training and MARA training use two-GPU DDP; cross-dataset evaluation
-assigns datasets across the two GPUs.
+Base, semantic-head, and MARA training use two-GPU DDP. VLM caching is not
+tensor parallel: GPU 0 and GPU 1 each run a complete FP8 model on a disjoint,
+resumable data shard. Cross-dataset evaluation assigns datasets across GPUs.
+
+Useful stage controls:
+
+```bash
+# Reuse an existing base and VLM cache, then distill/train/test.
+nohup env RUN_BASE=0 RUN_VLM_CACHE=0 \
+  BASE_CKPT=./checkpoint/dino_single_visa_xxx/ckpt/single_epoch_14.pth \
+  VLM_CACHE_PATH=./checkpoint/vlm_teacher_xxx/qwen3_vl_fp8_decisions.jsonl \
+  GPU_IDS=0,1 NPROC_PER_NODE=2 \
+  bash run_exp.sh > nohup_resume_vlm_mara.out 2>&1 &
+
+# Skip the VLM route entirely and retain the original DINO-only baseline.
+RUN_VLM_CACHE=0 RUN_VLM_DISTILL=0 GPU_IDS=0,1 NPROC_PER_NODE=2 bash run_exp.sh
+```
+
+`run_exp.sh` defaults to 70% GPU allocation per VLM worker. If either 4090 is
+also occupied, lower `VLM_GPU_MEMORY` (for example `0.62`). A failed cache shard
+is append-only and resumable by rerunning the same command. The merged cache
+must cover at least 95% of source samples before distillation starts.
 
 To run the code, please download the pretrained weights and place them in the specified directories:
 

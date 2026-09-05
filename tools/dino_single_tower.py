@@ -110,6 +110,8 @@ class DinoSingleTowerConfig:
     topk_ratio: float = 0.01
     hfa_layers: Tuple[int, ...] = field(default_factory=tuple)
     hfa_bottleneck: int = 256
+    semantic_enabled: bool = False
+    semantic_hidden_dim: int = 64
 
     def to_dict(self) -> Dict[str, Any]:
         output = asdict(self)
@@ -412,6 +414,125 @@ class DinoVisualPrototypeHead(nn.Module):
         }
 
 
+SEMANTIC_SPATIAL_CHANNELS = 3
+
+
+def semantic_global_dim(num_layers: int) -> int:
+    # action probabilities (3), layer probabilities (L), anomaly probability
+    # (1), and calibrated teacher confidence (1).
+    return int(num_layers) + 5
+
+
+class SemanticDecisionHead(nn.Module):
+    """Distilled VLM decision prior operating only on DINO evidence."""
+
+    def __init__(self, config: DinoSingleTowerConfig) -> None:
+        super().__init__()
+        num_layers = len(config.visual_layers)
+        spatial_channels = num_layers * (3 + config.evidence_channels) + 2
+        hidden_dim = int(config.semantic_hidden_dim)
+        groups = 8 if hidden_dim % 8 == 0 else 1
+        self.num_layers = num_layers
+        self.spatial_encoder = nn.Sequential(
+            nn.Conv2d(spatial_channels, hidden_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(groups, hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(groups, hidden_dim),
+            nn.GELU(),
+        )
+        self.map_head = nn.Conv2d(hidden_dim, 1, kernel_size=1)
+        self.global_encoder = nn.Sequential(
+            nn.Linear(hidden_dim + 2 + num_layers, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.action_head = nn.Linear(hidden_dim, 3)
+        self.layer_head = nn.Linear(hidden_dim, num_layers)
+        self.anomaly_head = nn.Linear(hidden_dim, 1)
+        self.confidence_head = nn.Linear(hidden_dim, 1)
+
+    @staticmethod
+    def _stack_layers(
+        evidence: Mapping[str, Sequence[torch.Tensor]],
+        key: str,
+    ) -> torch.Tensor:
+        values = list(evidence[key])
+        maps = [value.unsqueeze(1) if value.dim() == 3 else value for value in values]
+        return torch.cat(maps, dim=1)
+
+    def forward(
+        self,
+        base_prob: torch.Tensor,
+        base_logits: torch.Tensor,
+        evidence: Mapping[str, Sequence[torch.Tensor]],
+    ) -> Dict[str, torch.Tensor]:
+        cross_prob = self._stack_layers(evidence, "cross_prob_layers")
+        cross_margin = self._stack_layers(evidence, "cross_margin_layers")
+        awareness = self._stack_layers(evidence, "awareness_layers")
+        feature_maps = torch.cat(list(evidence["feature_layers"]), dim=1)
+        target_size = feature_maps.shape[-2:]
+        spatial_parts = []
+        for value in (cross_prob, cross_margin, awareness):
+            spatial_parts.append(
+                F.interpolate(value, size=target_size, mode="bilinear", align_corners=False)
+                if value.shape[-2:] != target_size
+                else value
+            )
+        base_anomaly = F.interpolate(
+            base_prob[:, 1:2], size=target_size, mode="bilinear", align_corners=False
+        )
+        entropy = -(
+            base_prob.clamp_min(1e-6) * base_prob.clamp_min(1e-6).log()
+        ).sum(dim=1, keepdim=True) / math.log(2.0)
+        entropy = F.interpolate(
+            entropy, size=target_size, mode="bilinear", align_corners=False
+        )
+        encoded = self.spatial_encoder(
+            torch.cat([*spatial_parts, feature_maps, base_anomaly, entropy], dim=1)
+        )
+        map_logits = self.map_head(encoded)
+        map_prob = torch.sigmoid(map_logits)
+
+        global_margin = torch.stack(
+            [value.reshape(value.shape[0], -1)[:, 0] for value in evidence["global_margin_layers"]],
+            dim=1,
+        )
+        pooled = F.adaptive_avg_pool2d(encoded, 1).flatten(1)
+        global_feature = self.global_encoder(
+            torch.cat([pooled, base_logits, torch.tanh(global_margin / 10.0)], dim=1)
+        )
+        action_logits = self.action_head(global_feature)
+        layer_logits = self.layer_head(global_feature)
+        anomaly_logit = self.anomaly_head(global_feature)
+        confidence_logit = self.confidence_head(global_feature)
+        action_prob = torch.softmax(action_logits, dim=1)
+        layer_prob = torch.softmax(layer_logits, dim=1)
+        anomaly_prob = torch.sigmoid(anomaly_logit)
+        confidence = torch.sigmoid(confidence_logit)
+        confidence_map = confidence[:, :, None, None].expand_as(map_prob)
+        disagreement_map = (map_prob - base_anomaly).abs()
+        global_vector = torch.cat(
+            [action_prob, layer_prob, anomaly_prob, confidence], dim=1
+        )
+        return {
+            "map_logits": map_logits,
+            "map_prob": map_prob,
+            "action_logits": action_logits,
+            "action_prob": action_prob,
+            "layer_logits": layer_logits,
+            "layer_prob": layer_prob,
+            "anomaly_logit": anomaly_logit,
+            "anomaly_prob": anomaly_prob,
+            "confidence_logit": confidence_logit,
+            "confidence": confidence,
+            "confidence_map": confidence_map,
+            "disagreement_map": disagreement_map,
+            "global_vector": global_vector,
+        }
+
+
 class DinoSingleTowerDetector(nn.Module):
     """Frozen DINOv3 plus the trainable visual prototype head."""
 
@@ -430,6 +551,18 @@ class DinoSingleTowerDetector(nn.Module):
                 bottleneck=config.hfa_bottleneck,
             )
         self.head = DinoVisualPrototypeHead(config)
+        self.semantic_head = (
+            SemanticDecisionHead(config) if config.semantic_enabled else None
+        )
+
+    def enable_semantic_head(self, hidden_dim: int = 64) -> SemanticDecisionHead:
+        self.config.semantic_enabled = True
+        self.config.semantic_hidden_dim = int(hidden_dim)
+        if self.semantic_head is None:
+            self.semantic_head = SemanticDecisionHead(self.config).to(
+                next(self.head.parameters()).device
+            )
+        return self.semantic_head
 
     @property
     def dino_adapters(self) -> nn.Module | None:
@@ -449,7 +582,17 @@ class DinoSingleTowerDetector(nn.Module):
                 backbone=self.backbone,
                 layers=self.config.visual_layers,
             )
-        return self.head(cls_tokens, patch_tokens, output_size=tuple(image.shape[-2:]))
+        output = self.head(cls_tokens, patch_tokens, output_size=tuple(image.shape[-2:]))
+        if self.semantic_head is not None:
+            decision = self.semantic_head(
+                output["prob"], output["global_logits"], output["evidence"]
+            )
+            output["semantic_decision"] = decision
+            output["evidence"]["semantic_prior_map"] = decision["map_prob"]
+            output["evidence"]["semantic_confidence_map"] = decision["confidence_map"]
+            output["evidence"]["semantic_disagreement_map"] = decision["disagreement_map"]
+            output["evidence"]["semantic_global"] = decision["global_vector"]
+        return output
 
     def checkpoint_fields(self) -> Dict[str, Any]:
         fields: Dict[str, Any] = {
@@ -462,12 +605,20 @@ class DinoSingleTowerDetector(nn.Module):
             "dino_single_config": self.config.to_dict(),
             "dino_single_head": self.head.state_dict(),
         }
+        if self.semantic_head is not None:
+            fields["dino_single_semantic_head"] = self.semantic_head.state_dict()
         if self.dino_adapters is not None:
             fields["dino_adapters"] = self.dino_adapters.state_dict()
         return fields
 
     def load_checkpoint_fields(self, payload: Mapping[str, Any], strict: bool = True) -> None:
         self.head.load_state_dict(payload["dino_single_head"], strict=strict)
+        if self.semantic_head is not None:
+            if "dino_single_semantic_head" not in payload:
+                raise KeyError("Semantic single-tower checkpoint is missing its decision head.")
+            self.semantic_head.load_state_dict(
+                payload["dino_single_semantic_head"], strict=strict
+            )
         if self.dino_adapters is not None:
             if "dino_adapters" not in payload:
                 raise KeyError("Single-tower checkpoint is missing dino_adapters.")

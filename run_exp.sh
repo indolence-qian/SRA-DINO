@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# DINO single-tower experiment:
+# DINO + offline Qwen3-VL teacher experiment:
 #   1) Train the language-free DINO visual-prototype detector with DDP.
-#   2) Freeze it and train MARA-GRPO with compact DINO feature evidence.
-#   3) Evaluate the latest MARA checkpoint on unseen datasets in parallel.
+#   2) Run one independent Qwen3-VL-8B-FP8 teacher per GPU and cache decisions.
+#   3) Distill the cached decisions into a compact DINO semantic head with DDP.
+#   4) Freeze stage one and train/evaluate MARA-GRPO with semantic evidence.
 #
 # Full run:
 #   GPU_IDS=0,1 NPROC_PER_NODE=2 bash run_exp.sh
@@ -20,6 +21,8 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 DEVICE="${DEVICE:-cuda:0}"
 
 RUN_BASE="${RUN_BASE:-1}"
+RUN_VLM_CACHE="${RUN_VLM_CACHE:-1}"
+RUN_VLM_DISTILL="${RUN_VLM_DISTILL:-1}"
 RUN_MARA="${RUN_MARA:-1}"
 RUN_TEST="${RUN_TEST:-1}"
 BASE_CKPT="${BASE_CKPT:-}"
@@ -35,11 +38,28 @@ ANOMALY_PROTOTYPES="${ANOMALY_PROTOTYPES:-8}"
 EVIDENCE_CHANNELS="${EVIDENCE_CHANNELS:-8}"
 SINGLE_HFA_SETTING="${SINGLE_HFA_SETTING:-none}"
 
+VLM_MODEL_ID="${VLM_MODEL_ID:-Qwen/Qwen3-VL-8B-Instruct-FP8}"
+VLM_PYTHON="${VLM_PYTHON:-python}"
+VLM_GPU_MEMORY="${VLM_GPU_MEMORY:-0.70}"
+VLM_MAX_MODEL_LEN="${VLM_MAX_MODEL_LEN:-4096}"
+VLM_MAX_TOKENS="${VLM_MAX_TOKENS:-192}"
+VLM_NUM_ROIS="${VLM_NUM_ROIS:-3}"
+VLM_IMAGE_SIZE="${VLM_IMAGE_SIZE:-512}"
+VLM_ROI_FRACTION="${VLM_ROI_FRACTION:-0.25}"
+VLM_MAX_INVALID_RATIO="${VLM_MAX_INVALID_RATIO:-0.05}"
+VLM_CACHE_PATH="${VLM_CACHE_PATH:-}"
+VLM_WORK_DIR="${VLM_WORK_DIR:-}"
+VLM_DISTILL_EPOCH="${VLM_DISTILL_EPOCH:-5}"
+VLM_DISTILL_BS="${VLM_DISTILL_BS:-4}"
+VLM_DISTILL_LR="${VLM_DISTILL_LR:-3e-4}"
+VLM_HIDDEN_DIM="${VLM_HIDDEN_DIM:-64}"
+VLM_MAP_SIZE="${VLM_MAP_SIZE:-32}"
+
 MARA_EPOCH="${MARA_EPOCH:-30}"
 MARA_BS="${MARA_BS:-2}"
 TEST_BS="${TEST_BS:-16}"
 TEST_EVAL_LATEST_ONLY="${TEST_EVAL_LATEST_ONLY:-1}"
-TRICK_NAME="${TRICK_NAME:-dino_single_mara}"
+TRICK_NAME="${TRICK_NAME:-dino_single_qwen3vl_mara}"
 TEST_TRICK_NAME="${TEST_TRICK_NAME:-${TRICK_NAME}_final}"
 
 DINO_REPO_DIR="${DINO_REPO_DIR:-./dinov3}"
@@ -81,6 +101,7 @@ echo "Source=${SOURCE_DATASET}/${TRAIN_SPLIT}, targets=${TEST_DATASETS}"
 echo "GPUs=${GPU_IDS}, processes=${NPROC_PER_NODE}"
 echo "Prototypes normal/anomaly=${NORMAL_PROTOTYPES}/${ANOMALY_PROTOTYPES}, embed=${EMBED_DIM}"
 echo "DINO feature evidence=${EVIDENCE_CHANNELS} channels/layer"
+echo "VLM teacher=${VLM_MODEL_ID}, offline workers=${#GPU_LIST[@]}"
 
 if [[ "${RUN_BASE}" == "1" ]]; then
   echo "===== Stage 1: DINO single-tower visual-prototype training ====="
@@ -115,8 +136,100 @@ if [[ -z "${BASE_CKPT}" || ! -f "${BASE_CKPT}" ]]; then
 fi
 echo "Single-tower base checkpoint: ${BASE_CKPT}"
 
+if [[ -z "${VLM_WORK_DIR}" ]]; then
+  VLM_WORK_DIR="./checkpoint/vlm_teacher_${SOURCE_DATASET}_${TS}"
+fi
+if [[ -z "${VLM_CACHE_PATH}" ]]; then
+  VLM_CACHE_PATH="${VLM_WORK_DIR}/qwen3_vl_fp8_decisions.jsonl"
+fi
+
+if [[ "${RUN_VLM_CACHE}" == "1" ]]; then
+  echo "===== Stage 2: dual-GPU Qwen3-VL-8B-FP8 decision cache ====="
+  mkdir -p "${VLM_WORK_DIR}"
+  if ! "${VLM_PYTHON}" -c "import qwen_vl_utils, transformers, vllm"; then
+    echo "[ERROR] VLM dependencies are missing. Run: pip install -r requirements-vlm.txt"
+    exit 1
+  fi
+  VLM_PIDS=()
+  VLM_SHARDS="${#GPU_LIST[@]}"
+  for shard_id in "${!GPU_LIST[@]}"; do
+    gpu_id="${GPU_LIST[${shard_id}]}"
+    echo "Starting VLM shard ${shard_id}/${VLM_SHARDS} on physical GPU ${gpu_id}"
+    CUDA_VISIBLE_DEVICES="${gpu_id}" "${VLM_PYTHON}" build_vlm_decision_cache.py \
+      --base_ckpt "${BASE_CKPT}" \
+      --output_path "${VLM_CACHE_PATH}" \
+      --shard_id "${shard_id}" \
+      --num_shards "${VLM_SHARDS}" \
+      --dataset "${SOURCE_DATASET}" \
+      --train_split "${TRAIN_SPLIT}" \
+      --image_size "${IMAGE_SIZE}" \
+      --device cuda:0 \
+      --model_id "${VLM_MODEL_ID}" \
+      --gpu_memory_utilization "${VLM_GPU_MEMORY}" \
+      --max_model_len "${VLM_MAX_MODEL_LEN}" \
+      --max_tokens "${VLM_MAX_TOKENS}" \
+      --num_rois "${VLM_NUM_ROIS}" \
+      --teacher_image_size "${VLM_IMAGE_SIZE}" \
+      --roi_fraction "${VLM_ROI_FRACTION}" \
+      --max_invalid_ratio "${VLM_MAX_INVALID_RATIO}" \
+      --dino_repo_dir "${DINO_REPO_DIR}" \
+      --dino_model_name "${DINO_MODEL_NAME}" \
+      --dino_weights "${DINO_WEIGHTS}" &
+    VLM_PIDS+=("$!")
+  done
+  VLM_FAILED=0
+  for pid in "${VLM_PIDS[@]}"; do
+    if ! wait "${pid}"; then
+      VLM_FAILED=1
+    fi
+  done
+  if [[ "${VLM_FAILED}" != "0" ]]; then
+    echo "[ERROR] At least one VLM cache worker failed. Shards are resumable; rerun the same command."
+    exit 1
+  fi
+  "${VLM_PYTHON}" build_vlm_decision_cache.py \
+    --output_path "${VLM_CACHE_PATH}" \
+    --num_shards "${VLM_SHARDS}" \
+    --merge_shards
+fi
+
+if [[ "${RUN_VLM_DISTILL}" == "1" ]]; then
+  if [[ ! -f "${VLM_CACHE_PATH}" ]]; then
+    echo "[ERROR] VLM cache not found: ${VLM_CACHE_PATH}"
+    exit 1
+  fi
+  echo "===== Stage 3: dual-GPU semantic decision-head distillation ====="
+  VLM_DISTILL_RESULT="${VLM_WORK_DIR}/distilled"
+  CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${LAUNCHER[@]}" train_vlm_distiller.py \
+    --base_ckpt "${BASE_CKPT}" \
+    --cache_path "${VLM_CACHE_PATH}" \
+    --result_path "${VLM_DISTILL_RESULT}" \
+    --device "${DEVICE}" \
+    --dataset "${SOURCE_DATASET}" \
+    --train_split "${TRAIN_SPLIT}" \
+    --image_size "${IMAGE_SIZE}" \
+    --map_size "${VLM_MAP_SIZE}" \
+    --batch_size "${VLM_DISTILL_BS}" \
+    --epoch "${VLM_DISTILL_EPOCH}" \
+    --lr "${VLM_DISTILL_LR}" \
+    --hidden_dim "${VLM_HIDDEN_DIM}" \
+    --teacher_model "${VLM_MODEL_ID}" \
+    --dino_repo_dir "${DINO_REPO_DIR}" \
+    --dino_model_name "${DINO_MODEL_NAME}" \
+    --dino_weights "${DINO_WEIGHTS}"
+
+  DISTILLED_NAME="$(find "${VLM_DISTILL_RESULT}/ckpt" -maxdepth 1 \
+    -name 'vlm_distilled_epoch_*.pth' -printf '%f\n' | sort -V | tail -n 1)"
+  BASE_CKPT="${VLM_DISTILL_RESULT}/ckpt/${DISTILLED_NAME}"
+  if [[ ! -f "${BASE_CKPT}" ]]; then
+    echo "[ERROR] Distilled semantic checkpoint was not created."
+    exit 1
+  fi
+  echo "Distilled semantic checkpoint: ${BASE_CKPT}"
+fi
+
 if [[ "${RUN_MARA}" == "1" || "${RUN_TEST}" == "1" ]]; then
-  echo "===== Stage 2/3: MARA training and cross-dataset evaluation ====="
+  echo "===== Stage 4/5: MARA training and cross-dataset evaluation ====="
   RUN_BASE=0 \
   RUN_MARA="${RUN_MARA}" \
   RUN_TEST="${RUN_TEST}" \
@@ -141,5 +254,6 @@ if [[ "${RUN_MARA}" == "1" || "${RUN_TEST}" == "1" ]]; then
   bash train_mara_visa.sh
 fi
 
-echo "===== DINO single-tower experiment finished ====="
-echo "Base checkpoint: ${BASE_CKPT}"
+echo "===== DINO + Qwen3-VL teacher experiment finished ====="
+echo "Stage-one checkpoint used by MARA: ${BASE_CKPT}"
+echo "VLM decision cache: ${VLM_CACHE_PATH}"

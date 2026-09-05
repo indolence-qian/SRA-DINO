@@ -136,6 +136,8 @@ def build_models_from_checkpoint(args, device: torch.device, payload: Dict):
         f"hfa_layers={args.hfa_layers_runtime}, "
         f"hfa_bottleneck={args.hfa_bottleneck_runtime}, "
         f"feature_channels_per_layer={args.evidence_feature_channels}, "
+        f"semantic_channels={args.evidence_semantic_channels}, "
+        f"semantic_global_dim={args.evidence_semantic_global_dim}, "
         f"evidence_channels={mara_cfg.evidence_channels}, "
         f"global_evidence_dim={mara_cfg.global_evidence_dim}"
     )
@@ -279,6 +281,12 @@ def evaluate_category(
                 map_size=mara_agent.cfg.map_size,
                 include_full_resolution_oracle=not args.disable_evidence_oracle,
                 feature_channels_per_layer=int(getattr(args, "evidence_feature_channels", 0)),
+                semantic_spatial_channels=int(
+                    getattr(args, "evidence_semantic_channels", 0)
+                ),
+                semantic_global_dim=int(
+                    getattr(args, "evidence_semantic_global_dim", 0)
+                ),
             )
             del stage1_evidence
             layer_maps = mara_evidence["layer_maps"]

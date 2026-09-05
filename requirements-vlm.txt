@@ -1,0 +1,5 @@
+# Optional dependencies used only while building the offline FP8 teacher cache.
+# Install them in the same CUDA environment as the repository on the Linux server.
+vllm>=0.11.0
+transformers>=4.57.0
+qwen-vl-utils==0.0.14
