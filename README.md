@@ -86,17 +86,24 @@ head. The 8B VLM is then unloaded before DDP distillation and MARA training, so
 the final detector does not require vLLM or the VLM weights.
 
 ```bash
-# One-time optional teacher dependencies (Linux CUDA server).
-pip install -r requirements-vlm.txt
+# One-time CUDA 12.8 VLM environment. Keep it separate from the training env.
+conda create -n sra_vlm python=3.10 pip -y
+conda activate sra_vlm
+python -m pip install -U uv
+uv pip install --python "$(which python)" -r requirements-vlm.txt --torch-backend=cu128
+python -c "import torch,vllm; print(torch.__version__, torch.version.cuda, vllm.__version__, torch.cuda.is_available())"
+conda activate qfg_addino
 
 # Base -> two FP8 cache workers -> semantic distillation -> MARA -> tests.
 nohup env GPU_IDS=0,1 NPROC_PER_NODE=2 \
+  VLM_PYTHON=/root/miniconda3/envs/sra_vlm/bin/python \
   bash run_exp.sh > nohup_dino_qwen3vl_mara.out 2>&1 &
 ```
 
 The default protocol trains with labeled VisA source images and evaluates on
 MVTec AD, BTAD, and MPDD. Do not report VisA as an unseen target in this setup.
-Base, semantic-head, and MARA training use two-GPU DDP. VLM caching is not
+Base, semantic-head, and MARA training use the original environment and
+two-GPU DDP. VLM caching uses the isolated `sra_vlm` environment and is not
 tensor parallel: GPU 0 and GPU 1 each run a complete FP8 model on a disjoint,
 resumable data shard. Cross-dataset evaluation assigns datasets across GPUs.
 

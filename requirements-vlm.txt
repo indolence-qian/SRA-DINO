@@ -1,5 +1,6 @@
-# Optional dependencies used only while building the offline FP8 teacher cache.
-# Install them in the same CUDA environment as the repository on the Linux server.
-vllm>=0.11.0
-transformers>=4.57.0
+# CUDA 12.8 stack used only by the offline FP8 teacher cache. Install this
+# file in a clean VLM-only environment; do not install it into the training env.
+vllm==0.11.0
+transformers==4.57.3
 qwen-vl-utils==0.0.14
+tifffile>=2025.5.10

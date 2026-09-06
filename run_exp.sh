@@ -103,6 +103,14 @@ echo "Prototypes normal/anomaly=${NORMAL_PROTOTYPES}/${ANOMALY_PROTOTYPES}, embe
 echo "DINO feature evidence=${EVIDENCE_CHANNELS} channels/layer"
 echo "VLM teacher=${VLM_MODEL_ID}, offline workers=${#GPU_LIST[@]}"
 
+if [[ "${RUN_BASE}" == "1" || "${RUN_VLM_DISTILL}" == "1" || "${RUN_MARA}" == "1" || "${RUN_TEST}" == "1" ]]; then
+  if ! python -c "import torch; assert torch.cuda.is_available() and torch.cuda.device_count() >= ${NPROC_PER_NODE}; print('Training CUDA:', torch.__version__, torch.version.cuda, torch.cuda.device_count())"; then
+    echo "[ERROR] The active training environment cannot access ${NPROC_PER_NODE} CUDA GPUs."
+    echo "[ERROR] Do not install vLLM into the training environment; restore its CUDA-compatible PyTorch first."
+    exit 1
+  fi
+fi
+
 if [[ "${RUN_BASE}" == "1" ]]; then
   echo "===== Stage 1: DINO single-tower visual-prototype training ====="
   CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${LAUNCHER[@]}" train_dino_single.py \
@@ -146,8 +154,9 @@ fi
 if [[ "${RUN_VLM_CACHE}" == "1" ]]; then
   echo "===== Stage 2: dual-GPU Qwen3-VL-8B-FP8 decision cache ====="
   mkdir -p "${VLM_WORK_DIR}"
-  if ! "${VLM_PYTHON}" -c "import qwen_vl_utils, transformers, vllm"; then
-    echo "[ERROR] VLM dependencies are missing. Run: pip install -r requirements-vlm.txt"
+  if ! "${VLM_PYTHON}" -c "import qwen_vl_utils, torch, transformers, vllm; assert torch.cuda.is_available(); print('VLM CUDA:', torch.__version__, torch.version.cuda, vllm.__version__)"; then
+    echo "[ERROR] VLM_PYTHON does not provide a working CUDA/vLLM environment."
+    echo "[ERROR] Create the separate CUDA 12.8 environment documented in README.md."
     exit 1
   fi
   VLM_PIDS=()
