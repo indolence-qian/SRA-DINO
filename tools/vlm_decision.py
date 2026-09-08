@@ -255,7 +255,21 @@ class QwenVLLMTeacher:
         max_model_len: int = 4096,
         max_tokens: int = 192,
         max_images: int = 8,
+        teacher_image_size: int = 512,
     ) -> None:
+        if int(teacher_image_size) < 32:
+            raise ValueError("teacher_image_size must be at least 32 pixels.")
+        if int(max_images) < 1:
+            raise ValueError("max_images must be positive.")
+        if not 0 < int(max_tokens) < int(max_model_len):
+            raise ValueError("Require 0 < max_tokens < max_model_len.")
+        self._max_images = int(max_images)
+        # Cap engine profiling as well as real requests. Resizing PIL images
+        # alone does not constrain vLLM's synthetic multimodal warmup inputs.
+        self._mm_processor_kwargs = {
+            "min_pixels": 32 * 32,
+            "max_pixels": int(teacher_image_size) ** 2,
+        }
         # Qwen's official offline-vLLM example uses spawn.  Cache generation
         # already initialized CUDA for DINO before the vLLM engine is created.
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
@@ -281,7 +295,13 @@ class QwenVLLMTeacher:
             tensor_parallel_size=1,
             max_model_len=int(max_model_len),
             gpu_memory_utilization=float(gpu_memory_utilization),
-            limit_mm_per_prompt={"image": int(max_images)},
+            limit_mm_per_prompt={"image": self._max_images, "video": 0},
+            mm_processor_kwargs=self._mm_processor_kwargs.copy(),
+            # Each cache worker issues one request at a time. Avoid provisioning
+            # default high-concurrency batches or CUDA graphs on a 24 GiB GPU.
+            max_num_seqs=1,
+            max_num_batched_tokens=int(max_model_len),
+            enforce_eager=True,
             seed=0,
         )
         self.model_id = model_id
@@ -293,7 +313,14 @@ class QwenVLLMTeacher:
         return [{"role": "user", "content": content}]
 
     def generate(self, prompt: str, images: Sequence[Image.Image]) -> str:
+        if not 1 <= len(images) <= self._max_images:
+            raise ValueError(f"Require 1..{self._max_images} images per teacher request.")
         messages = self._messages(prompt, images)
+        # qwen_vl_utils resizes images before vLLM sees them; use the same
+        # pixel limits at both preprocessing stages to keep token counts aligned.
+        for item in messages[0]["content"]:
+            if item["type"] == "image":
+                item.update(self._mm_processor_kwargs)
         prompt_text = self._processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
@@ -311,7 +338,7 @@ class QwenVLLMTeacher:
         request = {
             "prompt": prompt_text,
             "multi_modal_data": multi_modal_data,
-            "mm_processor_kwargs": video_kwargs,
+            "mm_processor_kwargs": {**(video_kwargs or {}), **self._mm_processor_kwargs},
         }
         output = self._llm.generate([request], sampling_params=self._sampling, use_tqdm=False)
         return output[0].outputs[0].text

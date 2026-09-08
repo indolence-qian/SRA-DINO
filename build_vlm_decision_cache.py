@@ -163,6 +163,7 @@ def build_shard(args) -> None:
         max_model_len=args.max_model_len,
         max_tokens=args.max_tokens,
         max_images=3 + args.num_rois,
+        teacher_image_size=args.teacher_image_size,
     )
 
     invalid = 0

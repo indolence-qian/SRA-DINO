@@ -44,6 +44,7 @@ VLM_GPU_MEMORY="${VLM_GPU_MEMORY:-0.70}"
 VLM_MAX_MODEL_LEN="${VLM_MAX_MODEL_LEN:-4096}"
 VLM_MAX_TOKENS="${VLM_MAX_TOKENS:-192}"
 VLM_NUM_ROIS="${VLM_NUM_ROIS:-3}"
+# Controls both input thumbnails and the teacher engine's image profiling cap.
 VLM_IMAGE_SIZE="${VLM_IMAGE_SIZE:-512}"
 VLM_ROI_FRACTION="${VLM_ROI_FRACTION:-0.25}"
 VLM_MAX_INVALID_RATIO="${VLM_MAX_INVALID_RATIO:-0.05}"
@@ -153,6 +154,7 @@ fi
 
 if [[ "${RUN_VLM_CACHE}" == "1" ]]; then
   echo "===== Stage 2: dual-GPU Qwen3-VL-8B-FP8 decision cache ====="
+  echo "VLM runtime: image-only, max_num_seqs=1, eager=True, image_size=${VLM_IMAGE_SIZE}, max_model_len=${VLM_MAX_MODEL_LEN}, GPU budget=${VLM_GPU_MEMORY}"
   mkdir -p "${VLM_WORK_DIR}"
   if ! "${VLM_PYTHON}" -c "import qwen_vl_utils, torch, transformers, vllm; assert torch.cuda.is_available(); print('VLM CUDA:', torch.__version__, torch.version.cuda, vllm.__version__)"; then
     echo "[ERROR] VLM_PYTHON does not provide a working CUDA/vLLM environment."

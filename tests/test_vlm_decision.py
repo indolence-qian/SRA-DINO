@@ -1,9 +1,13 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
+from PIL import Image
 
 from tools.vlm_decision import (
     ACTION_NAMES,
+    QwenVLLMTeacher,
     build_vlm_prompt,
     candidate_boxes_from_map,
     decision_target_map,
@@ -12,6 +16,81 @@ from tools.vlm_decision import (
 
 
 class VLMDecisionTests(unittest.TestCase):
+    def make_teacher(self, **kwargs):
+        processor = MagicMock()
+        processor.image_processor.patch_size = 16
+        processor.apply_chat_template.return_value = "rendered prompt"
+        vision = MagicMock(return_value=(["image inputs"], None, {}))
+        llm = MagicMock()
+        llm.return_value.generate.return_value = [
+            SimpleNamespace(outputs=[SimpleNamespace(text="teacher JSON")])
+        ]
+        modules = {
+            "qwen_vl_utils": SimpleNamespace(process_vision_info=vision),
+            "vllm": SimpleNamespace(LLM=llm, SamplingParams=MagicMock()),
+            "transformers": SimpleNamespace(
+                AutoProcessor=SimpleNamespace(
+                    from_pretrained=MagicMock(return_value=processor)
+                )
+            ),
+        }
+        with patch.dict("sys.modules", modules), patch.dict("os.environ"):
+            teacher = QwenVLLMTeacher(**kwargs)
+        return teacher, llm, vision
+
+    def test_teacher_uses_bounded_image_only_engine(self):
+        _, llm, _ = self.make_teacher(
+            max_images=6, teacher_image_size=448, max_model_len=3072
+        )
+        config = llm.call_args.kwargs
+        self.assertEqual(config["limit_mm_per_prompt"], {"image": 6, "video": 0})
+        self.assertEqual(config["mm_processor_kwargs"], {
+            "min_pixels": 1024, "max_pixels": 448 ** 2,
+        })
+        self.assertEqual(config["max_num_seqs"], 1)
+        self.assertEqual(config["max_num_batched_tokens"], 3072)
+        self.assertTrue(config["enforce_eager"])
+        self.assertEqual(config["tensor_parallel_size"], 1)
+        self.assertEqual(config["gpu_memory_utilization"], 0.70)
+
+    def test_teacher_request_and_preprocessing_share_pixel_cap(self):
+        teacher, llm, vision = self.make_teacher(teacher_image_size=448)
+        # Even a conflicting per-request utility default cannot drop our cap.
+        vision.return_value = (["image inputs"], None, {"max_pixels": 999999})
+        result = teacher.generate("inspect", [Image.new("RGB", (64, 64))])
+        self.assertEqual(result, "teacher JSON")
+        image_item = vision.call_args.args[0][0]["content"][0]
+        self.assertEqual(image_item["max_pixels"], 448 ** 2)
+        self.assertEqual(image_item["min_pixels"], 1024)
+        request = llm.return_value.generate.call_args.args[0][0]
+        self.assertEqual(request["mm_processor_kwargs"], {
+            "min_pixels": 1024, "max_pixels": 448 ** 2,
+        })
+        self.assertEqual(request["multi_modal_data"], {"image": ["image inputs"]})
+
+    def test_teacher_accepts_empty_utility_kwargs(self):
+        teacher, llm, vision = self.make_teacher()
+        vision.return_value = (["image inputs"], None, None)
+        teacher.generate("inspect", [Image.new("RGB", (32, 32))])
+        request = llm.return_value.generate.call_args.args[0][0]
+        self.assertEqual(request["mm_processor_kwargs"]["max_pixels"], 512 ** 2)
+
+    def test_teacher_rejects_bad_limits_before_loading_engine(self):
+        for kwargs in (
+            {"teacher_image_size": 0}, {"max_images": 0},
+            {"max_tokens": 4096}, {"max_tokens": 0},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                QwenVLLMTeacher(**kwargs)
+
+    def test_teacher_rejects_empty_or_excess_images(self):
+        teacher, llm, vision = self.make_teacher(max_images=1)
+        for images in ([], [Image.new("RGB", (32, 32))] * 2):
+            with self.assertRaises(ValueError):
+                teacher.generate("inspect", images)
+        vision.assert_not_called()
+        llm.return_value.generate.assert_not_called()
+
     def test_fenced_json_is_parsed_and_constrained(self):
         response = """```json
         {"image_anomaly_probability": 1.4, "action": "REFINE",

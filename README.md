@@ -121,10 +121,30 @@ nohup env RUN_BASE=0 RUN_VLM_CACHE=0 \
 RUN_VLM_CACHE=0 RUN_VLM_DISTILL=0 GPU_IDS=0,1 NPROC_PER_NODE=2 bash run_exp.sh
 ```
 
-`run_exp.sh` defaults to 70% GPU allocation per VLM worker. If either 4090 is
-also occupied, lower `VLM_GPU_MEMORY` (for example `0.62`). A failed cache shard
-is append-only and resumable by rerunning the same command. The merged cache
-must cover at least 95% of source samples before distillation starts.
+`run_exp.sh` defaults to 70% GPU allocation per VLM worker. The image-only
+teacher disables video profiling and CUDA graphs, permits one request at a time,
+and sets `max_num_batched_tokens` to `VLM_MAX_MODEL_LEN` (4096 by default).
+`VLM_IMAGE_SIZE` (512 by default) controls input thumbnails and the pixel-area
+cap (`VLM_IMAGE_SIZE ** 2`) in both Qwen preprocessing and vLLM profiling.
+Eager execution reduces startup overhead but may reduce peak throughput.
+
+If startup reports **negative available KV cache memory**, lowering
+`VLM_GPU_MEMORY` makes that budget smaller, not larger. First check the log
+shows `video: 0`, `max_num_seqs: 1`, and `enforce_eager: True`. If still needed,
+try `VLM_GPU_MEMORY=0.80` only when sufficient memory remains for DINO and no
+unrelated jobs occupy the cards. Conversely, an error saying **free memory is
+less than desired utilization** requires freeing competing allocations or
+lowering the budget. Neither setting guarantees that all workloads fit.
+
+Triton also requires a system C compiler even with eager execution. On
+Ubuntu/Debian install `build-essential` (as root or with sudo), and optionally
+pass `CC=/usr/bin/gcc CXX=/usr/bin/g++` in the `nohup env` command. This is a
+system dependency, not a package in `requirements-vlm.txt`.
+
+A failed cache shard is append-only and resumable by rerunning with the same
+`BASE_CKPT`, teacher settings and `VLM_WORK_DIR`. Use a new work directory if
+changing teacher inputs after valid decisions have already been cached. The
+merged cache must cover at least 95% of source samples before distillation starts.
 
 To run the code, please download the pretrained weights and place them in the specified directories:
 
