@@ -76,9 +76,41 @@ python test.py --result_path $save_path --dataset $dataset
 bash test.sh
 ```
 
-### 4. DINO Single Tower + Qwen3-VL FP8 Teacher
+### 4. Restored Mainline: CLIP + DINO
 
-The deployed detector remains a language-free DINO single tower. During
+`run_exp.sh` now defaults to `BASE_ARCH=clip_dino` and runs the existing
+`train_mara_visa.sh` pipeline: original dual-tower base -> MARA -> target tests.
+This restores the architecture/entry point, not the exact numerical results of
+an old checkpoint. The base trainer, HFA and semantic-anchor defaults are unchanged.
+For strict reproduction, reuse the previously evaluated dual-tower checkpoint
+and match its data/preprocessing settings. Single-tower checkpoints are rejected.
+
+```bash
+# Train the original base, then MARA, then evaluate.
+nohup env BASE_ARCH=clip_dino RUN_BASE=1 RUN_MARA=1 RUN_TEST=1 \
+  RUN_VLM_CACHE=0 RUN_VLM_DISTILL=0 GPU_IDS=0,1 NPROC_PER_NODE=2 \
+  bash run_exp.sh > nohup_clip_dino_mara.out 2>&1 &
+
+# Prefer this for reproducing a known base (replace the checkpoint path).
+nohup env BASE_ARCH=clip_dino RUN_BASE=0 RUN_MARA=1 RUN_TEST=1 \
+  RUN_VLM_CACHE=0 RUN_VLM_DISTILL=0 \
+  BASE_CKPT=./checkpoint/base_visa_hfa3_xxx/ckpt/14.pth \
+  GPU_IDS=0,1 NPROC_PER_NODE=2 \
+  bash run_exp.sh > nohup_clip_dino_resume.out 2>&1 &
+```
+
+The original dual-tower **base trainer is single-GPU**, MARA uses two-GPU DDP,
+and evaluation distributes target datasets across GPUs. Do not launch the
+original `train.py` with torchrun: it does not implement DDP. Target checkpoint
+selection defaults to the final epoch, not the highest target-test score.
+
+VLM integration into the dual tower is **not implemented** yet. Old VLM flags
+on the default entry point fail explicitly instead of silently running the
+wrong architecture. See [dual-tower VLM feasibility and ablations](docs/dual_tower_vlm_plan.md).
+
+### 5. Retained Ablation: DINO Single Tower + Qwen3-VL FP8 Teacher
+
+In this explicitly selected ablation, the deployed detector is a language-free DINO single tower. During
 training only, two independent `Qwen3-VL-8B-Instruct-FP8` workers inspect the
 query, a same-category normal reference, the DINO heatmap, and proposed ROIs.
 Their JSON decisions are cached and distilled into a small semantic decision
@@ -97,7 +129,7 @@ conda activate qfg_addino
 # Base -> two FP8 cache workers -> semantic distillation -> MARA -> tests.
 nohup env GPU_IDS=0,1 NPROC_PER_NODE=2 \
   VLM_PYTHON=/root/miniconda3/envs/sra_vlm/bin/python \
-  bash run_exp.sh > nohup_dino_qwen3vl_mara.out 2>&1 &
+  bash run_exp_dino_single.sh > nohup_dino_qwen3vl_mara.out 2>&1 &
 ```
 
 The default protocol trains with labeled VisA source images and evaluates on
@@ -115,13 +147,14 @@ nohup env RUN_BASE=0 RUN_VLM_CACHE=0 \
   BASE_CKPT=./checkpoint/dino_single_visa_xxx/ckpt/single_epoch_14.pth \
   VLM_CACHE_PATH=./checkpoint/vlm_teacher_xxx/qwen3_vl_fp8_decisions.jsonl \
   GPU_IDS=0,1 NPROC_PER_NODE=2 \
-  bash run_exp.sh > nohup_resume_vlm_mara.out 2>&1 &
+  bash run_exp_dino_single.sh > nohup_resume_vlm_mara.out 2>&1 &
 
 # Skip the VLM route entirely and retain the original DINO-only baseline.
-RUN_VLM_CACHE=0 RUN_VLM_DISTILL=0 GPU_IDS=0,1 NPROC_PER_NODE=2 bash run_exp.sh
+RUN_VLM_CACHE=0 RUN_VLM_DISTILL=0 GPU_IDS=0,1 NPROC_PER_NODE=2 bash run_exp_dino_single.sh
 ```
 
-`run_exp.sh` defaults to 70% GPU allocation per VLM worker. The image-only
+Alternatively, `BASE_ARCH=dino_single bash run_exp.sh` selects this ablation.
+`run_exp_dino_single.sh` defaults to 70% GPU allocation per VLM worker. The image-only
 teacher disables video profiling and CUDA graphs, permits one request at a time,
 and sets `max_num_batched_tokens` to `VLM_MAX_MODEL_LEN` (4096 by default).
 `VLM_IMAGE_SIZE` (512 by default) controls input thumbnails and the pixel-area
