@@ -104,11 +104,75 @@ and evaluation distributes target datasets across GPUs. Do not launch the
 original `train.py` with torchrun: it does not implement DDP. Target checkpoint
 selection defaults to the final epoch, not the highest target-test score.
 
-VLM integration into the dual tower is **not implemented** yet. Old VLM flags
-on the default entry point fail explicitly instead of silently running the
-wrong architecture. See [dual-tower VLM feasibility and ablations](docs/dual_tower_vlm_plan.md).
+Dual-tower **direct VLM ROI review is now available** through the separate
+`run_exp_dual_vlm.sh` entry point below. Dual-tower VLM distillation/MARA integration
+is still not implemented. Old single-tower VLM flags on `run_exp.sh` fail explicitly.
+See [dual-tower VLM feasibility and ablations](docs/dual_tower_vlm_plan.md).
 
-### 5. Retained Ablation: DINO Single Tower + Qwen3-VL FP8 Teacher
+### 5. Dual Tower + VLM ROI Review (frozen-model pilot)
+
+This experiment does NOT retrain Base or the 8B VLM, and bypasses MARA. It first
+exports CLIP+DINO maps and four candidate ROIs per sample, exits all dual-tower
+workers, runs one image-only FP8 VLM per GPU on disjoint shards, then unloads
+the VLM and computes CPU metrics. Continue using the original training conda
+environment plus the isolated `sra_vlm` environment; no new model is needed.
+
+```bash
+conda activate qfg_addino
+nohup env \
+  BASE_CKPT=/mnt/qfg/Tate_qfg/SRA-DINO/checkpoint/base_visa_hfa3_20260908_225850/ckpt \
+  WORK_DIR=./checkpoint/dual_vlm_visa_pilot_v1 \
+  DATASETS=visa MAX_PER_CATEGORY=40 \
+  GPU_IDS=0,1 EXPORT_BS=4 \
+  VLM_PYTHON=/root/miniconda3/envs/sra_vlm/bin/python \
+  VLM_MODEL_ID=/mnt/qfg/Tate_qfg/models/Qwen3-VL-8B-Instruct-FP8 \
+  CC=/usr/bin/gcc CXX=/usr/bin/g++ \
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  VLM_GPU_MEMORY=0.70 VLM_IMAGE_SIZE=512 VLM_MAX_MODEL_LEN=4096 VLM_MAX_TOKENS=512 \
+  VLM_HEATMAP=0 CALIBRATION_ALPHA=0.5 VLM_CONFIDENCE_THRESHOLD=0.8 \
+  bash run_exp_dual_vlm.sh > nohup_dual_vlm_visa_pilot_v1.out 2>&1 &
+```
+
+- A checkpoint directory selects the highest **numeric** epoch filename and
+  prints the resolved path; a MARA or single-tower checkpoint is rejected.
+- The default pilot samples up to 40 images per VisA category with a fixed
+  seed. It is a development diagnostic, NOT independent validation if these
+  images were used to train Base. The sample is not selected by model score.
+- After fixing settings using appropriate source data, full target evaluation
+  uses the same command with `DATASETS="mvtec btad mpdd" MAX_PER_CATEGORY=0`
+  and **a new** `WORK_DIR=./checkpoint/dual_vlm_targets_v1` and log filename.
+  Do not tune calibration parameters on those target test results.
+- There are no normal-reference inputs. Query/source label-bearing paths and
+  GT masks are never placed in the VLM prompt. `VLM_HEATMAP=1` is a separate
+  hint ablation and requires a new work directory.
+- Confidence is an uncalibrated eligibility filter, NOT a calibrated defect
+  probability. Accepted votes modify ROI log-odds by at most `CALIBRATION_ALPHA`
+  with tapered edges. Uncertain, low-confidence or invalid reviews retain Base.
+- `results/metric_vlm.txt`, `metrics.csv`, and `metrics.json` compare `base`,
+  `vlm_image` (only the image score changes), `vlm_region` (ROI map and derived
+  image score change), and `control_shrink` (non-VLM ROI suppression).
+  Image scores are map maxima, matching `test_mara.py`; map normalization is
+  `none`. Best-F1 is a test-set reporting statistic, not a deployable threshold.
+- Results also report candidate pixel recall, decisive ROI accuracy/coverage,
+  mean query latency, invalid responses and FP/FN counts at a fixed diagnostic
+  threshold of 0.5. This is inference-time VLM usage even though results are cached;
+  do not report it as a VLM-free deployed detector.
+- Rerun the **same command** to resume atomically completed samples. A lock
+  prevents simultaneous use of one work directory; changed settings/weights
+  are rejected. `RUN_EXPORT=0` skips an already sealed export, `RUN_REVIEW=0`
+  skips an already complete review. No missing reviews are silently ignored;
+  more than 5% invalid responses fail evaluation by default.
+- Runtime settings are frozen in `config.json` before evaluation, with a Base
+  SHA256 and local VLM weight size/mtime signature. Do not edit cache files or
+  move/change source data during a run. Ensure disk space for full-resolution
+  probability maps, query PNGs and evaluation masks.
+
+GPU availability/CC/Triton checks run before export. Failed worker stages stop
+the pipeline; no later training stage starts. On interruption, verify the old
+workers have exited with `nvidia-smi` before restarting. Real dual-4090 FP8
+capacity/throughput must be checked on the server; CPU/mock tests do not establish it.
+
+### 6. Retained Ablation: DINO Single Tower + Qwen3-VL FP8 Teacher
 
 In this explicitly selected ablation, the deployed detector is a language-free DINO single tower. During
 training only, two independent `Qwen3-VL-8B-Instruct-FP8` workers inspect the

@@ -8,7 +8,8 @@
 - 一阶段语义锚点仍沿用原脚本按资源文件存在与否决定的默认设置。若做历史严格复现，必须固定权重、锚点配置、数据与预处理，而不能只依赖当前默认值。
 - 单塔/VLM 代码保存在 `run_exp_dino_single.sh`，可独立复现，不删除权重或实验结果。
 - 默认双塔拒绝单塔 checkpoint 和 VLM 阶段开关，防止旧命令误跑。
-- 尚未实现双塔 VLM 缓存/蒸馏，也没有新的真实 GPU 实验结果。
+- 已新增 `run_exp_dual_vlm.sh`：冻结双塔导出 → 双卡直接 VLM 区域复核 → 固定校准评估。
+- 该新入口实现下文 P1 的首版无参考实验，不经过 MARA；双塔 VLM 蒸馏仍未实现，也没有新的真实 GPU 实验结果。
 
 ## 为什么不是把现有 VLM 开关打开就行
 
@@ -16,7 +17,7 @@
 `tools/utils_up.py::get_anomaly_map` 已输出跨模态分层概率、正常/异常相似度、margin、awareness 和全局 margin。
 `tools/mara_evidence.py::build_mara_evidence` 可拼接语义图和语义全局向量，但双塔目前并不产生这些 VLM 语义值。
 
-现有 `build_vlm_decision_cache.py`、`train_vlm_distiller.py` 只创建 DINO 单塔检测器；
+旧 `build_vlm_decision_cache.py`、`train_vlm_distiller.py` 只创建 DINO 单塔检测器；
 `train_mara.py::apply_base_runtime_config` 也只对单塔语义头启用语义通道。
 接入双塔需要独立实现双塔 teacher-input 导出、学生头训练、checkpoint 存取和训练/测试一致的语义通道注册，不能只改一个架构字符串。
 
@@ -81,4 +82,4 @@
 - [Qwen3-VL-8B-Instruct-FP8 模型卡](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-FP8)：提供多模态模型和 vLLM 推理方法，不构成工业异常检测涨点保证。
 - [vLLM 0.11 显存控制](https://docs.vllm.ai/en/v0.11.0/configuration/conserving_memory.html)：并发、上下文、多模态输入和 CUDA Graph 的显存配置。
 
-结论：双塔后加入 VLM 在工程上可行，但应定位为“区域复核/校准教师”，先证明不依赖 MARA 的独立增益。本次只恢复双塔入口并分析方案，不自动实现上述新模块。
+结论：双塔后加入 VLM 在工程上可行，但应定位为“区域复核/校准教师”，先证明不依赖 MARA 的独立增益。当前已实现 P1 直接复核的独立入口；P2 蒸馏与 RL 接入仍须等待实验结果。
