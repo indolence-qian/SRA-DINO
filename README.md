@@ -109,6 +109,14 @@ Dual-tower **direct VLM ROI review is now available** through the separate
 is still not implemented. Old single-tower VLM flags on `run_exp.sh` fail explicitly.
 See [dual-tower VLM feasibility and ablations](docs/dual_tower_vlm_plan.md).
 
+**Small-defect local review (new):** use `bash run_exp_dual_vlm_local.sh` with
+the same dual-tower `BASE_CKPT`. It crops context/detail from the original image,
+reviews ONE candidate per VLM request, and only changes compact candidate masks.
+Default: enhancement only, at most 0.5% image area per candidate / 2% total;
+no Base/MARA retraining. Normal TRAIN references and suppression comparisons
+are opt-in. The old multi-ROI script stays available as a baseline.
+See [the local-review launch command, P0/P1 ablations and diagnostic definitions](docs/local_vlm_experiment.md).
+
 ### 5. Dual Tower + VLM ROI Review (frozen-model pilot)
 
 This experiment does NOT retrain Base or the 8B VLM, and bypasses MARA. It first

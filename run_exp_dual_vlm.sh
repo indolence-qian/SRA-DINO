@@ -66,6 +66,18 @@ if [[ "${RUN_REVIEW}" == 1 ]]; then
 fi
 HEATMAP_FLAG=()
 [[ "${VLM_HEATMAP}" == 0 ]] || HEATMAP_FLAG=(--heatmap)
+LOCAL_FLAGS=()
+if [[ "${LOCAL_REVIEW:-0}" == 1 ]]; then
+  LOCAL_FLAGS=(--local_review --local_candidates "${LOCAL_CANDIDATES:-6}"
+    --local_max_area "${LOCAL_MAX_AREA:-0.005}" --local_total_area "${LOCAL_TOTAL_AREA:-0.02}"
+    --local_min_probability "${LOCAL_MIN_PROBABILITY:-0.1}"
+    --local_input "${LOCAL_INPUT:-native}" --local_prompt "${LOCAL_PROMPT:-local}"
+    --reference_pool "${REFERENCE_POOL:-8}" --reference_distance "${REFERENCE_DISTANCE:-0.12}"
+    --suppress_alpha "${SUPPRESS_ALPHA:-0.1}" --conflict_threshold "${CONFLICT_THRESHOLD:-0.7}")
+  [[ "${NORMAL_REFERENCE:-0}" == 0 ]] || LOCAL_FLAGS+=(--normal_reference)
+  [[ "${INCLUDE_SUPPRESSION:-0}" == 0 ]] || LOCAL_FLAGS+=(--include_suppression)
+  echo "Small-defect review: ${LOCAL_INPUT:-native} crops, ${LOCAL_PROMPT:-local} prompt; default enhance only"
+fi
 "${TRAIN_PYTHON}" dual_vlm.py --stage prepare \
   --work_dir "${WORK_DIR}" --base_ckpt "${BASE_CKPT}" \
   --datasets "${DATASETS}" --max_per_category "${MAX_PER_CATEGORY}" \
@@ -82,7 +94,7 @@ HEATMAP_FLAG=()
   --dino_repo_dir "${DINO_REPO_DIR:-./dinov3}" --dino_model_name "${DINO_MODEL_NAME:-dinov3_vitl16}" \
   --dino_weights "${DINO_WEIGHTS:-./dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth}" \
   --clip_model_name "${CLIP_MODEL_NAME:-ViT-L-14-336}" --clip_pretrained "${CLIP_PRETRAINED:-openai}" \
-  --visual_layers "${VISUAL_LAYERS:-5,11,17,23}" "${HEATMAP_FLAG[@]}"
+  --visual_layers "${VISUAL_LAYERS:-5,11,17,23}" "${HEATMAP_FLAG[@]}" "${LOCAL_FLAGS[@]}"
 
 PIDS=()
 cleanup() {

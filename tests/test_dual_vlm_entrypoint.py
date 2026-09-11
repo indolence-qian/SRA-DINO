@@ -78,6 +78,28 @@ class DualVLMEntrypointTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("BASE_CKPT", result.stderr)
 
+    def test_local_flags_preserve_stage_order_and_default_enhance_only(self):
+        shutil.copyfile(ROOT / "run_exp_dual_vlm_local.sh", self.root / "run.sh")
+        shutil.copyfile(ROOT / "run_exp_dual_vlm.sh", self.root / "run_exp_dual_vlm.sh")
+        result = self.run_script(NORMAL_REFERENCE="0", INCLUDE_SUPPRESSION="0")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        out = result.stdout
+        self.assertIn("--local_review", out)
+        self.assertIn("--local_input native", out)
+        self.assertIn("--alpha 0.25", out)
+        self.assertNotIn("--include_suppression", out)
+        self.assertNotIn("--normal_reference", out)
+        self.assertLess(out.rindex("STAGE=export"), out.index("STAGE=review"))
+        self.assertLess(out.rindex("STAGE=review"), out.index("STAGE=evaluate"))
+
+    def test_local_reference_and_input_ablation_flags(self):
+        result = self.run_script(LOCAL_REVIEW="1", NORMAL_REFERENCE="1", INCLUDE_SUPPRESSION="1", LOCAL_INPUT="resized", LOCAL_PROMPT="generic")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("--normal_reference", result.stdout)
+        self.assertIn("--include_suppression", result.stdout)
+        self.assertIn("--local_input resized", result.stdout)
+        self.assertIn("--local_prompt generic", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

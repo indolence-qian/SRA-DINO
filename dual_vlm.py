@@ -90,6 +90,8 @@ def prepare(args):
     cfg.update(protocol=PROTOCOL, base_ckpt=str(base), base_sha256=file_digest(base),
                model=model_signature(args.model_id), image_score="max_pixel_probability",
                label_policy="evaluation_only", normalization="none")
+    from tools.local_vlm_pipeline import add_config
+    add_config(args, cfg)
     path = Path(args.work_dir) / "config.json"
     if path.exists() and load_json(path) != cfg:
         raise ValueError("Work directory belongs to different settings/weights. Use a NEW WORK_DIR; nothing was overwritten.")
@@ -101,7 +103,8 @@ def prepare(args):
 
 def config(args):
     cfg = load_json(Path(args.work_dir) / "config.json")
-    if cfg["protocol"] != PROTOCOL:
+    from tools.local_vlm_review import PROTOCOL as LOCAL_PROTOCOL
+    if cfg["protocol"] not in (PROTOCOL, LOCAL_PROTOCOL):
         raise ValueError("Unknown export protocol")
     return cfg
 
@@ -204,7 +207,8 @@ def export(args):
                     record = load_json(record_path)
                     if record["fingerprint"] != fingerprint or record.get("source_token") != source_token:
                         raise ValueError("Stale export record or changed source data; use a new WORK_DIR")
-                    if all((root / record[k]).is_file() for k in ("query", "evidence", "evaluation")):
+                    assets = [record[k] for k in ("query", "evidence", "evaluation")] + record.get("local_assets", [])
+                    if all((root / path).is_file() for path in assets):
                         records.append(record)
                         continue
                 pending.append((idx, ident, source_token))
@@ -226,7 +230,7 @@ def export(args):
                 for pos, (idx, ident, source_token) in enumerate(group):
                     prob = base[pos, 1].cpu().numpy().astype(np.float32)
                     dis = disagreement[pos].cpu().numpy().astype(np.float32)
-                    rois = candidate_rois(prob, dis, seed=int(ident[:8], 16), fraction=cfg["roi_fraction"])
+                    rois = [] if cfg.get("local_review") else candidate_rois(prob, dis, seed=int(ident[:8], 16), fraction=cfg["roi_fraction"])
                     # Reconstruct exactly the tensor geometry seen by the detector.
                     img = batch["image"][pos].cpu().numpy().transpose(1, 2, 0)
                     rgb = np.rint(np.clip(img * [0.229, 0.224, 0.225] + [0.485, 0.456, 0.406], 0, 1) * 255).astype(np.uint8)
@@ -241,6 +245,9 @@ def export(args):
                     atomic_npz(root / record["evaluation"], mask=masks[pos, 0].cpu().numpy().astype(np.uint8),
                                label=np.array(int(batch["is_anomaly"][pos])),
                                global_logits=global_logits[pos].cpu().numpy())
+                    if cfg.get("local_review"):
+                        from tools.local_vlm_pipeline import export_local
+                        export_local(root, record, prob, dis, dataset.data_to_iterate[idx][2], cfg)
                     atomic_json(root / "records" / f"{ident}.json", record)
                     records.append(record)
                 print(f"[export shard {args.shard_id}] {dataset_name}/{category} {min(start + len(group), len(pending))}/{len(pending)}", flush=True)
@@ -294,6 +301,9 @@ def build_review_images(root, record, cfg):
 
 
 def review(args):
+    if config(args).get("local_review"):
+        from tools.local_vlm_pipeline import review as local_review
+        return local_review(args)
     from tools.vlm_decision import QwenVLLMTeacher
     cfg, root, records = manifest(args)
     if not 0 <= args.shard_id < cfg["num_shards"]:
@@ -335,6 +345,9 @@ def review(args):
 
 
 def evaluate(args):
+    if config(args).get("local_review"):
+        from tools.local_vlm_pipeline import evaluate as local_evaluate
+        return local_evaluate(args)
     from test2 import compute_best_f1, compute_i_auroc, compute_p_auroc, compute_pro
     cfg, root, records = manifest(args)
     reviews, invalid = {}, 0
@@ -475,6 +488,19 @@ def parser():
     p.add_argument("--clip_model_name", default="ViT-L-14-336")
     p.add_argument("--clip_pretrained", default="openai")
     p.add_argument("--visual_layers", default="5,11,17,23")
+    p.add_argument("--local_review", action="store_true")
+    p.add_argument("--local_candidates", type=int, default=6)
+    p.add_argument("--local_max_area", type=float, default=0.005)
+    p.add_argument("--local_total_area", type=float, default=0.02)
+    p.add_argument("--local_min_probability", type=float, default=0.1)
+    p.add_argument("--local_input", choices=("native", "resized"), default="native")
+    p.add_argument("--local_prompt", choices=("local", "generic"), default="local")
+    p.add_argument("--normal_reference", action="store_true")
+    p.add_argument("--reference_pool", type=int, default=8)
+    p.add_argument("--reference_distance", type=float, default=0.12)
+    p.add_argument("--include_suppression", action="store_true")
+    p.add_argument("--suppress_alpha", type=float, default=0.1)
+    p.add_argument("--conflict_threshold", type=float, default=0.7)
     return p
 
 
