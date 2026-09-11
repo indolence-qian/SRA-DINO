@@ -256,18 +256,21 @@ class QwenVLLMTeacher:
         max_tokens: int = 192,
         max_images: int = 8,
         teacher_image_size: int = 512,
+        min_pixels: int = 32 * 32,
     ) -> None:
         if int(teacher_image_size) < 32:
             raise ValueError("teacher_image_size must be at least 32 pixels.")
         if int(max_images) < 1:
             raise ValueError("max_images must be positive.")
+        if not 32 * 32 <= int(min_pixels) <= int(teacher_image_size) ** 2:
+            raise ValueError("Require 1024 <= min_pixels <= teacher_image_size ** 2")
         if not 0 < int(max_tokens) < int(max_model_len):
             raise ValueError("Require 0 < max_tokens < max_model_len.")
         self._max_images = int(max_images)
         # Cap engine profiling as well as real requests. Resizing PIL images
         # alone does not constrain vLLM's synthetic multimodal warmup inputs.
         self._mm_processor_kwargs = {
-            "min_pixels": 32 * 32,
+            "min_pixels": int(min_pixels),
             "max_pixels": int(teacher_image_size) ** 2,
         }
         # Qwen's official offline-vLLM example uses spawn.  Cache generation
@@ -312,7 +315,7 @@ class QwenVLLMTeacher:
         content.append({"type": "text", "text": prompt})
         return [{"role": "user", "content": content}]
 
-    def generate(self, prompt: str, images: Sequence[Image.Image]) -> str:
+    def generate(self, prompt: str, images: Sequence[Image.Image], trace_dir=None) -> str:
         if not 1 <= len(images) <= self._max_images:
             raise ValueError(f"Require 1..{self._max_images} images per teacher request.")
         messages = self._messages(prompt, images)
@@ -340,5 +343,44 @@ class QwenVLLMTeacher:
             "multi_modal_data": multi_modal_data,
             "mm_processor_kwargs": {**(video_kwargs or {}), **self._mm_processor_kwargs},
         }
+        # Opt-in diagnostics only. The production path and default pixel budget
+        # remain unchanged. This CPU processor probe is NOT engine telemetry.
+        trace = None
+        if trace_dir is not None:
+            from pathlib import Path
+            from tools.vlm_review import atomic_json, file_digest
+            trace_dir = Path(trace_dir)
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            processed = list(image_inputs or [])
+            if len(processed) != len(images) or not all(isinstance(im, Image.Image) for im in processed):
+                raise RuntimeError("Diagnostic image path did not produce one PIL image per input")
+            probe = self._processor.image_processor(
+                images=processed, return_tensors="pt", **self._mm_processor_kwargs
+            )
+            grid = probe["image_grid_thw"].tolist()
+            merge = int(self._processor.image_processor.merge_size)
+            patch = int(self._processor.image_processor.patch_size)
+            saved = []
+            for index, im in enumerate(processed):
+                path = trace_dir / f"post_vision_{index}.png"
+                im.save(path, format="PNG")
+                saved.append({"file": path.name, "sha256": file_digest(path)})
+            trace = dict(input_sizes=[list(im.size) for im in images],
+                         post_vision_sizes=[list(im.size) for im in processed],
+                         processor_probe_grid_thw=grid, patch_size=patch, merge_size=merge,
+                         processor_probe_tokens=[int(t*h*w // (merge*merge)) for t, h, w in grid],
+                         processor_probe_sizes=[[w*patch, h*patch] for _, h, w in grid],
+                         pixel_budget=self._mm_processor_kwargs.copy(), processed_images=saved,
+                         prompt=prompt, rendered_prompt=prompt_text,
+                         note="Grid/tokens are an equivalent CPU processor probe, not measured vLLM internal telemetry.")
+            del probe
         output = self._llm.generate([request], sampling_params=self._sampling, use_tqdm=False)
+        if trace is not None:
+            result = output[0].outputs[0]
+            trace.update(finish_reason=getattr(result, "finish_reason", None),
+                         stop_reason=str(getattr(result, "stop_reason", None)),
+                         output_tokens=len(getattr(result, "token_ids", [])),
+                         engine_prompt_tokens=len(getattr(output[0], "prompt_token_ids", []) or []),
+                         raw_response=result.text)
+            atomic_json(trace_dir / "trace.json", trace)
         return output[0].outputs[0].text

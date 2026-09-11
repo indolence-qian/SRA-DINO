@@ -79,9 +79,30 @@ class VLMDecisionTests(unittest.TestCase):
         for kwargs in (
             {"teacher_image_size": 0}, {"max_images": 0},
             {"max_tokens": 4096}, {"max_tokens": 0},
+            {"min_pixels": 0}, {"min_pixels": 512**2+1},
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 QwenVLLMTeacher(**kwargs)
+
+    def test_diagnostic_budget_and_trace_are_opt_in(self):
+        from pathlib import Path
+        import tempfile
+        import json
+        teacher, llm, vision = self.make_teacher(min_pixels=65536)
+        image = Image.new("RGB", (256,256))
+        vision.return_value = ([image], None, {})
+        teacher._processor.image_processor.merge_size = 2
+        teacher._processor.image_processor.return_value = {"image_grid_thw": torch.tensor([[1,16,16]])}
+        with tempfile.TemporaryDirectory() as folder:
+            teacher.generate("inspect", [Image.new("RGB", (8,8))], trace_dir=folder)
+            trace = json.loads((Path(folder)/"trace.json").read_text())
+            self.assertEqual(trace["input_sizes"], [[8,8]])
+            self.assertEqual(trace["post_vision_sizes"], [[256,256]])
+            self.assertEqual(trace["processor_probe_tokens"], [64])
+            self.assertEqual(trace["pixel_budget"]["min_pixels"], 65536)
+            self.assertTrue((Path(folder)/"post_vision_0.png").exists())
+        request = llm.return_value.generate.call_args.args[0][0]
+        self.assertEqual(request["mm_processor_kwargs"]["min_pixels"], 65536)
 
     def test_teacher_rejects_empty_or_excess_images(self):
         teacher, llm, vision = self.make_teacher(max_images=1)

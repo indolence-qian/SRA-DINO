@@ -168,3 +168,11 @@ Do not interpret `invalid=0` as correct decisions. If no eligible candidates
 exist, VLM is skipped and all outputs equal Base; `no_candidate_images` makes
 this explicit. No improvement is promised: compare candidate recall, teacher
 errors, small-component hits and the no-VLM control before adding complexity.
+
+## Diagnose near-total abstention before changing the detector
+
+Use `run_exp_vlm_diagnose.sh` to reuse this sealed export for paired original /
+neutral-prompt / larger-minimum-pixel-budget / combined reviews. It records
+input geometry, processed images, processor token probes, raw answers and
+pixel effects in a separate directory, without Base/MARA training. See
+[the diagnostic protocol and nohup command](vlm_diagnosis.md).
