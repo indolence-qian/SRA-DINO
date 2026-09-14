@@ -31,6 +31,37 @@ def add_config(args, cfg):
                geometry="direct_resize_same_size_center_crop", component_area_bins=[0.001, 0.01],
                diagnostic_pixel_threshold=0.5, diagnostic_component_hit_fraction=0.1)
     cfg["reference_bank"] = reference_bank(cfg) if args.normal_reference else {}
+    if (args.local_parser != "legacy" or args.local_prompt == "repaired" or args.local_context_factor != 4.0
+            or args.local_context_minimum != 32 or args.local_teacher_min_pixels != 1024 or args.reference_structure_min != 0):
+        if (not 1.5 <= args.local_context_factor <= 16 or not 8 <= args.local_context_minimum <= cfg["image_size"]
+                or not 1024 <= args.local_teacher_min_pixels <= cfg["teacher_image_size"]**2
+                or not 0 <= args.reference_structure_min <= 1):
+            raise ValueError("Invalid observation/reference budget")
+        cfg.update({k: getattr(args, k) for k in ("local_parser", "local_context_factor", "local_context_minimum",
+                                                 "local_teacher_min_pixels", "reference_structure_min")})
+        cfg["local_code_hashes"] = {p: file_digest(Path(__file__).resolve().parent.parent / p) for p in
+                                    ("tools/local_vlm_protocol.py", "tools/local_vlm_pipeline.py", "tools/local_vlm_review.py")}
+
+
+def crop_options(cfg):
+    return dict(context_factor=cfg.get("local_context_factor", 4.0), context_minimum=cfg.get("local_context_minimum", 32))
+
+
+def structure_similarity(a, b):
+    # Gradient cosine is a conservative prefilter, NOT semantic registration.
+    def edges(image):
+        gray = np.asarray(image.convert("L").resize((32,32)), np.float32)
+        return np.concatenate([x.ravel() for x in np.gradient(gray)])
+    x, y = edges(a), edges(b)
+    denom = float(np.linalg.norm(x)*np.linalg.norm(y))
+    return float(np.clip(np.dot(x,y)/denom, -1, 1)) if denom > 1e-6 else 0.0
+
+
+def parse_vote(raw, candidate, cfg):
+    if cfg.get("local_parser") == "repair_v2":
+        from tools.local_vlm_protocol import parse_repaired
+        return parse_repaired(raw, candidate["roi_id"], "reference" in candidate)
+    return parse_local(raw, candidate["roi_id"], "reference" in candidate), {}
 
 
 def reference_bank(cfg):
@@ -72,7 +103,9 @@ def select_reference(cfg, record, candidate, query_source, context, shape):
             raise ValueError("Normal reference changed since prepare; use a new WORK_DIR")
         with Image.open(path) as image:
             crops, _ = native_crops(image.convert("RGB"), candidate["box"], shape, cfg["teacher_image_size"],
-                                    cfg["local_input"] == "resized")
+                                    cfg["local_input"] == "resized", **crop_options(cfg))
+        if cfg.get("reference_structure_min", 0) > 0 and structure_similarity(context, crops[0]) < cfg["reference_structure_min"]:
+            continue
         distance = float(np.abs(descriptor(context) - descriptor(crops[0])).mean())
         if distance <= cfg["reference_distance"] and (best is None or distance < best[0]):
             best = distance, crops[1], entry
@@ -90,7 +123,7 @@ def export_local(root, record, base, disagreement, source, cfg):
         raw = image.convert("RGB")
     for candidate in candidates:
         images, geometry = native_crops(raw, candidate["box"], base.shape, cfg["teacher_image_size"],
-                                        cfg["local_input"] == "resized")
+                                        cfg["local_input"] == "resized", **crop_options(cfg))
         prefix = f"local_crops/{record['id']}_{candidate['roi_id']}"
         candidate.update(context=prefix+"_context.png", detail=prefix+"_detail.png", geometry=geometry)
         atomic_image(root / candidate["context"], np.asarray(images[0]))
@@ -116,7 +149,7 @@ def check_cached(payload, cfg, record, candidate):
     value = dict(payload["decision"])
     expected = value.pop("parse_ok")
     import json
-    parsed = parse_local(json.dumps(value), candidate["roi_id"], "reference" in candidate)
+    parsed = parse_local(json.dumps(value), candidate["roi_id"], "reference" in candidate, policy=cfg.get("local_parser", "legacy"))
     if bool(expected) != parsed["parse_ok"]:
         raise ValueError("Local cached decision schema is inconsistent")
     return payload
@@ -140,7 +173,8 @@ def review(args):
         return
     teacher = QwenVLLMTeacher(model_id=cfg["model"]["path"], gpu_memory_utilization=cfg["gpu_memory"],
                              max_model_len=cfg["max_model_len"], max_tokens=cfg["max_tokens"],
-                             max_images=3, teacher_image_size=cfg["teacher_image_size"])
+                             max_images=3, teacher_image_size=cfg["teacher_image_size"],
+                             min_pixels=cfg.get("local_teacher_min_pixels", 1024))
     for i, (record, candidate) in enumerate(pending):
         images = []
         for key in ("context", "detail", "reference"):
@@ -149,16 +183,19 @@ def review(args):
                     images.append(image.convert("RGB"))
         prompt = local_prompt(record["category"], candidate["roi_id"], "reference" in candidate,
                               cfg["local_prompt"] == "generic")
+        if cfg["local_prompt"] == "repaired":
+            from tools.local_vlm_protocol import repaired_prompt
+            prompt = repaired_prompt(record["category"], candidate["roi_id"], "reference" in candidate)
         started, responses = time.monotonic(), []
         for attempt in range(cfg["retries"]+1):
             raw = teacher.generate(prompt + (" Previous JSON was invalid; return all required fields." if attempt else ""), images)
             responses.append(raw)
-            decision = parse_local(raw, candidate["roi_id"], "reference" in candidate)
+            decision, audit = parse_vote(raw, candidate, cfg)
             if decision["parse_ok"]:
                 break
         atomic_json(review_path(root, record, candidate), {"fingerprint": digest(cfg), "id": record["id"],
                     "candidate_id": candidate["roi_id"], "decision": decision, "raw_responses": responses,
-                    "seconds": time.monotonic()-started})
+                    "seconds": time.monotonic()-started, **audit})
         print(f"[local review {args.shard_id}] {i+1}/{len(pending)} {decision['verdict']} valid={decision['parse_ok']}", flush=True)
 
 
@@ -224,7 +261,10 @@ def evaluate(args):
                                   "verdict": vote["verdict"], "visibility": vote["visibility"], "proposed_action": choice,
                                   "reference_match": vote["reference_match"], "gt_contains_defect": gt,
                                   "context_crop": candidate["context"], "detail_crop": candidate["detail"],
-                                  "evidence": vote["evidence"]})
+                                  "evidence": vote["evidence"],
+                                  "parser_policy": cfg.get("local_parser", "legacy"),
+                                  "parse_errors": ";".join(entries[candidate["roi_id"]-1].get("parse_errors", [])),
+                                  "parse_warnings": ";".join(entries[candidate["roi_id"]-1].get("parse_warnings", []))})
             for mode in modes:
                 updated = base if mode == "base" else calibrate_local(base, supports, votes, mode, cfg["alpha"],
                                             cfg["suppress_alpha"], cfg["conflict_threshold"])

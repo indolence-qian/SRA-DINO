@@ -20,7 +20,7 @@ from tools.vlm_review import atomic_json, digest, file_digest, load_json
 PROTOCOL = "local_vlm_diagnosis_v1"
 VARIANTS = {"A_original": (False, False), "B_prompt": (True, False),
             "C_pixels": (False, True), "D_prompt_pixels": (True, True)}
-CODE_FILES = ("vlm_diagnose.py", "tools/vlm_decision.py", "tools/local_vlm_review.py", "tools/vlm_review.py")
+CODE_FILES = ("vlm_diagnose.py", "tools/vlm_decision.py", "tools/local_vlm_review.py", "tools/vlm_review.py", "tools/local_vlm_protocol.py")
 
 
 def neutral_prompt(category, candidate_id, reference=False):
@@ -241,7 +241,8 @@ def validate_review(path, cfg):
         if payload.get("key") != path.stem or payload.get("variant") != path.parent.name:
             raise ValueError(f"Mismatched candidate/arm: {path}")
         candidate = next(c for r,c in entries(cfg) if key(r,c) == path.stem)
-        reparsed = parse_local(payload["raw_responses"][-1], candidate["roi_id"], "reference" in candidate)
+        reparsed = parse_local(payload["raw_responses"][-1], candidate["roi_id"], "reference" in candidate,
+                               policy=cfg.get("parser_policy", "legacy"))
         if reparsed != payload["decision"]:
             raise ValueError(f"Stored decision differs from raw response: {path}")
     for relative, expected in payload["trace_hashes"].items():
@@ -254,6 +255,8 @@ def review(args):
     from tools.vlm_decision import QwenVLLMTeacher
     from dual_vlm import model_signature
     cfg, out = load_config(args), Path(args.work_dir)
+    if cfg.get("reparse_source"):
+        raise ValueError("Offline replay outputs cannot start new reviews; use a new diagnostic experiment")
     if model_signature(cfg["model"]["path"]) != cfg["model"]:
         raise ValueError("Model files changed; use NEW WORK_DIR")
     if not 0 <= args.shard_id < cfg["num_shards"]:
@@ -436,6 +439,8 @@ def evaluate(args):
                           input_sizes=str(trace["input_sizes"]), post_vision_sizes=str(trace["post_vision_sizes"]),
                           probe_tokens=str(trace["processor_probe_tokens"]), finish_reason=trace["finish_reason"],
                           output_tokens=trace["output_tokens"], seconds=payload["seconds"])
+            detail.update(parse_errors=";".join(payload.get("parse_errors", [])),
+                          parse_warnings=";".join(payload.get("parse_warnings", [])))
             details.append(detail)
         n = counts["candidates"]
         for name in ("enhance", "suppress", "keep"):

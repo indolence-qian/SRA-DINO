@@ -85,7 +85,7 @@ def small_candidates(base, disagreement, max_candidates=6, max_area_fraction=0.0
     return result, np.stack(supports) if supports else np.zeros((0, h, w), dtype=bool)
 
 
-def raw_boxes(box, detector_shape, raw_size):
+def raw_boxes(box, detector_shape, raw_size, context_factor=4.0, context_minimum=32):
     """Dataset export uses direct square resize with same-size center crop.
 
     Map pixel *edges* using independent x/y scales, then crop native RGB before
@@ -101,13 +101,16 @@ def raw_boxes(box, detector_shape, raw_size):
         bw, bh = max((x2-x1)*factor, minimum), max((y2-y1)*factor, minimum)
         return [max(0, int(np.floor((cx-bw/2)*rw/w))), max(0, int(np.floor((cy-bh/2)*rh/h))),
                 min(rw, int(np.ceil((cx+bw/2)*rw/w))), min(rh, int(np.ceil((cy+bh/2)*rh/h)))]
-    return expand(1.5, 8), expand(4.0, 32)
+    if context_factor < 1.5 or context_minimum < 8:
+        raise ValueError("Context must contain the detail window")
+    return expand(1.5, 8), expand(context_factor, context_minimum)
 
 
-def native_crops(raw, box, detector_shape, image_limit=512, resized_ablation=False):
+def native_crops(raw, box, detector_shape, image_limit=512, resized_ablation=False,
+                 context_factor=4.0, context_minimum=32):
     if resized_ablation:
         raw = raw.resize((detector_shape[1], detector_shape[0]), Image.Resampling.BICUBIC)
-    tight, context = raw_boxes(box, detector_shape, raw.size)
+    tight, context = raw_boxes(box, detector_shape, raw.size, context_factor, context_minimum)
     images = [raw.crop(tuple(context)), raw.crop(tuple(tight))]
     for image in images:
         image.thumbnail((image_limit, image_limit), Image.Resampling.LANCZOS)
@@ -137,7 +140,12 @@ def local_prompt(category, candidate_id, reference=False, generic=False):
             "reference_match: matched/unmatched/unavailable. Do not invent numeric confidence.")
 
 
-def parse_local(text, candidate_id, reference=False):
+def parse_local(text, candidate_id, reference=False, policy="legacy"):
+    if policy == "repair_v2":
+        from tools.local_vlm_protocol import parse_repaired
+        return parse_repaired(text, candidate_id, reference)[0]
+    if policy != "legacy":
+        raise ValueError("Unknown parser policy")
     fallback = {"parse_ok": False, "candidate_id": candidate_id, "verdict": "insufficient_evidence",
                 "visibility": "insufficient", "reference_match": "unavailable", "evidence": "", "defect_type": "unknown"}
     try:

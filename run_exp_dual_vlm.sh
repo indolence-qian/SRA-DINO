@@ -72,6 +72,9 @@ if [[ "${LOCAL_REVIEW:-0}" == 1 ]]; then
     --local_max_area "${LOCAL_MAX_AREA:-0.005}" --local_total_area "${LOCAL_TOTAL_AREA:-0.02}"
     --local_min_probability "${LOCAL_MIN_PROBABILITY:-0.1}"
     --local_input "${LOCAL_INPUT:-native}" --local_prompt "${LOCAL_PROMPT:-local}"
+    --local_parser "${LOCAL_PARSER:-legacy}" --local_context_factor "${LOCAL_CONTEXT_FACTOR:-4}"
+    --local_context_minimum "${LOCAL_CONTEXT_MINIMUM:-32}" --local_teacher_min_pixels "${LOCAL_TEACHER_MIN_PIXELS:-1024}"
+    --reference_structure_min "${REFERENCE_STRUCTURE_MIN:-0}"
     --reference_pool "${REFERENCE_POOL:-8}" --reference_distance "${REFERENCE_DISTANCE:-0.12}"
     --suppress_alpha "${SUPPRESS_ALPHA:-0.1}" --conflict_threshold "${CONFLICT_THRESHOLD:-0.7}")
   [[ "${NORMAL_REFERENCE:-0}" == 0 ]] || LOCAL_FLAGS+=(--normal_reference)

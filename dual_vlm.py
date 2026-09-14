@@ -106,6 +106,9 @@ def config(args):
     from tools.local_vlm_review import PROTOCOL as LOCAL_PROTOCOL
     if cfg["protocol"] not in (PROTOCOL, LOCAL_PROTOCOL):
         raise ValueError("Unknown export protocol")
+    for relative, expected in cfg.get("local_code_hashes", {}).items():
+        if file_digest(Path(__file__).resolve().parent / relative) != expected:
+            raise ValueError("Local review code changed; use NEW WORK_DIR")
     return cfg
 
 
@@ -494,7 +497,12 @@ def parser():
     p.add_argument("--local_total_area", type=float, default=0.02)
     p.add_argument("--local_min_probability", type=float, default=0.1)
     p.add_argument("--local_input", choices=("native", "resized"), default="native")
-    p.add_argument("--local_prompt", choices=("local", "generic"), default="local")
+    p.add_argument("--local_prompt", choices=("local", "generic", "repaired"), default="local")
+    p.add_argument("--local_parser", choices=("legacy", "repair_v2"), default="legacy")
+    p.add_argument("--local_context_factor", type=float, default=4.0)
+    p.add_argument("--local_context_minimum", type=int, default=32)
+    p.add_argument("--local_teacher_min_pixels", type=int, default=1024)
+    p.add_argument("--reference_structure_min", type=float, default=0.0)
     p.add_argument("--normal_reference", action="store_true")
     p.add_argument("--reference_pool", type=int, default=8)
     p.add_argument("--reference_distance", type=float, default=0.12)
