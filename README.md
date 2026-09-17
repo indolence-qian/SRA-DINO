@@ -259,6 +259,15 @@ To run the code, please download the pretrained weights and place them in the sp
 | **Meta AI DINOv3 (vitl16_pretrain_lvd)** | [🔗 DINOv3 Official Weights](https://github.com/facebookresearch/dinov3) | `./` *(project root)* |
 
 
+## Upstream local-semantic localization experiment
+
+`run_exp_upstream_localization.sh` trains **new dense localization heads** on
+frozen CLIP+DINO features, with and without full-coverage local VLM descriptions.
+It preserves the old Base and fixed downstream-review experiments and does not
+run MARA. The default is supervised VisA-source training and held-out MVTec
+evaluation, not unsupervised VisA training. See
+[the protocol, two-GPU nohup command and result guide](docs/upstream_localization.md).
+
 ## Citation
 If you use this work, please cite:
 ```
