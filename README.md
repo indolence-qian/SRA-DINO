@@ -261,6 +261,11 @@ To run the code, please download the pretrained weights and place them in the sp
 
 ## Upstream local-semantic localization experiment
 
+**P0+P1 repair:** `run_exp_upstream_repair.sh` reuses the sealed v1 cache read-only,
+diagnoses probability-floor damage, and trains constrained heads with source-only
+selection and an explicit Base fallback. No VLM regeneration is needed. See
+[the P0+P1 protocol and two-GPU command](docs/upstream_P0_P1.md).
+
 `run_exp_upstream_localization.sh` trains **new dense localization heads** on
 frozen CLIP+DINO features, with and without full-coverage local VLM descriptions.
 It preserves the old Base and fixed downstream-review experiments and does not
