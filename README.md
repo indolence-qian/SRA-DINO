@@ -104,6 +104,22 @@ and evaluation distributes target datasets across GPUs. Do not launch the
 original `train.py` with torchrun: it does not implement DDP. Target checkpoint
 selection defaults to the final epoch, not the highest target-test score.
 
+### Frozen MARA early-stop diagnosis (A/B)
+
+Use run_exp_mara_diagnose.sh with ONE explicit MARA checkpoint file:
+
+    nohup env MARA_CKPT=./checkpoint/YOUR_MARA_RUN/ckpt/mara_epoch_029.pth \
+      GPU_IDS=0,1 WORK_DIR=./checkpoint/mara_early_stop_ab_v1 \
+      bash run_exp_mara_diagnose.sh > nohup_mara_early_stop_ab.out 2>&1 &
+
+Experiment A records actions, quality components, costs, discounted returns,
+STOP/inactive output drift and frozen-checkpoint policy-gradient probes.
+Experiment B pairs D0-D3 (normal/forced continuation x original/bypassed gain
+acceptance). Spatial fusion gates remain intact. Base evidence is exported once
+per image and reused by all arms; there is no retraining, VLM call, target
+checkpoint selection or automatic production STOP fix. Results are diagnostic.
+See [protocol, outputs and resume settings](docs/mara_early_stop_ab.md).
+
 Dual-tower **direct VLM ROI review is now available** through the separate
 `run_exp_dual_vlm.sh` entry point below. Dual-tower VLM distillation/MARA integration
 is still not implemented. Old single-tower VLM flags on `run_exp.sh` fail explicitly.

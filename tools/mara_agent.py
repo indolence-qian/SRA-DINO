@@ -471,6 +471,10 @@ class MARAAgent(nn.Module):
             "layer_action": layer_action,
             "op_action": op_action,
             "op_logits": op_logits,
+            # Diagnostic logits only; these do not change actions or training.
+            "region_logits": region_logits,
+            "layer_logits": layer_logits,
+            "box_features": box_features,
             "logprob": logprob,
             "entropy": entropy,
         }
