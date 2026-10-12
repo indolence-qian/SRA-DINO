@@ -249,6 +249,16 @@ def cache_ready(root, record, signature):
     return True
 
 
+def base_export_runtime(runtime_config):
+    # The shared evaluator also accepts CLI gate overrides. Export must leave
+    # them neutral so the checkpoint's production settings are not changed.
+    # Add them here, not to config.json, so already prepared runs remain usable.
+    return argparse.Namespace(**dict(
+        runtime_config, gain_safety_margin=None, gain_accept_probability=None,
+        disable_hard_gain_gate=False,
+    ))
+
+
 def export(args):
     root, cfg, manifest, signature = load_work(args.work_dir)
     assigned = [r for r in manifest if r["shard"] == args.shard_id]
@@ -271,7 +281,7 @@ def export(args):
     payload = load_torch(cfg["mara_ckpt"])
     # Allow explicitly recorded file relocation, not an architecture change.
     payload = dict(payload, **{k: cfg["runtime"][k] for k in ("dino_repo_dir", "dino_weights")})
-    runtime = argparse.Namespace(**cfg["runtime"])
+    runtime = base_export_runtime(cfg["runtime"])
     device = torch.device(args.device)
     models = build_models_from_checkpoint(runtime, device, payload)
     clip, prompts, dino, dino_adapters, model, agent, single = models

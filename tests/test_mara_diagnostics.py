@@ -1,3 +1,4 @@
+import ast
 import copy
 from dataclasses import asdict, replace
 import json
@@ -7,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import types
+from typing import Dict, Optional, Tuple
 import unittest
 from unittest.mock import patch
 
@@ -16,6 +18,11 @@ import torch
 
 import mara_diagnose as entry
 from tools.mara_agent import MARAAgent, MARAConfig, _discounted_returns, quality_score
+from tools.dino_single_tower import (
+    SEMANTIC_SPATIAL_CHANNELS, DinoSingleTowerDetector,
+    config_from_checkpoint as single_tower_config_from_checkpoint,
+    semantic_global_dim,
+)
 from tools.mara_diagnostics import (
     ARMS, PROTOCOL, binary_metrics, checkpoint_config, gradient_probe,
     map_metrics, quality_parts, sampled_pro, score_trace, select_indices,
@@ -24,6 +31,56 @@ from tools.mara_diagnostics import (
 
 torch.set_num_threads(1)
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def source_functions(module, filename, names):
+    """Execute the actual loader functions without unrelated optional imports."""
+    tree = ast.parse((ROOT/filename).read_text(encoding="utf-8"), filename=filename)
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    if {node.name for node in functions} != set(names):
+        raise AssertionError(f"Missing loader functions in {filename}")
+    exec(compile(ast.Module(body=functions, type_ignores=[]), filename, "exec"), module.__dict__)
+
+
+def real_base_loader():
+    # Only heavyweight model factories are stubbed. Runtime restoration, gate
+    # config parsing, model-building orchestration and state loading are real.
+    evaluator = types.ModuleType("test_mara")
+    evaluator.__dict__.update(
+        torch=torch, Dict=Dict, Optional=Optional, Tuple=Tuple,
+        MARAAgent=MARAAgent, MARAConfig=MARAConfig,
+        DinoSingleTowerDetector=DinoSingleTowerDetector,
+        single_tower_config_from_checkpoint=single_tower_config_from_checkpoint,
+        SEMANTIC_SPATIAL_CHANNELS=SEMANTIC_SPATIAL_CHANNELS,
+        semantic_global_dim=semantic_global_dim,
+    )
+    source_functions(evaluator, "train_mara.py", (
+        "normalize_layers_obj", "resolve_hfa_layers", "apply_base_runtime_config",
+        "create_visual_backbone_for_mara", "create_single_tower_from_checkpoint",
+    ))
+    source_functions(evaluator, "train_up.py", ("create_clip_model",))
+    source_functions(evaluator, "test_mara.py", (
+        "config_from_payload", "apply_payload_runtime_config", "build_models_from_checkpoint",
+        "load_mara_checkpoint",
+    ))
+
+    class FakeSingle(torch.nn.Module):
+        def load_checkpoint_fields(self, payload, strict=True):
+            if "dino_single_head" not in payload:
+                raise KeyError("dino_single_head")
+
+    def fake_adapter(*args):
+        model = torch.nn.Module()
+        for name in ("cls_token_adapter", "patch_token_adapter", "prompt_adapter"):
+            model.add_module(name, torch.nn.Identity())
+        return model
+
+    evaluator.create_model = lambda **kwargs: torch.nn.Linear(1, 1)
+    evaluator.create_prompt_learner = lambda *args: torch.nn.Identity()
+    evaluator.create_adapter_model = fake_adapter
+    evaluator.create_dino_single_tower = lambda **kwargs: FakeSingle()
+    evaluator.install_bottleneck_adapters_into_dino = lambda *args, **kwargs: (torch.nn.Identity(), None)
+    return evaluator
 
 
 def native_bash():
@@ -243,6 +300,42 @@ class MetricAndSelectionTests(unittest.TestCase):
         self.assertIsNone(sampled_pro(np.zeros_like(masks), maps, 41))
 
 
+class BaseLoaderContractTests(unittest.TestCase):
+    def test_old_runtime_omits_overrides_but_preserves_checkpoint_gates(self):
+        agent, _, _, _ = toy()
+        cfg = replace(agent.cfg, gain_safety_margin=.17, gain_accept_probability=.83, hard_gain_gate=False)
+        stored = dict(
+            image_size=16, visual_backbone="dino", visual_layers=[0, 1],
+            hfa_setting="hfa4", hfa_layers="", hfa_bottleneck=None, dino_bottleneck=256,
+            clip_model_name="test", clip_pretrained="test", dino_repo_dir="/fake/dino",
+            dino_model_name="test", dino_weights="/fake/weights.pth",
+        )
+        before = copy.deepcopy(stored)
+        payload = dict(mara_config=asdict(cfg), mara_agent=MARAAgent(cfg).state_dict(),
+                       visual_backbone="dino", visual_layers=[0, 1],
+                       hfa_setting="custom", hfa_layers=[1], hfa_bottleneck=32)
+        evaluator = real_base_loader()
+        # Reproduce the reported bug using the old sparse Namespace.
+        with self.assertRaisesRegex(AttributeError, "gain_safety_margin"):
+            evaluator.config_from_payload(payload, types.SimpleNamespace(**stored))
+        for architecture in ("clip_dino", "dino_single"):
+            with self.subTest(architecture=architecture):
+                current = dict(payload, base_arch=architecture)
+                if architecture == "dino_single":
+                    current.update(dino_single_config=dict(visual_layers=[0, 1], evidence_channels=8),
+                                   dino_single_head={})
+                runtime = entry.base_export_runtime(stored)
+                with patch("torch.hub.load", return_value=torch.nn.Linear(1, 1)):
+                    models = evaluator.build_models_from_checkpoint(runtime, torch.device("cpu"), current)
+                self.assertEqual(models[5].cfg, cfg)
+                self.assertIsNone(runtime.gain_safety_margin)
+                self.assertIsNone(runtime.gain_accept_probability)
+                self.assertFalse(runtime.disable_hard_gain_gate)
+                self.assertEqual(runtime.hfa_layers_runtime, (1,))
+                self.assertEqual(runtime.hfa_bottleneck_runtime, 32)
+        self.assertEqual(stored, before)
+
+
 class OfflinePipelineTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -379,17 +472,16 @@ class OfflinePipelineTests(unittest.TestCase):
                 return None, kwargs["image_info"]["mask"], base, outer.inputs["base_logits"], evidence
 
             utils.get_anomaly_map = base_forward
-            evaluator = types.ModuleType("test_mara")
+            evaluator = real_base_loader()
+            real_build = evaluator.build_models_from_checkpoint
 
             def build(runtime, device, checkpoint):
                 self.assertEqual(runtime.image_size, 16)
-                runtime.evidence_feature_channels = 0
-                runtime.evidence_semantic_channels = 0
-                runtime.evidence_semantic_global_dim = 0
-                return None, None, None, None, None, copy.deepcopy(outer.agent), None
+                models = real_build(runtime, device, checkpoint)
+                self.assertEqual(models[5].cfg, outer.agent.cfg)
+                return models
 
             evaluator.build_models_from_checkpoint = build
-            evaluator.load_mara_checkpoint = lambda *a: None
             worker = type("Args", (), dict(work_dir=str(work), shard_id=0, device="cpu"))()
             with patch.dict("sys.modules", {"tools.utils_up": utils, "test_mara": evaluator}):
                 entry.export(worker)

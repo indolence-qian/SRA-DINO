@@ -109,8 +109,14 @@ CPU 汇总时 GPU 空闲是正常现象，worker 详细日志在 WORK_DIR 内。
 
 复用同一命令、同一 WORK_DIR 即可续跑；校验 checkpoint、源文件、缓存和
 结果哈希，配置变化则拒绝覆盖。改变采样、horizon、checkpoint、GPU 数量时
-应使用新的 WORK_DIR。单目录 flock 防止并发运行，任何 worker 失败会终止，
+应使用新的 WORK_DIR。git_revision 也在配置签名内，因此 git pull 更新代码后
+重新运行一体化脚本也应使用新的 WORK_DIR，保留旧目录供核查；不要删除 config.json
+来绕过校验。单目录 flock 防止并发运行，任何 worker 失败会终止，
 collect 拒绝不完整结果。没有安装依赖、下载 VLM、删除旧结果或自动 git pull。
+
+若 export 日志出现 `Namespace ... gain_safety_margin`，这是早期诊断入口
+漏传共享加载函数的三个门控覆盖参数，并非奖励、显存或环境问题。修复版在
+export 调用前补齐 None/None/False，表示不覆盖 checkpoint 的原门控设置。
 
 可单独跳过阶段，但仍必须保持 prepare 配置相同：
 
