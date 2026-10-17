@@ -286,6 +286,17 @@ To run the code, please download the pretrained weights and place them in the sp
 | **Meta AI DINOv3 (vitl16_pretrain_lvd)** | [🔗 DINOv3 Official Weights](https://github.com/facebookresearch/dinov3) | `./` *(project root)* |
 
 
+## Controlled MARA diagnostics and reward retraining
+
+`run_exp_mara_gate_sweep.sh` runs the frozen gate sweep with shared Base caches
+and a unified GT audit. See [experiment G](docs/mara_gate_sweep.md).
+
+`run_exp_mara_reward.sh` runs the paired R0/R1/R2 classification-reward ablation
+on two independent GPU workers. All arms use fresh matched initialization,
+source-only training, the same frozen Base, and a fixed final epoch. It reuses
+G caches and produces a small `reward_report.zip`, excluding checkpoints and
+large evidence tensors. See [experiment R and the nohup command](docs/mara_reward_experiment.md).
+
 ## Upstream local-semantic localization experiment
 
 **P0+P1 repair:** `run_exp_upstream_repair.sh` reuses the sealed v1 cache read-only,

@@ -134,8 +134,8 @@ def export(args):
     shared.export(args, protocol=PROTOCOL)
 
 
-def audit(args):
-    root, cfg, manifest, signature = load_work(args.work_dir)
+def audit(args, protocol=PROTOCOL):
+    root, cfg, manifest, signature = shared.load_work(args.work_dir, protocol=protocol)
     rows = []
     for record in manifest:
         shared.verify_source(record)

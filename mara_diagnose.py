@@ -164,7 +164,8 @@ def prepare(args, protocol=PROTOCOL, arms=None, extra_config=None):
             dataset = dataset_cls(source=source, split=split_cls.TEST, classname=category,
                                   resize=args.image_size, imagesize=args.image_size)
             items = dataset.data_to_iterate
-            indices = select_indices(items, args.samples_per_category, args.seed)
+            limits = (extra_config or {}).get("dataset_sample_limits", {})
+            indices = select_indices(items, limits.get(dataset_name, args.samples_per_category), args.seed)
             if not indices:
                 raise ValueError(f"No samples: {dataset_name}/{category}")
             for index in indices:

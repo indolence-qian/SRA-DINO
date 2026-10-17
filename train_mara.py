@@ -437,7 +437,14 @@ def train_one_epoch(
 
     for idx, image_info in enumerate(train_loader):
         with torch.no_grad():
-            if single_tower is not None:
+            if "_mara_cached" in image_info:
+                # R reuses immutable, audited FP32 Base outputs. No Base forward,
+                # gradients, or changes to the rollout/replay objective below.
+                cached = image_info["_mara_cached"]
+                mask = image_info["mask"].to(device).float()
+                base_map = cached["base_prob"].to(device)
+                base_logits = cached["base_logits"].to(device)
+            elif single_tower is not None:
                 mask, base_map, base_logits, stage1_evidence = forward_dino_single_batch(
                     single_tower,
                     image_info,
@@ -459,20 +466,25 @@ def train_one_epoch(
                 )
 
         labels = image_info["is_anomaly"].to(device).long()
-        mara_evidence = build_mara_evidence(
-            evidence=stage1_evidence,
-            fallback_prob=base_map,
-            num_layers=len(args.visual_layers),
-            map_size=args.mara_map_size,
-            feature_channels_per_layer=int(getattr(args, "evidence_feature_channels", 0)),
-            semantic_spatial_channels=int(
-                getattr(args, "evidence_semantic_channels", 0)
-            ),
-            semantic_global_dim=int(
-                getattr(args, "evidence_semantic_global_dim", 0)
-            ),
-        )
-        del stage1_evidence
+        if "_mara_cached" in image_info:
+            mara_evidence = dict(layer_maps=cached["layer_maps"].to(device),
+                                 extra_maps=cached.get("evidence_maps"),
+                                 global_evidence=cached.get("global_evidence"))
+        else:
+            mara_evidence = build_mara_evidence(
+                evidence=stage1_evidence,
+                fallback_prob=base_map,
+                num_layers=len(args.visual_layers),
+                map_size=args.mara_map_size,
+                feature_channels_per_layer=int(getattr(args, "evidence_feature_channels", 0)),
+                semantic_spatial_channels=int(
+                    getattr(args, "evidence_semantic_channels", 0)
+                ),
+                semantic_global_dim=int(
+                    getattr(args, "evidence_semantic_global_dim", 0)
+                ),
+            )
+            del stage1_evidence
         layer_maps = mara_evidence["layer_maps"]
         evidence_maps = None if args.disable_evidence_bank else mara_evidence["extra_maps"]
         global_evidence = None if args.disable_evidence_bank else mara_evidence["global_evidence"]
