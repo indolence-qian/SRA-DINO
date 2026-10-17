@@ -104,12 +104,22 @@ and evaluation distributes target datasets across GPUs. Do not launch the
 original `train.py` with torchrun: it does not implement DDP. Target checkpoint
 selection defaults to the final epoch, not the highest target-test score.
 
+### Frozen MARA gate sweep (G, dual 24 GB GPUs)
+
+Use `run_exp_mara_gate_sweep.sh` for the corrected-state, frozen-checkpoint
+threshold scan. It reuses verified old Base caches, runs independent GPU workers
+with batch/OOM backoff, audits empty GT consistently, overlaps CPU metrics with
+GPU work, and writes a small `gate_report.zip` rather than large prediction NPZs.
+No training or VLM is run. G0-G4 scan 0/-0.01/-0.03/-0.05/-0.10; a bypass arm
+and an explicit legacy-transition reference isolate the two interventions.
+See [the protocol and complete two-4090 nohup command](docs/mara_gate_sweep.md).
+
 ### Frozen MARA early-stop diagnosis (A/B)
 
 Use run_exp_mara_diagnose.sh with ONE explicit MARA checkpoint file:
 
     nohup env MARA_CKPT=./checkpoint/YOUR_MARA_RUN/ckpt/mara_epoch_029.pth \
-      GPU_IDS=0,1 WORK_DIR=./checkpoint/mara_early_stop_ab_v1 \
+      GPU_IDS=0,1 WORK_DIR=./checkpoint/mara_early_stop_ab_corrected_v2 \
       bash run_exp_mara_diagnose.sh > nohup_mara_early_stop_ab.out 2>&1 &
 
 Experiment A records actions, quality components, costs, discounted returns,
@@ -117,7 +127,8 @@ STOP/inactive output drift and frozen-checkpoint policy-gradient probes.
 Experiment B pairs D0-D3 (normal/forced continuation x original/bypassed gain
 acceptance). Spatial fusion gates remain intact. Base evidence is exported once
 per image and reused by all arms; there is no retraining, VLM call, target
-checkpoint selection or automatic production STOP fix. Results are diagnostic.
+checkpoint selection. Protocol v2 uses corrected no-op state semantics;
+historical v1 results remain tied to their original code revision. Results are diagnostic.
 See [protocol, outputs and resume settings](docs/mara_early_stop_ab.md).
 
 Dual-tower **direct VLM ROI review is now available** through the separate

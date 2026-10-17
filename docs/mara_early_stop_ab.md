@@ -2,7 +2,9 @@
 
 入口：run_exp_mara_diagnose.sh。只读取一个明确的 MARA 权重文件，冻结所有权重，
 不重训 Base/MARA，不调用 VLM，不选择目标域最佳检查点或阈值。
-生产 STOP 转移行为保持原样；诊断会记录它是否改变图像级 logits。
+当前协议为 v2，D0 使用修复后的生产 STOP 转移；不执行时全部状态冻结。
+历史 v1 使用旧转移，其结论仍对应原 Git 提交，不应拿新代码覆盖旧结果。
+新的收益门扫描请使用 [实验 G](mara_gate_sweep.md)，其中有显式 L0_legacy 对照。
 
 ## 一体化 nohup
 
@@ -15,7 +17,7 @@
     nohup env \
       TRAIN_PYTHON="$(command -v python)" \
       MARA_CKPT=./checkpoint/你的MARA目录/ckpt/mara_epoch_029.pth \
-      WORK_DIR=./checkpoint/mara_early_stop_ab_v1 \
+      WORK_DIR=./checkpoint/mara_early_stop_ab_corrected_v2 \
       GPU_IDS=0,1 \
       DATASETS="visa mvtec btad mpdd" \
       SAMPLES_PER_CATEGORY=8 \
@@ -57,7 +59,8 @@ results/step_trace.csv 保存所有四组、所有样本、所有步骤，包括
 该 CSV 中的候选是当前策略选中 ROI/layer 的反事实修正，
 不是遍历 16x4 动作得到的 GT Oracle。本次范围只有 A/B，不包含候选枚举和成本重训。
 GT 评分发生在 trace_infer 返回之后，不反馈给下一步动作。
-即使停止，仍走完原 infer 的剩余循环，真实保留并揭示原实现的 inactive 漂移。
+即使停止，仍走完 infer 的剩余循环以核对状态不变。v2 已修复 inactive 漂移，
+如需复现旧转移，请使用实验 G 的 L0_legacy，而不是将 v1/v2 结果混用。
 
 results/gradient_probe.csv 与 gradient_trajectories.csv 对固定抽取的样本做：
 在一个独立 MARA 克隆上复现预热后的软门控、采样 group、Base 锚和

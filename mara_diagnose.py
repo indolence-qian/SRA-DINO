@@ -2,13 +2,15 @@
 """A: step/return/gradient audit. B: paired frozen D0-D3 interventions.
 
 prepare -> export (independent GPU workers) -> diagnose -> collect.
-No training, no checkpoint selection, no VLM calls, no production STOP fix.
+No training, no checkpoint selection, no VLM calls. Uses corrected STOP semantics.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from dataclasses import asdict, replace
 import csv
 import hashlib
+import gc
 import json
 import os
 from pathlib import Path
@@ -103,18 +105,18 @@ def check_signature(path, expected):
         raise ValueError(f"Output belongs to another run: {path}; use a new WORK_DIR")
 
 
-def load_work(work_dir, verify_checkpoint=True):
+def load_work(work_dir, verify_checkpoint=True, protocol=PROTOCOL):
     root = Path(work_dir).resolve()
     cfg = load_json(root/"config.json")
     manifest = load_json(root/"manifest.json")
-    if cfg.get("protocol") != PROTOCOL or digest(manifest) != cfg["manifest_sha256"]:
+    if cfg.get("protocol") != protocol or digest(manifest) != cfg["manifest_sha256"]:
         raise ValueError("Work directory protocol/manifest mismatch")
     if verify_checkpoint and sha256_file(cfg["mara_ckpt"]) != cfg["checkpoint_sha256"]:
         raise ValueError("MARA checkpoint changed since prepare")
     return root, cfg, manifest, digest(cfg)
 
 
-def prepare(args):
+def prepare(args, protocol=PROTOCOL, arms=None, extra_config=None):
     ckpt = Path(args.mara_ckpt).resolve()
     if not ckpt.is_file():
         raise ValueError("MARA_CKPT must name ONE explicit checkpoint file, not a directory")
@@ -182,6 +184,11 @@ def prepare(args):
                 manifest.append(record)
     if len({r["id"] for r in manifest}) != len(manifest):
         raise ValueError("Duplicate selected image identity")
+    if extra_config and extra_config.get("category_shards"):
+        owners = {key: i % args.num_shards for i, key in enumerate(sorted(
+            {(r["dataset"], r["category"]) for r in manifest}))}
+        for record in manifest:
+            record["shard"] = owners[(record["dataset"], record["category"])]
     gradient_ids = [r["id"] for r in sorted(
         manifest, key=lambda r: stable_id(args.seed, "gradient", r["id"]))[:args.gradient_images]]
     runtime = dict(
@@ -209,7 +216,7 @@ def prepare(args):
     except (OSError, subprocess.CalledProcessError):
         revision = "unavailable"
     cfg = dict(
-        protocol=PROTOCOL, git_revision=revision, mara_ckpt=str(ckpt),
+        protocol=protocol, git_revision=revision, mara_ckpt=str(ckpt),
         checkpoint_sha256=sha256_file(ckpt), checkpoint_epoch_zero_based=payload.get("epoch"),
         base_ckpt_metadata=payload.get("base_ckpt"), base_arch=payload.get("base_arch", "clip_dino"),
         original_mara_config=asdict(original_cfg), mara_config=asdict(runtime_cfg), runtime=runtime,
@@ -217,11 +224,13 @@ def prepare(args):
         samples_per_category=args.samples_per_category, categories=args.categories,
         num_shards=args.num_shards, seed=args.seed, gradient_ids=gradient_ids,
         manifest_sha256=digest(manifest), pro_num_th=args.pro_num_th, pro_max_fpr=args.pro_max_fpr,
-        quality_tolerance=args.quality_tolerance, arms=ARMS,
+        quality_tolerance=args.quality_tolerance, arms=ARMS if arms is None else arms,
         sampling_note="mask-presence stratified; this diagnostic subset is not an independent performance claim",
         selection_note="No target checkpoint/threshold selection; GT is post-hoc scoring only",
         gradient_note="Frozen checkpoint counterfactual post-warmup probe; historical W_GRPO/warmup are not stored",
     )
+    if extra_config:
+        cfg.update(extra_config)
     if (root/"config.json").exists() and load_json(root/"config.json") != cfg:
         raise ValueError("WORK_DIR has a different config; do not overwrite. Use a new WORK_DIR")
     atomic_json(root/"config.json", cfg)
@@ -259,8 +268,8 @@ def base_export_runtime(runtime_config):
     ))
 
 
-def export(args):
-    root, cfg, manifest, signature = load_work(args.work_dir)
+def export(args, protocol=PROTOCOL):
+    root, cfg, manifest, signature = load_work(args.work_dir, protocol=protocol)
     assigned = [r for r in manifest if r["shard"] == args.shard_id]
     pending = []
     for record in assigned:
@@ -296,24 +305,15 @@ def export(args):
     agent.cfg = type(agent.cfg)(**cfg["mara_config"])
     dataset = None
     current_key = None
-    with torch.no_grad():
-        for count, record in enumerate(pending):
-            key = (record["dataset"], record["category"])
-            if key != current_key:
-                dataset_cls, split_cls, _ = DATASET_REGISTRY[record["dataset"]]
-                dataset = dataset_cls(source=record["source"], split=split_cls.TEST, classname=record["category"],
-                                      resize=cfg["image_size"], imagesize=cfg["image_size"])
-                current_key = key
-            sample = dataset[record["dataset_index"]]
-            if str(Path(sample["image_path"]).resolve()) != record["image_path"]:
-                raise ValueError("Dataset ordering changed since prepare")
-            image_info = collate_anomaly_batch([sample])
+    def forward_batch(records, samples):
+        with torch.no_grad():
+            image_info = collate_anomaly_batch(samples)
             if single is not None:
                 mask, base, logits, evidence = forward_dino_single_batch(single, image_info, device)
             else:
                 _, mask, base, logits, evidence = get_anomaly_map(
                     clip_model=clip, image_info=image_info, device=device, model=model,
-                    Dino_model=dino, prompt_learner=prompts, idx=record["index"],
+                    Dino_model=dino, prompt_learner=prompts, idx=records[0]["index"],
                     visual_backbone=runtime.visual_backbone, visual_layers=runtime.visual_layers,
                     text_source=runtime.text_source, return_evidence=True)
             packed = build_mara_evidence(
@@ -321,24 +321,67 @@ def export(args):
                 feature_channels_per_layer=runtime.evidence_feature_channels,
                 semantic_spatial_channels=runtime.evidence_semantic_channels,
                 semantic_global_dim=runtime.evidence_semantic_global_dim)
-            cache = dict(
+            batch_cache = dict(
                 base_prob=base.detach().float().cpu(), base_logits=logits.detach().float().cpu(),
                 layer_maps=packed["layer_maps"].float().cpu(),
                 evidence_maps=packed["extra_maps"].float().cpu() if agent.cfg.evidence_channels else None,
                 global_evidence=packed["global_evidence"].float().cpu() if agent.cfg.global_evidence_dim else None,
                 mask=(mask > .5).to(torch.uint8).cpu(),
                 labels=image_info["is_anomaly"].long().cpu(),
-                record_id=record["id"], signature=signature,
             )
             if base.shape[-2:] != (cfg["image_size"], cfg["image_size"]):
                 raise ValueError("Base output does not match prepared image_size")
-            validate_cache(cache, agent.cfg)
-            if cache["mask"].shape != base[:, :1].shape or cache["labels"].shape != (1,) or int(cache["labels"][0]) not in (0, 1):
-                raise ValueError("Invalid GT geometry")
-            path = root/"evidence"/f"{record['id']}.pt"
-            atomic_torch(path, cache)
-            atomic_json(path.with_suffix(".json"), dict(signature=signature, sha256=sha256_file(path)))
-            print(f"Export {args.shard_id} {count+1}/{len(pending)} {record['dataset']}/{record['category']}", flush=True)
+            if len(base) != len(records):
+                raise ValueError("Base returned the wrong batch dimension")
+            return [{**{k: v[i:i+1].clone() if v is not None else None for k, v in batch_cache.items()},
+                     "record_id": record["id"], "signature": signature} for i, record in enumerate(records)]
+
+    batch_size = int(cfg.get("export_batch_size", 1))
+    position = 0
+    with ThreadPoolExecutor(max_workers=int(cfg.get("decode_workers", 1))) as decoder:
+        while position < len(pending):
+            record = pending[position]
+            key = (record["dataset"], record["category"])
+            if key != current_key:
+                dataset_cls, split_cls, _ = DATASET_REGISTRY[record["dataset"]]
+                dataset = dataset_cls(source=record["source"], split=split_cls.TEST, classname=record["category"],
+                                      resize=cfg["image_size"], imagesize=cfg["image_size"])
+                current_key = key
+            records = []
+            for item in pending[position:position+batch_size]:
+                if (item["dataset"], item["category"]) != key:
+                    break
+                records.append(item)
+            samples = list(decoder.map(lambda r: dataset[r["dataset_index"]], records))
+            if any(str(Path(s["image_path"]).resolve()) != r["image_path"] for r, s in zip(records, samples)):
+                raise ValueError("Dataset ordering changed since prepare")
+            caches = None
+            try:
+                caches = forward_batch(records, samples)
+            except torch.cuda.OutOfMemoryError:
+                if len(records) == 1:
+                    raise
+                batch_size = max(1, len(records)//2)
+                print(f"Export OOM backoff: batch={batch_size}; precision unchanged", flush=True)
+            if caches is None:
+                gc.collect()
+                torch.cuda.empty_cache()
+                continue
+            for record, cache in zip(records, caches):
+                save_export_cache(root, cfg, record, cache, agent.cfg, signature)
+            position += len(records)
+            peak = torch.cuda.max_memory_allocated(device)/2**30 if device.type == "cuda" else 0.
+            print(f"Export {args.shard_id} {position}/{len(pending)} {record['dataset']}/{record['category']} "
+                  f"batch={len(records)} peak={peak:.2f}GiB", flush=True)
+
+
+def save_export_cache(root, cfg, record, cache, agent_cfg, signature):
+    validate_cache(cache, agent_cfg)
+    if cache["mask"].shape != cache["base_prob"][:, :1].shape or cache["labels"].shape != (1,) or int(cache["labels"][0]) not in (0, 1):
+        raise ValueError("Invalid GT geometry")
+    path = root/"evidence"/f"{record['id']}.pt"
+    atomic_torch(path, cache)
+    atomic_json(path.with_suffix(".json"), dict(signature=signature, sha256=sha256_file(path)))
 
 
 def result_ready(root, record, signature):
@@ -514,12 +557,12 @@ def collect(args):
     write_csv(out/"gradient_trajectories.csv", gradient_trajectories)
     report = [
         "# MARA early-stop A/B diagnostics", "",
-        "DIAGNOSTIC ONLY. No retraining, no checkpoint/threshold selection, no production STOP fix.",
+        "DIAGNOSTIC ONLY. No retraining, no checkpoint/threshold selection. Corrected no-op state semantics.",
         f"Checkpoint: {cfg['mara_ckpt']}", f"SHA256: {cfg['checkpoint_sha256']}",
         f"Paired images: {len(manifest)}; steps: {cfg['mara_config']['max_steps']}",
         "All arms retain spatial fusion gates. D1/D3 bypass only the gain acceptance gate.",
         "D2/D3 force REFINE at every still-active step, not merely the first step.",
-        "D0 preserves production post-STOP behaviour; output drift is reported, not silently repaired.",
+        "D0 matches corrected production STOP behaviour. Historical v1 runs used the old transition.",
         "GT is post-hoc scoring only. Candidate scores describe policy-selected proposals, not a 64-action oracle.",
         "PRO is the existing sampled-threshold definition, accelerated by sorting. Undefined metrics are blank.",
         "Gradient probes are counterfactual at frozen weights, not evidence of historical W_GRPO or optimizer updates.",
@@ -535,9 +578,9 @@ def collect(args):
     print(f"Complete: {out}; read README.md, stop_summary.csv and macro_metrics.csv first", flush=True)
 
 
-def parser():
+def parser(stage_choices=("prepare", "export", "diagnose", "collect")):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--stage", required=True, choices=("prepare", "export", "diagnose", "collect"))
+    p.add_argument("--stage", required=True, choices=stage_choices)
     p.add_argument("--work_dir", required=True)
     p.add_argument("--mara_ckpt", default="")
     p.add_argument("--datasets", default="visa mvtec btad mpdd")

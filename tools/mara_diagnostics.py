@@ -1,7 +1,7 @@
 """Frozen MARA A/B diagnostics. GT is used ONLY after action execution.
 
-D0 preserves infer(), including its post-STOP transition behaviour. This is
-an audit, not a fix, and forced actions / bypassed gain gates are diagnostic.
+D0 matches corrected production infer(). Forced actions / bypassed gain
+gates are diagnostic. Historical v1 results belong to their original revision.
 """
 from dataclasses import replace
 import copy
@@ -18,7 +18,7 @@ from tools.mara_agent import (
     _resize_map,
 )
 
-PROTOCOL = "mara_early_stop_ab_v1"
+PROTOCOL = "mara_early_stop_ab_v2"
 ARMS = {
     "D0": dict(force_refine=False, bypass_gain=False),
     "D1": dict(force_refine=False, bypass_gain=True),
@@ -77,25 +77,26 @@ def checkpoint_config(payload):
     return cfg
 
 
-def validate_cache(cache, cfg):
+def validate_cache(cache, cfg, allow_batch=False):
     base = cache["base_prob"]
-    if base.ndim != 4 or base.shape[:2] != (1, 2):
+    if base.ndim != 4 or base.shape[1] != 2 or base.shape[0] < 1 or (not allow_batch and base.shape[0] != 1):
         raise ValueError("Cache must contain one B=1 two-class Base map")
     if base.shape[-1] != base.shape[-2]:
         raise ValueError("MARA currently requires square maps")
-    if cache["base_logits"].shape != (1, 2):
+    batch = base.shape[0]
+    if cache["base_logits"].shape != (batch, 2):
         raise ValueError("Invalid Base logits")
     layers = cache["layer_maps"]
-    if layers is None or layers.shape[:2] != (1, cfg.num_layers):
+    if layers is None or layers.shape[:2] != (batch, cfg.num_layers):
         raise ValueError("Layer evidence does not match checkpoint")
     evidence = cache.get("evidence_maps")
     if cfg.evidence_channels and (
-        evidence is None or evidence.shape[:2] != (1, cfg.evidence_channels)
+        evidence is None or evidence.shape[:2] != (batch, cfg.evidence_channels)
     ):
         raise ValueError("Spatial evidence does not match checkpoint")
     global_evidence = cache.get("global_evidence")
     if cfg.global_evidence_dim and (
-        global_evidence is None or global_evidence.shape != (1, cfg.global_evidence_dim)
+        global_evidence is None or global_evidence.shape != (batch, cfg.global_evidence_dim)
     ):
         raise ValueError("Global evidence does not match checkpoint")
     for name in ("base_prob", "base_logits", "layer_maps", "evidence_maps", "global_evidence"):
@@ -115,15 +116,19 @@ def move_inputs(cache, device):
 
 
 @torch.no_grad()
-def trace_infer(agent, inputs, arm="D0"):
+def trace_infer(agent, inputs, arm="D0", intervention=None):
     """No masks, labels, losses or oracle choices are accepted by this function."""
-    if arm not in ARMS:
+    if intervention is None and arm not in ARMS:
         raise ValueError(f"Unknown diagnostic arm: {arm}")
     if set(inputs)-{"base_prob", "base_logits", "layer_maps", "evidence_maps", "global_evidence"}:
         raise ValueError("Inference inputs must not contain GT or diagnostic scores")
     validate_cache(inputs, agent.cfg)
     original_cfg = agent.cfg
-    cfg = replace(original_cfg, use_gain_gate=False) if ARMS[arm]["bypass_gain"] else original_cfg
+    spec = ARMS[arm] if intervention is None else intervention
+    overrides = {k: spec[k] for k in ("gain_safety_margin", "freeze_noop_state") if k in spec}
+    if spec["bypass_gain"]:
+        overrides["use_gain_gate"] = False
+    cfg = replace(original_cfg, **overrides)
     agent.cfg = cfg
     try:
         base_hr = inputs["base_prob"]
@@ -142,7 +147,7 @@ def trace_infer(agent, inputs, arm="D0"):
         for step in range(cfg.max_steps):
             before = (current, global_logits, gate, active)
             state = agent._make_state(current, base, layers, step, evidence)
-            forced = torch.ones_like(active, dtype=torch.long) if ARMS[arm]["force_refine"] else None
+            forced = torch.ones_like(active, dtype=torch.long) if spec["force_refine"] else None
             policy = agent._policy(
                 state, global_logits, active, step, sample=False,
                 forced_op=forced, global_evidence=global_evidence,
@@ -156,14 +161,8 @@ def trace_infer(agent, inputs, arm="D0"):
             after_hr, gate_hr = _compose_high_res_probability(
                 base_hr, result["next_logits"], result["next_cumulative_gate"])
             # Construct the ungated candidate at ORIGINAL resolution too.
-            selected = policy["masks"][:, policy["region_action"].item():policy["region_action"].item()+1]
-            hidden = agent.refiner(torch.cat([
-                state, layers[:, policy["layer_action"].item():policy["layer_action"].item()+1], selected
-            ], dim=1))
-            candidate_gate = torch.sigmoid(agent.gate_head(hidden)) * cfg.gate_max * selected * active[:, None, None, None]
-            candidate_cumulative = 1 - (1-gate) * (1-candidate_gate)
-            candidate_logits = logits + agent.delta_head(hidden) * selected * cfg.delta_scale * active[:, None, None, None]
-            candidate_hr, _ = _compose_high_res_probability(base_hr, candidate_logits, candidate_cumulative)
+            candidate_hr, _ = _compose_high_res_probability(
+                base_hr, result["candidate_logits"], result["candidate_cumulative_gate"])
             op = int(policy["op_action"].item())
             is_active = bool(active.item())
             accepted = bool(result["gain_accepted"].item())
@@ -187,7 +186,7 @@ def trace_infer(agent, inputs, arm="D0"):
             records.append(dict(
                 step=step, active_before=is_active,
                 active_after=bool(result["next_active"].item()), op=op,
-                forced_refine=ARMS[arm]["force_refine"], bypass_gain=ARMS[arm]["bypass_gain"],
+                forced_refine=spec["force_refine"], bypass_gain=spec["bypass_gain"],
                 region=region, layer=layer, stop_reason=reason,
                 p_stop=float(op_prob[0]), p_refine=float(op_prob[1]),
                 region_prob=float(policy["region_logits"].softmax(-1)[0, region]),

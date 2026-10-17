@@ -61,7 +61,7 @@ EXTRA=()
 [[ -z "${DINO_REPO_DIR:-}" ]] || EXTRA+=(--dino_repo_dir "${DINO_REPO_DIR}")
 [[ -z "${DINO_WEIGHTS:-}" ]] || EXTRA+=(--dino_weights "${DINO_WEIGHTS}")
 [[ -z "${CATEGORIES:-}" ]] || EXTRA+=(--categories "${CATEGORIES}")
-echo "MARA A/B: one frozen checkpoint; shared Base caches; D0 preserves production STOP behaviour"
+echo "MARA A/B v2: one frozen checkpoint; shared Base caches; corrected no-op state semantics"
 CUDA_VISIBLE_DEVICES="" "${TRAIN_PYTHON}" mara_diagnose.py --stage prepare \
   --mara_ckpt "${MARA_CKPT}" --work_dir "${WORK_DIR}" \
   --datasets "${DATASETS}" --data_roots "${DATA_ROOTS}" \

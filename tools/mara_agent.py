@@ -50,6 +50,8 @@ class MARAConfig:
     gain_lower_quantile: float = 0.10
     gain_lower_weight: float = 1.0
     quality_degradation_tolerance: float = 1e-4
+    # False is diagnostic-only compatibility with checkpoints' old transition.
+    freeze_noop_state: bool = True
 
 
 def _resize_map(x: torch.Tensor, size: int, mode: str = "bilinear") -> torch.Tensor:
@@ -537,6 +539,12 @@ class MARAAgent(nn.Module):
             base_logits * (1.0 - candidate_gate_scalar.unsqueeze(1))
             + candidate_global_proposal * candidate_gate_scalar.unsqueeze(1)
         )
+        if self.cfg.freeze_noop_state:
+            candidate_logits = torch.where(active[:, None, None, None], candidate_logits, current_logits)
+            candidate_cumulative_gate = torch.where(
+                active[:, None, None, None], candidate_cumulative_gate, cumulative_gate)
+            candidate_prob = torch.where(active[:, None, None, None], candidate_prob, current_prob)
+            candidate_global_logits = torch.where(active[:, None], candidate_global_logits, global_logits)
 
         # The gain predictor is a critic. Detaching its acceptance weight keeps
         # segmentation/classification gradients from pushing every gain positive.
@@ -570,6 +578,15 @@ class MARAAgent(nn.Module):
             base_logits * (1.0 - gate_scalar.unsqueeze(1))
             + proposal_global_logits * gate_scalar.unsqueeze(1)
         )
+        if self.cfg.freeze_noop_state:
+            # A STOP, hard rejection or inactive row is an exact state identity.
+            # Keep the active counterfactual above for gain supervision.
+            executed = execute_scalar > 0
+            proposal_logits = torch.where(executed[:, None, None, None], proposal_logits, current_logits)
+            next_prob = torch.where(executed[:, None, None, None], next_prob, current_prob)
+            next_cumulative_gate = torch.where(
+                executed[:, None, None, None], next_cumulative_gate, cumulative_gate)
+            next_global_logits = torch.where(executed[:, None], next_global_logits, global_logits)
         next_active = active & (policy_out["op_action"] == 1)
         if self.cfg.stop_on_gain_reject and self.cfg.hard_gain_gate and hard_gain_gate:
             next_active = next_active & gain_accepted
@@ -589,6 +606,8 @@ class MARAAgent(nn.Module):
             "execute_weight": execute_scalar,
             "candidate_prob": candidate_prob,
             "candidate_global_logits": candidate_global_logits,
+            "candidate_logits": candidate_logits,
+            "candidate_cumulative_gate": candidate_cumulative_gate,
         }
 
     def rollout(

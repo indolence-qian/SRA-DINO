@@ -138,7 +138,7 @@ class TraceTests(unittest.TestCase):
             self.assertTrue(torch.equal(trace[key], expected[key]), key)
         self.assertEqual(len(trace["records"]), 3)
 
-    def test_D0_matches_STOP_and_inactive_drift(self):
+    def test_D0_matches_frozen_STOP_and_inactive_state(self):
         agent, inputs, mask, labels = toy()
         original = agent._policy
 
@@ -157,8 +157,8 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(rows[1]["stop_reason"], "policy_stop")
         self.assertEqual(rows[2]["stop_reason"], "inactive")
         self.assertEqual(rows[1]["pixel_change_max"], 0.)
-        self.assertGreater(rows[1]["global_change_max"], 0.)
-        self.assertGreater(rows[2]["global_change_max"], 0.)
+        self.assertEqual(rows[1]["global_change_max"], 0.)
+        self.assertEqual(rows[2]["global_change_max"], 0.)
         self.assertEqual(rows[2]["reward"], 0.)
 
     def test_true_bypass_retains_spatial_gate(self):
@@ -511,7 +511,7 @@ class EntrypointTests(unittest.TestCase):
                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def run_mock_shell(self, **overrides):
+    def run_mock_shell(self, script_name="run_exp_mara_diagnose.sh", **overrides):
         bash = native_bash()
         if not bash:
             self.skipTest("No native Bash available")
@@ -558,7 +558,7 @@ class EntrypointTests(unittest.TestCase):
                                   str(bash.parent), env.get("PATH", ""))),
         )
         env.update(overrides)
-        result = subprocess.run([str(bash), (ROOT/"run_exp_mara_diagnose.sh").as_posix()],
+        result = subprocess.run([str(bash), (ROOT/script_name).as_posix()],
                                 cwd=ROOT, env=env, capture_output=True, text=True,
                                 encoding="utf-8", errors="replace", timeout=40)
         lines = calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
