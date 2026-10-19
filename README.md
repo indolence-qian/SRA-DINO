@@ -297,6 +297,14 @@ source-only training, the same frozen Base, and a fixed final epoch. It reuses
 G caches and produces a small `reward_report.zip`, excluding checkpoints and
 large evidence tensors. See [experiment R and the nohup command](docs/mara_reward_experiment.md).
 
+`run_exp_mara_ppo.sh` runs the new **on-policy PPO + V** controller and a matched
+zero-value-baseline MC control on two independent GPUs. Both share the same
+trained, frozen Base/Refiner, use full HR returns, and bypass only the legacy
+gain-acceptance veto (spatial fusion stays). Actual behavior states are stored
+for PPO; the Refiner is never updated/replayed during optimization. It produces
+`ppo_report.zip`, including independent Monte Carlo value checks. The legacy
+GRPO/G/R paths are preserved. See [the design and complete nohup command](docs/mara_ppo_experiment.md).
+
 ## Upstream local-semantic localization experiment
 
 **P0+P1 repair:** `run_exp_upstream_repair.sh` reuses the sealed v1 cache read-only,

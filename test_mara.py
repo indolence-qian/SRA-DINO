@@ -99,6 +99,13 @@ def config_from_payload(payload: Dict, args) -> MARAConfig:
             "max_steps": args.mara_steps,
             "group_size": 1,
         }
+    is_ppo = payload.get("mara_algorithm") == "mara_ppo_v1"
+    if payload.get("mara_algorithm") and not is_ppo:
+        raise ValueError(f"Unknown MARA algorithm: {payload['mara_algorithm']}")
+    if is_ppo and (getattr(args, "gain_safety_margin", None) is not None
+                   or getattr(args, "gain_accept_probability", None) is not None
+                   or getattr(args, "disable_hard_gain_gate", False)):
+        raise ValueError("PPO has no gain acceptance gate; legacy gate overrides are invalid")
     mara_state = payload.get("mara_agent", {})
     has_gain_regressor = any(str(key).startswith("gain_head.") for key in mara_state.keys())
     has_gain_lower = any(str(key).startswith("gain_lower_head.") for key in mara_state.keys())
@@ -155,7 +162,11 @@ def build_models_from_checkpoint(args, device: torch.device, payload: Dict):
         prompt_learner = create_prompt_learner(clip_model, device)
         dino_model, dino_adapters = create_visual_backbone_for_mara(args, device)
         model = create_adapter_model(clip_model, device, args.visual_backbone)
-    mara_agent = MARAAgent(mara_cfg).to(device)
+    if payload.get("mara_algorithm") == "mara_ppo_v1":
+        from tools.mara_ppo import MARAPPOAgent, PPOConfig
+        mara_agent = MARAPPOAgent(mara_cfg, PPOConfig(**payload["ppo_config"])).to(device)
+    else:
+        mara_agent = MARAAgent(mara_cfg).to(device)
 
     if clip_model is not None:
         clip_model.eval()
@@ -194,7 +205,10 @@ def load_mara_checkpoint(
             prompt_learner.load_state_dict(payload["prompt_learner"], strict=False)
         if dino_adapters is not None and "dino_adapters" in payload:
             dino_adapters.load_state_dict(payload["dino_adapters"], strict=True)
-    missing, unexpected = mara_agent.load_state_dict(payload["mara_agent"], strict=False)
+    if payload.get("mara_algorithm") == "mara_ppo_v1":
+        missing, unexpected = mara_agent.load_state_dict(payload["mara_ppo_agent"], strict=True)
+    else:
+        missing, unexpected = mara_agent.load_state_dict(payload["mara_agent"], strict=False)
     if missing or unexpected:
         print(f"[WARN] MARA state loaded with missing={missing}, unexpected={unexpected}")
 

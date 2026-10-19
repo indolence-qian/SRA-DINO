@@ -149,11 +149,13 @@ def build_candidate_masks(
     centers_x = flat_idx % width
     boxes = _boxes_from_centers(centers_y, centers_x, height, width, roi_size)
 
-    masks = torch.zeros(bsz, num_regions, height, width, device=device, dtype=anomaly_map.dtype)
-    for b in range(bsz):
-        for k in range(num_regions):
-            y1, x1, y2, x2 = boxes[b, k].tolist()
-            masks[b, k, y1 : y2 + 1, x1 : x2 + 1] = 1.0
+    # Same inclusive boxes, vectorized: avoid B*K CUDA->CPU synchronizations
+    # per decision during on-policy collection and every PPO minibatch.
+    yy = torch.arange(height, device=device).view(1, 1, height, 1)
+    xx = torch.arange(width, device=device).view(1, 1, 1, width)
+    bounds = boxes[..., None, None]
+    masks = ((yy >= bounds[:, :, 0]) & (yy <= bounds[:, :, 2])
+             & (xx >= bounds[:, :, 1]) & (xx <= bounds[:, :, 3])).to(anomaly_map.dtype)
 
     norm = torch.tensor(
         [max(1, height - 1), max(1, width - 1), max(1, height - 1), max(1, width - 1)],
