@@ -334,6 +334,18 @@ run MARA. The default is supervised VisA-source training and held-out MVTec
 evaluation, not unsupervised VisA training. See
 [the protocol, two-GPU nohup command and result guide](docs/upstream_localization.md).
 
+## Stage-one high-resolution and normal-reference experiment
+
+`run_exp_reference_highres.sh` runs a matched **2x2** experiment on frozen CLIP+DINO:
+global / global+native-image tiles / normal-reference residuals / both. Four same-budget
+heads learn a supervised evidence-to-text interface; frozen global and high-resolution
+readouts remain explicit controls. Source-only validation selects epochs, residual
+strength and operating thresholds. Reference-assisted arms use known-normal TRAIN
+support and are reported separately from single-image zero-shot inference.
+The one-command pipeline exports once, trains independent heads across GPUs,
+evaluates held-out targets, and writes paired gains and factorial interactions.
+See [experiment design, two-GPU command, resume and result guide](docs/reference_highres_experiment.md).
+
 ## Citation
 If you use this work, please cite:
 ```
