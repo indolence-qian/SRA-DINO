@@ -23,7 +23,7 @@ done
 command -v "${TRAIN_PYTHON}" >/dev/null
 command -v flock >/dev/null
 export PYTHONUNBUFFERED=1 OMP_NUM_THREADS="${CPU_THREADS}" MKL_NUM_THREADS="${CPU_THREADS}"
-"${TRAIN_PYTHON}" -c "import torch,numpy,cv2,PIL,train_mara,mara_ppo_experiment; print('PPO dependencies:',torch.__version__)"
+"${TRAIN_PYTHON}" -c "import torch,numpy,cv2,PIL,matplotlib,train_mara,mara_ppo_experiment; print('PPO dependencies:',torch.__version__)"
 CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${TRAIN_PYTHON}" -c \
   "import torch; assert torch.cuda.is_available() and torch.cuda.device_count()==${#GPUS[@]}, 'Requested GPUs unavailable'; print([(torch.cuda.get_device_name(i),round(torch.cuda.get_device_properties(i).total_memory/2**30,1)) for i in range(torch.cuda.device_count())])"
 mkdir -p "${WORK_DIR}"
@@ -36,6 +36,11 @@ EXTRA=()
 [[ -z "${DINO_WEIGHTS:-}" ]] || EXTRA+=(--dino_weights "${DINO_WEIGHTS}")
 [[ -z "${CATEGORIES:-}" ]] || EXTRA+=(--categories "${CATEGORIES}")
 echo "PPO pilot: V vs MC; frozen trained Refiner/Base; same HR reward/split/init; no gain veto/no VLM"
+if [[ "${RESUME_PREPARED:-0}" == 1 ]]; then
+  # Explicitly keep the OLD sealed scientific config after a logging-only code
+  # update. New scientific env overrides are ignored in this mode, not resealed.
+  "${TRAIN_PYTHON}" -c "import sys,mara_ppo_experiment as e; r,c,m,s=e.load_work(sys.argv[1]); assert c['num_shards']==int(sys.argv[2]), 'GPU shard layout changed'; print('RESUME_PREPARED: using existing sealed scientific config; scientific env overrides ignored; signature='+s)" "${WORK_DIR}" "${#GPUS[@]}"
+else
 CUDA_VISIBLE_DEVICES="" "${TRAIN_PYTHON}" mara_ppo_experiment.py --stage prepare \
   --work_dir "${WORK_DIR}" --mara_ckpt "${MARA_CKPT}" \
   --datasets "${DATASETS:-visa mvtec btad mpdd}" --data_roots "${DATA_ROOTS}" \
@@ -53,6 +58,7 @@ CUDA_VISIBLE_DEVICES="" "${TRAIN_PYTHON}" mara_ppo_experiment.py --stage prepare
   --image_size "${IMAGE_SIZE:-512}" --pro_num_th "${PRO_NUM_TH:-1000}" --pro_max_fpr "${PRO_MAX_FPR:-0.3}" \
   --text_source "${TEXT_SOURCE:-prompt_learner}" --clip_model_name "${CLIP_MODEL_NAME:-ViT-L-14-336}" \
   --clip_pretrained "${CLIP_PRETRAINED:-openai}" "${EXTRA[@]}"
+fi
 PIDS=()
 cleanup() { for pid in "${PIDS[@]}"; do kill "${pid}" 2>/dev/null || true; done; }
 trap cleanup EXIT
@@ -66,6 +72,9 @@ run_workers() {
     local overrides=()
     if [[ "${stage}" == train && -n "${EXEC_GPU_CACHE_GB:-}" ]]; then
       overrides+=(--gpu_cache_gb "${EXEC_GPU_CACHE_GB}")
+    fi
+    if [[ "${stage}" == train ]]; then
+      overrides+=(--monitor_every "${MONITOR_EVERY:-5}" --monitor_samples_per_category "${MONITOR_SAMPLES_PER_CATEGORY:-8}" --preview_samples "${PREVIEW_SAMPLES:-8}")
     fi
     echo "[$(date +'%F %T')] ${stage} GPU=${GPUS[$shard]} shard=${shard}" >> "${log}"
     echo "Launching ${stage} GPU=${GPUS[$shard]}; log=${log}"

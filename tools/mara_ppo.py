@@ -204,6 +204,7 @@ class MARAPPOAgent(nn.Module):
             step = dict(valid=active.clone(), done=done, actions=actions, old_logprob=policy["logprob"],
                         old_value=value, before_hr=before_hr, after_hr=after_hr,
                         before_logits=logits, after_logits=out["next_global_logits"],
+                        cumulative_gate=out["next_cumulative_gate"],
                         execute=out["execute_weight"], p_stop=policy["logits"]["op"].softmax(-1)[:, 0],
                         box=policy["boxes"].gather(1, actions["region"][:, None, None].expand(-1, 1, 4))[:, 0],
                         pixel_change=(after_hr-before_hr).abs().flatten(1).amax(1),
@@ -241,6 +242,22 @@ class MARAPPOAgent(nn.Module):
                        refine_mean=float(sum(s["execute"] for s in steps).mean()),
                        first_stop_fraction=float((steps[0]["actions"]["op"] == 0).float().mean()),
                        negative_refines=sum(int(((s["reward"] < 0) & (s["execute"] > 0)).sum()) for s in steps))
+        depth = sum(s["execute"] for s in steps)
+        summary.update(return_positive_fraction=float((steps[0]["return"] > 0).float().mean()),
+                       multi_step_fraction=float((depth >= 2).float().mean()))
+        for n in range(self.cfg.max_steps+1):
+            summary[f"depth_{n}_fraction"] = float((depth == n).float().mean())
+        for label, name in ((0, "normal"), (1, "anomaly")):
+            selected = labels == label
+            summary[name+"_count"] = int(selected.sum())
+            # Zero denotes no observations, not a measured zero return; count is
+            # retained so plots/aggregators can mask these empty strata.
+            summary[name+"_return_mean"] = float(steps[0]["return"][selected].mean()) if selected.any() else 0.
+            summary[name+"_refine_mean"] = float(depth[selected].mean()) if selected.any() else 0.
+        for name, count in (("layer", self.cfg.num_layers), ("region", self.cfg.num_regions)):
+            chosen = torch.cat([s["actions"][name][s["execute"] > 0] for s in steps])
+            counts = torch.bincount(chosen, minlength=count).cpu().tolist()
+            summary.update({f"{name}_{n}_executions": counts[n] for n in range(count)})
         return batch, summary
 
     @torch.no_grad()
@@ -282,14 +299,14 @@ def optimizers(agent):
     return actor, critic
 
 
-def update(agent, batch, actor_optimizer, critic_optimizer, entropy_coef=None):
+def update(agent, batch, actor_optimizer, critic_optimizer, entropy_coef=None, diagnostic_callback=None):
     """Finite PPO passes over one fresh batch. No environment replay/backprop."""
     cfg, rows = agent.ppo, []
     count = len(batch["return"])
     entropy_coef = cfg.entropy_coef if entropy_coef is None else entropy_coef
-    for _ in range(cfg.update_epochs):
+    for pass_index in range(cfg.update_epochs):
         order = torch.randperm(count, device=batch["return"].device)
-        for ids in order.split(cfg.minibatch_size):
+        for minibatch_index, ids in enumerate(order.split(cfg.minibatch_size)):
             observation = {k: v[ids] for k, v in batch["observation"].items()}
             actions = {k: v[ids] for k, v in batch["actions"].items()}
             policy = agent.actor(observation, actions=actions)
@@ -310,8 +327,9 @@ def update(agent, batch, actor_optimizer, critic_optimizer, entropy_coef=None):
                 critic_optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_actor = nn.utils.clip_grad_norm_(agent.actor.parameters(), cfg.grad_clip, error_if_nonfinite=True)
+            grad_critic = actor_loss.new_zeros(())
             if critic_optimizer is not None:
-                nn.utils.clip_grad_norm_(agent.critic.parameters(), cfg.grad_clip, error_if_nonfinite=True)
+                grad_critic = nn.utils.clip_grad_norm_(agent.critic.parameters(), cfg.grad_clip, error_if_nonfinite=True)
             actor_optimizer.step()
             if critic_optimizer is not None:
                 critic_optimizer.step()
@@ -319,7 +337,9 @@ def update(agent, batch, actor_optimizer, critic_optimizer, entropy_coef=None):
                              value_loss=float(value_loss.detach()), entropy=float(entropy.detach()),
                              approx_kl=float(((ratio-1)-logratio).mean().detach()),
                              clip_fraction=float(((ratio-1).abs() > cfg.clip_eps).float().mean()),
-                             actor_grad_norm=float(grad_actor)))
+                             actor_grad_norm=float(grad_actor), critic_grad_norm=float(grad_critic)))
+            if diagnostic_callback is not None:
+                diagnostic_callback(dict(ppo_pass=pass_index+1, minibatch=minibatch_index+1, **rows[-1]))
     weight = sum(r["weight"] for r in rows)
     metrics = {k: sum(r[k]*r["weight"] for r in rows)/weight for k in rows[0] if k != "weight"}
     variance = batch["return"].var(unbiased=False)

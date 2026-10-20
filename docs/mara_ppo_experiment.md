@@ -175,3 +175,90 @@ PRO 沿用已有 1000 阈值、最大 FPR=.3 定义；Dice 奖励改善不能直
 
 验收顺序：先查冻结哈希/STOP 恒等/GT 审计，再查学习回报与 V 拟合，最后查 PRO/P-AUROC/正常误报。
 即使 V loss 降低、多步增加、代理回报上升，也不能单独宣称异常分割涨点。
+
+## 训练过程可视化与历史结果补画
+
+新版本默认启用，**不再只输出最终表格**，也不依赖 TensorBoard、浏览器服务或网络字体。
+Matplotlib 已在项目 requirements 中，使用离线 Agg 后端；无需安装新可视化依赖。
+
+### 每批次、每次 PPO 更新
+
+`jobs/V_seed0/monitor/live_epoch_001.jsonl` 会持续 flush（MC 对应自己的目录）。
+每批记录 total/policy/value loss、回报、优势均值/标准差、旧 V、explained variance、熵、KL、
+clip fraction、Actor/Critic 梯度范数、学习率、耗时、显存、STOP 和多步比例、正常/异常回报、
+0/1/2/3 步分布、ROI/层执行次数。每次 optimizer update 另有单独记录。
+
+每个完整 epoch 后更新：
+
+```text
+jobs/V_seed0/monitor/index.html
+jobs/MC_seed0/monitor/index.html
+```
+
+点开页面可浏览 PNG 曲线和样本图；CSV 同步保留便于自行分析。
+曲线使用原始值，不偷偷平滑、不省略负奖励、不把缺失数据补零。
+`batch_metrics.csv`、`update_metrics.csv` 只合并已提交 epoch；中断 epoch 的 live JSONL 不是完整结果。
+重跑当前 epoch 时只重置它自己的未提交日志，避免重复统计。
+训练仍用同一套梯度计算；新增日志/留出前向/绘图不消耗训练的 Python、NumPy、Torch、CUDA RNG。
+
+**本阶段 Refiner 冻结，没有训练 segmentation loss，因此不会伪造 seg loss 曲线。**
+真实损失是 `L_policy + .5 L_value - beta * entropy`，其中 `L_value=.5*MSE`。
+Policy loss 不要求像监督学习 loss 一样单调下降；MC 的 V loss=0 是设计如此，不是更优的证据。
+正常/异常 epoch 均值按对应标签真实数量加权；该类没有样本的批次不当成零回报参与平均。
+
+### 固定源域验证与可视化轨迹
+
+默认在 epoch **0、1、5、10、15、20、25、30** 做源域过程验证。
+epoch0 是“随机 Actor + 已训练冻结 Refiner”，不是重新训练 Base。
+从 source calibration 固定选择每类别最多 8 张，按正常/异常均衡、稳定 ID 排序，绝不按好坏挑图。
+显示 PRO/P-AUROC/背景 FPR 与同样本 Base 对照、greedy 回报、STOP 和执行深度。
+这是固定的小规模过程验证，不等于完整 calibration 集或目标域最终成绩，不用于自动早停/选最优 epoch。
+
+默认固定 8 张预览样本，尽量覆盖多个类别和正常/异常；每张保存：
+
+- 原图、GT、Base 概率图、GT overlay。
+- 每一步概率图（固定 [0,1] 色阶）、ROI/层编号、STOP/REFINE、r、V、该条 greedy 轨迹 G。
+- 实际 `delta P`（显示每步真实色阶范围）、累计空间门 C（[0,1] 色阶）、原图上的 ROI 路径。
+
+V 仍代表随机策略的未来期望，不应期待它等于某一条 greedy G。
+最终总览另有 V 与独立随机轨迹 MC 均值/标准误校准图，以及 Base/V/MC 最终指标柱图。
+
+可在原 nohup 命令中加以下**仅影响展示**的设置：
+
+```bash
+MONITOR_EVERY=5 MONITOR_SAMPLES_PER_CATEGORY=8 PREVIEW_SAMPLES=8
+```
+
+`MONITOR_EVERY=1` 每个 epoch 都验证，开销更大；0/1/最终 epoch 始终记录。
+同一个目录不混用不同验证样本/预览样本选择；科学训练配置仍保持原签名。
+只保存固定少量图片及标量，不打包完整概率张量/大证据缓存。最终 `ppo_report.zip` 自动包含全部可视化。
+完整结果解压后打开 `visual_report/index.html`，再点各 job 页面。
+
+### 已经启动或已经跑完的旧版本：不必重训
+
+只补画已有 loss/回报等曲线，不读权重、GT 或缓存、不占 GPU（也支持解压出的旧 `ppo_report.zip` 目录）：
+
+```bash
+git pull --ff-only origin main
+python mara_ppo_experiment.py --stage visualize \
+  --work_dir ./checkpoint/mara_ppo_v1 --curves_only --device cpu
+```
+
+生成 `ppo_process_report.zip`，可在训练未结束时单独上传供分析。
+解压后打开 `visual_report/index.html`。两个 job 可能处于不同的已提交 epoch，页面按真实记录展示。
+旧版只保存 epoch 均值，不能恢复当时未记录的 batch/optimizer 波动；相应图会明确显示未记录。
+
+若还想从**确实存在的历史 epoch 权重**补画源域指标和逐步图，在空闲 GPU 上运行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python mara_ppo_experiment.py --stage visualize \
+  --work_dir ./checkpoint/mara_ppo_v1 --device cuda:0 --visualize_all_shards
+```
+
+只做前向，不训练；验证 checkpoint/split/冻结参数身份，缺少的 epoch 跳过并告知，绝不插值造图。
+保留现有训练记录/权重，不覆盖 `training.csv`；过程诊断保存在独立 monitor 目录。
+还在跑旧进程时不必为了曲线杀任务；`--curves_only` 可读取其已提交 CSV。
+
+若本来就因故中断，需要用新日志代码续训旧已准备目录，在**之前原始 nohup 命令**中额外加
+`RESUME_PREPARED=1`。它明确保留原 config/split/预算，忽略新的科学环境参数覆盖，
+只采用新的展示设置；仍检查 GPU shard 数。不要用它更换训练参数。

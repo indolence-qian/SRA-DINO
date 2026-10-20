@@ -9,6 +9,7 @@ from unittest.mock import patch
 import zipfile
 
 import torch
+import matplotlib.pyplot  # Keep extension modules loaded across sys.modules fixtures.
 
 import mara_diagnose as shared
 import mara_ppo_experiment as experiment
@@ -249,6 +250,12 @@ class PPOPipelineTests(unittest.TestCase):
         with zipfile.ZipFile(self.work/"ppo_report.zip") as archive:
             self.assertFalse(any(n.endswith((".pt", ".pth", ".npz")) for n in archive.namelist()))
             self.assertIn("results/value_probe.csv", archive.namelist())
+            self.assertIn("visual_report/index.html", archive.namelist())
+            self.assertIn("jobs/V_seed0/monitor/curves/epoch_training.png", archive.namelist())
+            self.assertTrue(any("/previews/" in n and n.endswith(".png") for n in archive.namelist()))
+            self.assertFalse(any("live_epoch_" in n for n in archive.namelist()))
+            updates = list(csv.DictReader(io.StringIO(archive.read("jobs/V_seed0/monitor/update_metrics.csv").decode())))
+            self.assertEqual(len(updates), sum(r["optimizer_steps"] for r in trained[0]["history"]))
             rows = list(csv.DictReader(io.StringIO(archive.read("results/step_trace.csv").decode())))
             for arm in ARMS:
                 self.assertEqual({r["sample_id"] for r in rows if r["arm"] == arm}, set(split["calibration_ids"]+split["target_ids"]))
@@ -260,6 +267,10 @@ class PPOPipelineTests(unittest.TestCase):
         self.assertNotIn("mara_agent", payload)
         self.assertEqual(payload["mara_algorithm"], PROTOCOL)
         agent_from_payload(payload)
+        # Backfill uses saved weights only; never retrain or modify a checkpoint.
+        with patch.object(experiment, "train_epoch", side_effect=AssertionError("no retraining")):
+            experiment.visualize(self.args)
+        self.assertEqual(before, [shared.sha256_file(self.work/"jobs"/f"{a}_seed0"/"final.pth") for a in ARMS])
 
     def test_exact_epoch_resume_restores_actor_critic_optimizers_and_RNG(self):
         self.run_to_audit()

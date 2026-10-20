@@ -305,6 +305,13 @@ for PPO; the Refiner is never updated/replayed during optimization. It produces
 `ppo_report.zip`, including independent Monte Carlo value checks. The legacy
 GRPO/G/R paths are preserved. See [the design and complete nohup command](docs/mara_ppo_experiment.md).
 
+PPO now records every optimizer update and rollout batch, refreshes PNG/HTML
+loss/reward/value/policy dashboards each epoch, and saves fixed source-holdout
+PRO/FP curves plus step-by-step image/GT/probability/delta/gate/ROI grids.
+The final ZIP includes these visuals. Existing runs can be plotted without
+retraining: `mara_ppo_experiment.py --stage visualize --work_dir <run> --curves_only`.
+See [monitoring and historical backfill](docs/mara_ppo_experiment.md#训练过程可视化与历史结果补画).
+
 ## Upstream local-semantic localization experiment
 
 **P0+P1 repair:** `run_exp_upstream_repair.sh` reuses the sealed v1 cache read-only,

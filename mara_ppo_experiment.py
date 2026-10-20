@@ -24,10 +24,14 @@ from tools.mara_ppo import (
     PROTOCOL, ARMS, INPUTS, PPOConfig, MARAPPOAgent, environment_config,
     optimizers, update, score_trajectory,
 )
+from tools.mara_ppo_monitor import (
+    EpochTelemetry, monitor_epoch, refresh_job, refresh_overview, diagnostic_context,
+    read_history, visual_files, package_process,
+)
 
 
-def load_work(path):
-    return shared.load_work(path, protocol=PROTOCOL)
+def load_work(path, verify_checkpoint=True):
+    return shared.load_work(path, protocol=PROTOCOL, verify_checkpoint=verify_checkpoint)
 
 
 def new_agent(cfg, seed, refiner_state):
@@ -121,15 +125,26 @@ class OptimizerPair:
             self.critic.load_state_dict(state["critic"])
 
 
-def train_epoch(agent, store, records, cfg, job, epoch, pair, scheduler):
+def train_epoch(agent, store, records, cfg, job, epoch, pair, scheduler, telemetry=None):
     rows = []
     agent.train()
     loader = CachedBatches(store, records, cfg["train_batch_size"], job["seed"], epoch)
     entropy = agent.ppo.entropy_coef*(1-epoch/max(1, cfg["epochs"]-1))
     for index, batch in enumerate(loader):
+        started = time.monotonic()
         samples, summary = agent.collect(batch["_mara_cached"], batch["mask"], batch["is_anomaly"])
-        metrics = update(agent, samples, pair.actor, pair.critic, entropy_coef=entropy)
+        callback = (lambda row: telemetry.record("update", dict(batch=index+1, **row))) if telemetry else None
+        metrics = update(agent, samples, pair.actor, pair.critic, entropy_coef=entropy, diagnostic_callback=callback)
+        metrics.update(batch_seconds=time.monotonic()-started, actor_lr=pair.actor.param_groups[0]["lr"],
+                       critic_lr=pair.critic.param_groups[0]["lr"] if pair.critic else 0.,
+                       gpu_allocated_gb=torch.cuda.memory_allocated()/2**30 if next(agent.parameters()).is_cuda else 0.)
         rows.append(dict(**summary, **metrics))
+        if telemetry:
+            telemetry.record("batch", dict(batch=index+1, **rows[-1]))
+            for n in range(min(16, len(samples["return"]))):
+                telemetry.record("transition", dict(batch=index+1, sampled_row=n,
+                    **{k: float(samples[k][n]) for k in ("old_value", "return", "advantage")},
+                    **{k: int(v[n]) for k, v in samples["actions"].items()}))
         scheduler.step()
         if index % 20 == 0 or index+1 == len(loader):
             print(f"{job['id']} epoch={epoch+1}/{cfg['epochs']} batch={index+1}/{len(loader)} "
@@ -137,13 +152,18 @@ def train_epoch(agent, store, records, cfg, job, epoch, pair, scheduler):
                   f"refines={summary['refine_mean']:.2f} KL={metrics['approx_kl']:.5f}", flush=True)
         del samples
     total = sum(r["trajectories"] for r in rows)
-    meters = {k: sum(r[k]*r["trajectories"] for r in rows)/total for k in rows[0]
-              if k not in ("trajectories", "decisions", "negative_refines", "optimizer_steps")}
-    meters.update({k: sum(r[k] for r in rows) for k in ("trajectories", "decisions", "negative_refines", "optimizer_steps")})
+    counts = {k for k in rows[0] if k.endswith(("_count", "_executions"))} | {
+        "trajectories", "decisions", "negative_refines", "optimizer_steps"}
+    meters = {k: sum(r[k]*r["trajectories"] for r in rows)/total for k in rows[0] if k not in counts}
+    meters.update({k: sum(r[k] for r in rows) for k in counts})
+    for name in ("normal", "anomaly"):
+        count = meters[name+"_count"]
+        for key in ("return_mean", "refine_mean"):
+            meters[name+"_"+key] = sum(r[name+"_"+key]*r[name+"_count"] for r in rows)/max(1, count)
     return meters
 
 
-def train_job(root, cfg, manifest, signature, split, store, job, device):
+def train_job(root, cfg, manifest, signature, split, store, job, device, monitor_settings=None):
     directory = root/"jobs"/job["id"]
     directory.mkdir(parents=True, exist_ok=True)
     identity = dict(signature=signature, job=job, split_sha256=shared.digest(split),
@@ -184,19 +204,33 @@ def train_job(root, cfg, manifest, signature, split, store, job, device):
         del saved
         print(f"Resume {job['id']} epoch={first+1}, optimizer/RNG restored", flush=True)
     start = time.monotonic()
+    # Visualization is execution-only: it must not alter sealed scientific
+    # config, checkpoint selection, data order, optimizer or policy sampling RNG.
+    settings = dict(every=5, per_category=8, previews=8) if monitor_settings is None else monitor_settings
+    audited = shared.load_json(root/"audit.json") if settings and (root/"audit.json").exists() else None
+    if settings and first == 0 and audited:
+        monitor_epoch(directory, agent, cfg, manifest, split, audited, store, job, 0, **settings)
     for epoch in range(first, cfg["epochs"]):
+        telemetry = EpochTelemetry(directory, job, epoch+1)
         try:
-            meters = train_epoch(agent, store, records, cfg, job, epoch, pair, scheduler)
+            meters = train_epoch(agent, store, records, cfg, job, epoch, pair, scheduler, telemetry)
         except torch.cuda.OutOfMemoryError:
             raise RuntimeError("PPO OOM; no silent sample/batch changes. Rerun same script with EXEC_GPU_CACHE_GB=0 "
                                "to resume the last complete epoch. Changing scientific batches needs a new WORK_DIR.") from None
+        finally:
+            telemetry.close()
         if not all(math.isfinite(v) for v in meters.values()):
             raise ValueError("Nonfinite PPO epoch metrics")
         if state_hash(agent.transition.state_dict()) != cfg["refiner_state_sha256"]:
             raise ValueError("Frozen Refiner changed")
         history.append(dict(job=job["id"], arm=job["arm"], seed=job["seed"], epoch=epoch+1, **meters))
         save_resume(directory, identity, epoch, agent, pair, scheduler, history, device)
+        telemetry.commit()
         shared.write_csv(directory/"training.csv", history)
+        if settings and audited and (epoch == 0 or (epoch+1) % settings["every"] == 0 or epoch+1 == cfg["epochs"]):
+            monitor_epoch(directory, agent, cfg, manifest, split, audited, store, job, epoch+1, **settings)
+        with diagnostic_context(agent):
+            refresh_job(directory, history)
         print(f"Committed {job['id']} epoch {epoch+1}/{cfg['epochs']}", flush=True)
     final, meta = directory/"final.pth", directory/"training.json"
     if not final.exists() or not meta.exists():
@@ -311,9 +345,7 @@ def value_probe(directory, agent, cfg, manifest, split, store, job, signature):
     shared.atomic_json(path, dict(signature=signature, rows=rows))
 
 
-def train(args):
-    root, cfg, manifest, signature = load_work(args.work_dir)
-    split, audited = checked_split(root, signature)
+def evidence_store(root, cfg, signature, audited, device, gpu_cache_gb=None):
     hashes = {r["sample_id"]: r["cache_sha256"] for r in audited["rows"]}
     verified = set()
     def loader(record):
@@ -325,16 +357,77 @@ def train(args):
             verified.add(record["id"])
             return cache
         return shared.load_torch(root/"evidence"/f"{record['id']}.pt")
+    return EvidenceStore(loader, device, cfg["cpu_cache_gb"], cfg["gpu_cache_gb"] if gpu_cache_gb is None else gpu_cache_gb)
+
+
+def train(args):
+    root, cfg, manifest, signature = load_work(args.work_dir)
+    split, audited = checked_split(root, signature)
     device = torch.device(args.device)
-    store = EvidenceStore(loader, device, cfg["cpu_cache_gb"], cfg["gpu_cache_gb"] if args.gpu_cache_gb is None else args.gpu_cache_gb)
+    store = evidence_store(root, cfg, signature, audited, device, args.gpu_cache_gb)
     for index, job in enumerate(cfg["jobs"]):
         if index % cfg["num_shards"] != args.shard_id:
             continue
-        directory, agent, trained = train_job(root, cfg, manifest, signature, split, store, job, device)
+        directory, agent, trained = train_job(root, cfg, manifest, signature, split, store, job, device,
+            dict(every=args.monitor_every, per_category=args.monitor_samples_per_category, previews=args.preview_samples))
         store.clear_gpu()
         evaluate_job(directory, agent, trained, root, cfg, manifest, signature, split, store, job)
         del agent
         store.clear_gpu()
+
+
+def visualize(args):
+    """Backfill actual curves and saved-epoch source previews, without training.
+
+    Missing optimizer/batch telemetry in old runs is explicitly left absent.
+    This also works on a running old process's already committed epochs.
+    """
+    root, cfg, manifest, signature = load_work(args.work_dir, verify_checkpoint=not args.curves_only)
+    if args.curves_only:
+        for job in cfg["jobs"]:
+            refresh_job(root/"jobs"/job["id"], read_history(root, job))
+        refresh_overview(root, cfg)
+        print(f"Curves only: {package_process(root, cfg)}; no weights/GT/cache loading, no training", flush=True)
+        return
+    split, audited = checked_split(root, signature)
+    device = torch.device(args.device)
+    store = evidence_store(root, cfg, signature, audited, device, args.gpu_cache_gb)
+    for index, job in enumerate(cfg["jobs"]):
+        if args.visualize_all_shards is False and index % cfg["num_shards"] != args.shard_id:
+            continue
+        directory = root/"jobs"/job["id"]
+        pointer = directory/"resume.json"
+        if not pointer.exists():
+            continue
+        last = shared.load_json(pointer)["epoch"]+1
+        epochs = sorted({0, 1, last} | set(range(args.monitor_every, last+1, args.monitor_every)))
+        original = shared.load_torch(cfg["mara_ckpt"])
+        agent = new_agent(cfg, job["seed"], original["mara_agent"])
+        agent.ppo = replace(agent.ppo, use_value=ARMS[job["arm"]])
+        agent.to(device)
+        for epoch in epochs:
+            if epoch:
+                path = directory/"resume"/f"epoch_{epoch-1:03d}.pth"
+                if not path.exists():
+                    print(f"No saved epoch {epoch} for {job['id']}; no invented history", flush=True)
+                    continue
+                saved = shared.load_torch(path)
+                identity = saved["identity"]
+                if (identity["signature"] != signature or identity["job"] != job
+                        or identity["split_sha256"] != shared.digest(split) or saved["epoch"] != epoch-1):
+                    raise ValueError("Historical checkpoint identity mismatch")
+                agent.load_state_dict(saved["mara_agent"], strict=True)
+                del saved
+            elif state_hash(agent.state_dict()) != cfg["initial_state_hashes"][str(job["seed"])]:
+                raise ValueError("Cannot reconstruct exact initial weights")
+            monitor_epoch(directory, agent, cfg, manifest, split, audited, store, job, epoch,
+                          every=args.monitor_every, per_category=args.monitor_samples_per_category, previews=args.preview_samples)
+        latest = shared.load_torch(directory/"resume"/shared.load_json(pointer)["filename"])
+        refresh_job(directory, latest["history"])
+        del agent, latest
+        store.clear_gpu()
+    refresh_overview(root, cfg)
+    print(f"Visual report: {root/'visual_report'/'index.html'}; {package_process(root, cfg)}; NO training/target selection", flush=True)
 
 
 def collect(args):
@@ -425,6 +518,9 @@ def collect(args):
         split_sha256=shared.digest(split), jobs=len(cfg["jobs"]), final_epoch=cfg["epochs"],
         metrics_sha256=shared.sha256_file(out/"metrics.csv"), refiner_state_sha256=cfg["refiner_state_sha256"],
         source_train=len(split["train_ids"]), source_calibration=len(split["calibration_ids"]), target_images=len(split["target_ids"])))
+    for job in cfg["jobs"]:
+        refresh_job(root/"jobs"/job["id"])
+    refresh_overview(root, cfg)
     target = root/"ppo_report.zip"
     temporary = target.with_suffix(".zip.tmp")
     try:
@@ -434,6 +530,8 @@ def collect(args):
                     archive.write(path, "results/"+path.name)
             for name in ("config.json", "manifest.json", "audit.json", "split.json", "complete.json"):
                 archive.write(root/name, name)
+            for path in visual_files(root, cfg):
+                archive.write(path, path.relative_to(root).as_posix())
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
@@ -441,7 +539,7 @@ def collect(args):
 
 
 def parser():
-    p = shared.parser(stage_choices=("prepare", "export", "audit", "train", "collect"))
+    p = shared.parser(stage_choices=("prepare", "export", "audit", "train", "collect", "visualize"))
     p.description = __doc__
     p.set_defaults(gradient_images=0, steps=3)
     p.add_argument("--source_work_dir", default="")
@@ -458,6 +556,11 @@ def parser():
     p.add_argument("--critic_lr", type=float, default=3e-4)
     p.add_argument("--cpu_cache_gb", type=float, default=4.)
     p.add_argument("--gpu_cache_gb", type=float, default=None)
+    p.add_argument("--monitor_every", type=int, default=5)
+    p.add_argument("--monitor_samples_per_category", type=int, default=8)
+    p.add_argument("--preview_samples", type=int, default=8)
+    p.add_argument("--visualize_all_shards", action="store_true")
+    p.add_argument("--curves_only", action="store_true", help="Plot recorded CSVs only; no weights/GT/GPU needed")
     return p
 
 
@@ -471,6 +574,8 @@ def main():
         raise ValueError("Invalid PPO budgets")
     if min(args.shard_id, args.source_samples_per_category, args.samples_per_category, args.source_split_seed) < 0:
         raise ValueError("Invalid sampling/shard")
+    if args.monitor_every < 1 or min(args.monitor_samples_per_category, args.preview_samples) < 0:
+        raise ValueError("Invalid monitoring cadence/subset")
     if not 0 < args.calibration_fraction < 1 or args.pro_num_th < 2 or not 0 < args.pro_max_fpr <= 1:
         raise ValueError("Invalid split/PRO config")
     if not math.isfinite(args.cpu_cache_gb) or args.cpu_cache_gb < 0 or (args.gpu_cache_gb is not None and
@@ -480,7 +585,9 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
-    if args.stage != "prepare" and args.shard_id >= load_work(args.work_dir)[1]["num_shards"]:
+    if args.curves_only and args.stage != "visualize":
+        raise ValueError("--curves_only applies only to --stage visualize")
+    if args.stage != "prepare" and args.shard_id >= load_work(args.work_dir, verify_checkpoint=not args.curves_only)[1]["num_shards"]:
         raise ValueError("Shard outside prepared layout")
     globals()[args.stage](args)
 
