@@ -258,6 +258,8 @@ def trace_rows(result, chunk, labels, mask, agent, arm, source):
     for t, step in enumerate(result["steps"]):
         numbers = {k: step[k].cpu().tolist() for k in ("valid", "done", "old_value", "return", "advantage", "reward",
                    "quality_before", "quality_after", "execute", "p_stop", "pixel_change", "global_change", "box")}
+        numbers.update({k: step[k].cpu().tolist() for k in ("reference_reward", "reference_return", "rank_before", "rank_after",
+                       "tail_before", "tail_after", "risk_cost", "risk_increase") if k in step})
         actions = {k: v.cpu().tolist() for k, v in step["actions"].items()}
         parts = [_quality_batch(step[k], step[g], mask, labels, agent.cfg)
                  for k, g in (("before_hr", "before_logits"), ("after_hr", "after_logits"))]
@@ -281,8 +283,9 @@ def trace_rows(result, chunk, labels, mask, agent, arm, source):
     return rows
 
 
-def evaluate_job(directory, agent, trained, root, cfg, manifest, signature, split, store, job):
-    eval_signature = shared.digest(dict(training=trained["final_sha256"], split=shared.digest(split), signature=signature))
+def evaluate_job(directory, agent, trained, root, cfg, manifest, signature, split, store, job, category_callback=None):
+    evaluated_hash = trained.get("selected_sha256", trained["final_sha256"])
+    eval_signature = shared.digest(dict(training=evaluated_hash, split=shared.digest(split), signature=signature))
     categories = defaultdict(list)
     ids = set(split["calibration_ids"]+split["target_ids"])
     for record in manifest:
@@ -301,18 +304,18 @@ def evaluate_job(directory, agent, trained, root, cfg, manifest, signature, spli
                 chunk = records[offset:offset+cfg["eval_batch_size"]]
                 batch = store.batch(chunk)
                 result = agent.trajectory({k: batch[k] for k in INPUTS if k in batch}, sample=False)
-                score_trajectory(result, batch["mask"], batch["labels"], agent.cfg, agent.ppo)
+                agent.score(result, batch["mask"], batch["labels"])
                 rows.extend(trace_rows(result, chunk, batch["labels"], batch["mask"], agent, job["arm"], cfg["source_dataset"]))
                 maps.extend(torch.stack([s["after_hr"][:, 1] for s in result["steps"]], 1).cpu().numpy())
                 masks.extend(batch["mask"][:, 0].cpu().numpy().astype(bool))
                 labels.extend(batch["labels"].cpu().tolist())
                 bases.extend(batch["base_prob"][:, 1].cpu().numpy())
-            futures.append(pool.submit(gate.finish_category, directory, eval_cfg, eval_signature, split["audit_sha256"],
+            futures.append(pool.submit(category_callback or gate.finish_category, directory, eval_cfg, eval_signature, split["audit_sha256"],
                                        key, records, rows, {job["arm"]: np.stack(maps)}, np.stack(masks), np.array(labels), np.stack(bases)))
         for future in futures:
             future.result()
     value_probe(directory, agent, cfg, manifest, split, store, job, eval_signature)
-    shared.atomic_json(directory/"evaluated.json", dict(signature=eval_signature, job=job, final_sha256=trained["final_sha256"]))
+    shared.atomic_json(directory/"evaluated.json", dict(signature=eval_signature, job=job, final_sha256=evaluated_hash))
 
 
 @torch.no_grad()
@@ -334,7 +337,7 @@ def value_probe(directory, agent, cfg, manifest, split, store, job, signature):
         batch = store.batch([record])
         inputs = {k: batch[k].repeat_interleave(count, 0) for k in INPUTS if k in batch}
         result = agent.trajectory(inputs, sample=True)
-        score_trajectory(result, batch["mask"].repeat_interleave(count, 0), batch["labels"].repeat_interleave(count, 0), agent.cfg, agent.ppo)
+        agent.score(result, batch["mask"].repeat_interleave(count, 0), batch["labels"].repeat_interleave(count, 0))
         first = result["steps"][0]
         returns = first["return"]
         mean, value = float(returns.mean()), float(first["old_value"][0])

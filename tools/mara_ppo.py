@@ -175,12 +175,21 @@ class MARAPPOAgent(nn.Module):
                     context=torch.cat([logits, base_logits, global_evidence, remaining], 1).detach())
 
     @torch.no_grad()
-    def trajectory(self, inputs, sample=True, keep_observations=False):
+    def trajectory(self, inputs, sample=True, keep_observations=False, action_sequence=None):
         """GT-free transition execution. Return full maps for subsequent scoring."""
         if set(inputs)-set(INPUTS):
             raise ValueError("GT/unknown keys forbidden in policy inputs")
         validate_cache(inputs, self.cfg, allow_batch=True)
         cfg = self.cfg
+        if action_sequence is not None:
+            if set(action_sequence) != {"op", "region", "layer"}:
+                raise ValueError("Oracle action sequence requires op/region/layer only")
+            for key, limit in (("op", 2), ("region", cfg.num_regions), ("layer", cfg.num_layers)):
+                values = action_sequence[key]
+                if values.shape != (len(inputs["base_prob"]), cfg.max_steps) or values.dtype != torch.long:
+                    raise ValueError("Invalid oracle action shape/dtype")
+                if bool(((values < 0) | (values >= limit)).any()):
+                    raise ValueError("Oracle action index out of range")
         base_hr = inputs["base_prob"].detach()
         base = _resize_map(base_hr, cfg.map_size)
         layers = _resize_map(inputs["layer_maps"], cfg.map_size)
@@ -193,7 +202,8 @@ class MARAPPOAgent(nn.Module):
         for t in range(cfg.max_steps):
             raw = self.transition._make_state(current, base, layers, t, evidence)
             observation = self.observe(raw, proposal, gate, logits, inputs["base_logits"], inputs.get("global_evidence"), t)
-            policy = self.actor(observation, sample=sample)
+            forced = None if action_sequence is None else {k: v[:, t] for k, v in action_sequence.items()}
+            policy = self.actor(observation, actions=forced, sample=sample)
             value = self.critic(observation) if self.ppo.use_value else base.new_zeros(len(base))
             actions = policy["actions"]
             policy_out = dict(masks=policy["masks"], **{k+"_action": v for k, v in actions.items()})
@@ -224,7 +234,7 @@ class MARAPPOAgent(nn.Module):
         repeated = {k: v.repeat_interleave(count, 0) for k, v in inputs.items() if v is not None}
         mask, labels = mask.repeat_interleave(count, 0), labels.repeat_interleave(count, 0)
         result = self.trajectory(repeated, sample=True, keep_observations=True)
-        score_trajectory(result, mask, labels, self.cfg, self.ppo)
+        self.score(result, mask, labels)
         steps = result["steps"]
         # Each stored row is its ACTUAL behavior observation; actions/logp/V/G/A
         # are detached and fixed for all minibatch passes, then discarded.
@@ -258,7 +268,14 @@ class MARAPPOAgent(nn.Module):
             chosen = torch.cat([s["actions"][name][s["execute"] > 0] for s in steps])
             counts = torch.bincount(chosen, minlength=count).cpu().tolist()
             summary.update({f"{name}_{n}_executions": counts[n] for n in range(count)})
+        summary.update(self.extra_summary(result, mask, labels))
         return batch, summary
+
+    def score(self, result, mask, labels):
+        return score_trajectory(result, mask, labels, self.cfg, self.ppo)
+
+    def extra_summary(self, result, mask, labels):
+        return {}
 
     @torch.no_grad()
     def infer(self, base_prob, base_logits, layer_maps=None, evidence_maps=None, global_evidence=None, sample=False):
@@ -353,6 +370,12 @@ def update(agent, batch, actor_optimizer, critic_optimizer, entropy_coef=None, d
 
 
 def agent_from_payload(payload):
+    if payload.get("mara_algorithm") == "mara_ppo_locsafe_v1":
+        from tools.mara_locsafe import LocSafeAgent, LocSafeConfig
+        agent = LocSafeAgent(MARAConfig(**payload["mara_config"]), PPOConfig(**payload["ppo_config"]),
+                             LocSafeConfig(**payload["locsafe_config"]), payload["locsafe_arm"])
+        agent.load_state_dict(payload["mara_ppo_agent"], strict=True)
+        return agent
     if payload.get("mara_algorithm") != PROTOCOL:
         raise ValueError("Not a MARA PPO checkpoint")
     agent = MARAPPOAgent(MARAConfig(**payload["mara_config"]), PPOConfig(**payload["ppo_config"]))

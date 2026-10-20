@@ -44,7 +44,7 @@ export PYTHONUNBUFFERED=1 OMP_NUM_THREADS="${CPU_THREADS}" MKL_NUM_THREADS="${CP
 "${TRAIN_PYTHON}" -c "import torch,numpy,cv2,PIL; print('G dependencies:',torch.__version__)"
 CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${TRAIN_PYTHON}" -c \
   "import torch; assert torch.cuda.is_available() and torch.cuda.device_count()==${#GPUS[@]}, 'Requested GPUs unavailable'; print([(torch.cuda.get_device_name(i),round(torch.cuda.get_device_properties(i).total_memory/2**30,1)) for i in range(torch.cuda.device_count())])"
-mkdir -p "${WORK_DIR}"
+[[ -d "${WORK_DIR}" ]] || mkdir -p "${WORK_DIR}"
 exec 9>"${WORK_DIR}/.run.lock"
 flock -n 9 || { echo "WORK_DIR is already running" >&2; exit 1; }
 exec > >(tee -a "${WORK_DIR}/run_$(date +'%Y%m%d_%H%M%S').log") 2>&1

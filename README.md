@@ -312,6 +312,14 @@ The final ZIP includes these visuals. Existing runs can be plotted without
 retraining: `mara_ppo_experiment.py --stage visualize --work_dir <run> --curves_only`.
 See [monitoring and historical backfill](docs/mara_ppo_experiment.md#训练过程可视化与历史结果补画).
 
+`run_exp_mara_locsafe.sh` runs source-only candidate diagnosis **O**, followed by
+matched **P0/P1/P2/P3** PPO+V ablations: original reward, no classification reward,
+region-balanced hard-background ranking, then a terminal normal-risk constraint.
+It keeps Base/Refiner frozen, selects checkpoints on a nested source DEV split,
+and evaluates targets only after every training job finishes. Curves, per-step
+maps, independent V checks, risk tails and population-separated metrics are in
+`locsafe_report.zip`. See [the protocol and dual-4090 nohup command](docs/mara_locsafe_experiment.md).
+
 ## Upstream local-semantic localization experiment
 
 **P0+P1 repair:** `run_exp_upstream_repair.sh` reuses the sealed v1 cache read-only,

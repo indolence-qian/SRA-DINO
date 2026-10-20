@@ -52,7 +52,7 @@ if [[ "${RUN_EXPORT}" == 1 || "${RUN_DIAGNOSE}" == 1 ]]; then
   CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${TRAIN_PYTHON}" -c \
     "import torch; assert torch.cuda.is_available() and torch.cuda.device_count()==${#GPUS[@]}, 'Requested GPUs unavailable'; print('Visible GPUs:',torch.cuda.device_count())"
 fi
-mkdir -p "${WORK_DIR}"
+[[ -d "${WORK_DIR}" ]] || mkdir -p "${WORK_DIR}"
 exec 9>"${WORK_DIR}/.run.lock"
 flock -n 9 || { echo "WORK_DIR is already running" >&2; exit 1; }
 exec > >(tee -a "${WORK_DIR}/run_$(date +'%Y%m%d_%H%M%S').log") 2>&1

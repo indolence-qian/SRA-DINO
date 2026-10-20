@@ -275,7 +275,7 @@ def monitor_epoch(directory, agent, cfg, manifest, split, audited, store, job, e
                 chunk = records[offset:offset+cfg["eval_batch_size"]]
                 batch = store.batch(chunk)
                 result = agent.trajectory({k: batch[k] for k in INPUTS if k in batch}, sample=False)
-                score_trajectory(result, batch["mask"], batch["labels"], agent.cfg, agent.ppo)
+                agent.score(result, batch["mask"], batch["labels"])
                 maps.extend(result["final_prob"][:, 1].cpu().numpy())
                 bases.extend(batch["base_prob"][:, 1].cpu().numpy())
                 masks.extend(batch["mask"][:, 0].cpu().numpy().astype(bool))
@@ -361,13 +361,19 @@ def refresh_job(directory, history=None):
         ("Learning rates", ["actor_lr", "critic_lr"]),
         ("Advantage spread / entropy weight", ["advantage_std", "entropy_coef"])],
         title=directory.name+" | policy behavior, source training only")
+    if any("dual_used" in r for r in history):
+        panels(root/"curves"/"locsafe_risk.png", history, [
+            ("Normal tail-probability damage", ["normal_risk_mean", "normal_risk_p95", "normal_risk_worst5_mean", "normal_risk_max"]),
+            ("Fixed P0 reference return", ["reference_return_mean", "normal_reference_worst5_mean"]),
+            ("Lagrange multiplier (P3 only)", ["dual_used", "dual_next"]),
+            ("Ranking improvement", ["rank_improvement_mean"])], title="LocSafe | full-epoch tail risk, not mean loss only")
     validations = [shared.load_json(p) for p in sorted((root/"validation").glob("epoch_*.json"))]
     if validations:
         panels(root/"curves"/"source_validation.png", [dict(epoch=r["epoch"], **r["macro"]) for r in validations], [
             ("Fixed SOURCE holdout PRO", ["PRO", "base_PRO"]), ("Pixel ranking", ["P_AUROC", "base_P_AUROC"]),
             ("Background FPR at .5", ["background_FPR_at_05", "base_background_FPR_at_05"]), ("Greedy net return", ["return_mean"]),
             ("Greedy STOP", ["first_stop_fraction"]), ("Greedy refine depth", ["refine_mean"])],
-            title="SOURCE-only monitoring | fixed subset, no checkpoint selection")
+            title="SOURCE-only monitoring | fixed population; consult protocol for selection")
     if transitions:
         plt = pyplot()
         fig, axes = plt.subplots(1, 3, figsize=(13, 3.8))
@@ -398,7 +404,7 @@ def refresh_job(directory, history=None):
         galleries.append(f'<details><summary>Epoch {result["epoch"]}: {result["selected_images"]} source monitor images</summary>{cards}</details>')
     atomic_html(root/"index.html", page(directory.name+" | PPO process diagnostics",
         '<p>Refresh this file after a committed epoch. Raw PNG/CSV files are downloadable below. '
-        'No target data is used here. No best-epoch selection. Old missing telemetry is NOT reconstructed.</p>'
+        'No target data is used here. Check the experiment protocol for checkpoint selection. Old missing telemetry is NOT reconstructed.</p>'
         '<p>Policy loss need not monotonically decrease. MC value loss is zero by design. '
         'V is remaining stochastic return, not current map quality or one greedy return.</p>'
         f'<p>Recorded: {len(history)} epochs, {len(batches)} rollout batches, {len(updates)} optimizer updates. '
@@ -428,14 +434,18 @@ def refresh_overview(root, cfg):
     panels(directory/"training_comparison.png", history, [
         ("Total objective", ["loss"]), ("Policy loss", ["policy_loss"]), ("Value loss (MC=0)", ["value_loss"]),
         ("Training return", ["return_mean"]), ("STOP", ["first_stop_fraction"]), ("Refine depth", ["refine_mean"])],
-        group_key="job", title="V / MC | matched protocol, fixed final epoch")
+        group_key="job", title=cfg.get("protocol", "PPO")+" | raw rewards may differ across arms")
     final = read_csv(root/"results"/"macro_metrics.csv")
+    if cfg.get("protocol") == "mara_ppo_locsafe_v1":
+        final = [r for r in final if r.get("role") in ("source_dev", "target_full")]
     if final:
         plt = pyplot()
         fig, axes = plt.subplots(2, 2, figsize=(13, 8))
         datasets = sorted({r["dataset"] for r in final})
         for ax, metric in zip(axes.flat, ("PRO", "P_AUROC", "F1", "background_FPR_at_05")):
-            for offset, arm in enumerate(("Base", "V", "MC")):
+            arms = ("Base", *cfg.get("arms", ("V", "MC")))
+            width = .8/len(arms)
+            for offset, arm in enumerate(arms):
                 means, stds = [], []
                 for dataset in datasets:
                     values = {r["seed"]: number(r, metric) for r in final if r["dataset"] == dataset and r["arm"] == arm
@@ -443,19 +453,19 @@ def refresh_overview(root, cfg):
                     values = [v for v in values.values() if math.isfinite(v)]
                     means.append(float(np.mean(values)) if values else float("nan"))
                     stds.append(float(np.std(values)) if len(values) > 1 else 0.)
-                ax.bar(np.arange(len(datasets))+(offset-1)*.25, means, width=.24, yerr=stds, label=arm, capsize=3)
+                ax.bar(np.arange(len(datasets))+(offset-(len(arms)-1)/2)*width, means, width=width*.95, yerr=stds, label=arm, capsize=3)
             ax.set_xticks(np.arange(len(datasets)), datasets)
             ax.set_title(metric+" (raw 0-1 units)")
             ax.legend(fontsize=8)
             ax.grid(axis="y", alpha=.2)
-        fig.suptitle("Fixed FINAL epoch | category macro; seed mean +/- std (not CI); source holdout / targets differ")
+        fig.suptitle("Category macro; seed mean +/- std (not CI); consult protocol for checkpoint selection")
         fig.tight_layout()
         atomic_figure(fig, directory/"final_metrics.png")
     probe = read_csv(root/"results"/"value_probe.csv")
     if probe:
         plt = pyplot()
         fig, ax = plt.subplots(figsize=(7, 5))
-        for arm in ("V", "MC"):
+        for arm in sorted({r["arm"] for r in probe}):
             rows = [r for r in probe if r["arm"] == arm]
             ax.errorbar([number(r, "v_prediction") for r in rows], [number(r, "mc_return_mean") for r in rows],
                         yerr=[number(r, "mc_standard_error") for r in rows], fmt="o", markersize=3, alpha=.6, label=arm)
