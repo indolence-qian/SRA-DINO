@@ -358,3 +358,12 @@ If you use this work, please cite:
 ```
 
 ⭐ Star this repo if you find it useful!
+
+# Three-stage alignment ablations
+
+The new `run_exp_alignment_stages.sh` reads an existing sealed v1 experiment without modifying it,
+then runs H1/H2/H3, source-gated teacher/late-fusion T ablations, and frontend-locked R reference ablations.
+It records source PRO/AP and diagnostic BCE selectors separately, supports per-epoch resume and fixed-data
+multi-seed runs, and keeps target labels evaluation-only. See
+[running instructions](docs/alignment_stages_running.md) and the
+[experiment protocol](docs/stage1_alignment_three_stage_plan.md). New modes are not parameters of the v1 script.
