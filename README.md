@@ -367,3 +367,5 @@ It records source PRO/AP and diagnostic BCE selectors separately, supports per-e
 multi-seed runs, and keeps target labels evaluation-only. See
 [running instructions](docs/alignment_stages_running.md) and the
 [experiment protocol](docs/stage1_alignment_three_stage_plan.md). New modes are not parameters of the v1 script.
+For the interrupted `2f826ad` residual-parity error, the runner now supports an explicitly audited
+`REPAIR_EXPORT=1 START_PHASE=2` recovery that preserves H checkpoints; see the running instructions.

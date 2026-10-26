@@ -18,11 +18,12 @@ RUN_EVAL="${RUN_EVAL:-1}"
 RUN_EXTRA_EXPORT="${RUN_EXTRA_EXPORT:-1}"
 RUN_BENCHMARK="${RUN_BENCHMARK:-1}"
 RUN_AUX0="${RUN_AUX0:-0}"
+REPAIR_EXPORT="${REPAIR_EXPORT:-0}"
 CONTINUE_ON_SOURCE_FALLBACK="${CONTINUE_ON_SOURCE_FALLBACK:-0}"
 [[ -f "${V1_DIR}/config.json" && -f "${V1_DIR}/sealed.json" ]] || { echo 'V1_DIR must contain the original config, sealed cache, source masks and Base paths.'; exit 1; }
 [[ "${GPU_IDS}" =~ ^[0-9]+(,[0-9]+)*$ && "${TRAIN_SEEDS}" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo 'Use comma-separated distinct GPU ids and integer train seeds.'; exit 1; }
 [[ "${START_PHASE}" =~ ^[123]$ && "${STOP_PHASE}" =~ ^[123]$ && "${START_PHASE}" -le "${STOP_PHASE}" ]] || { echo 'Require 1 <= START_PHASE <= STOP_PHASE <= 3.'; exit 1; }
-for flag in "${RUN_TRAIN}" "${RUN_EVAL}" "${RUN_EXTRA_EXPORT}" "${RUN_BENCHMARK}" "${RUN_AUX0}" "${CONTINUE_ON_SOURCE_FALLBACK}"; do
+for flag in "${RUN_TRAIN}" "${RUN_EVAL}" "${RUN_EXTRA_EXPORT}" "${RUN_BENCHMARK}" "${RUN_AUX0}" "${REPAIR_EXPORT}" "${CONTINUE_ON_SOURCE_FALLBACK}"; do
   [[ "${flag}" == 0 || "${flag}" == 1 ]] || { echo 'Stage flags must be 0 or 1.'; exit 1; }
 done
 IFS=',' read -r -a GPUS <<< "${GPU_IDS}"
@@ -47,6 +48,10 @@ COMMON=(--work_dir "${WORK_DIR}" --until_epoch "${TRAIN_UNTIL_EPOCH}")
 FORCE=()
 [[ "${CONTINUE_ON_SOURCE_FALLBACK}" == 0 ]] || FORCE=(--continue_on_fallback)
 CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${TRAIN_PYTHON}" -c "import torch,numpy,scipy,sklearn,cv2,PIL; assert torch.cuda.is_available() and torch.cuda.device_count()==${#GPUS[@]}; print('torch',torch.__version__)"
+if [[ "${REPAIR_EXPORT}" == 1 ]]; then
+  # Only the audited, interrupted H-only release is compatible. No H/v1 file changes.
+  "${TRAIN_PYTHON}" "${DRIVER}" --stage repair_export "${COMMON[@]}"
+fi
 "${TRAIN_PYTHON}" "${DRIVER}" --stage prepare "${COMMON[@]}" --v1_dir "${V1_DIR}" \
   --epochs "${HEAD_EPOCHS}" --workers "${LOADER_WORKERS:-2}" --num_shards "${#GPUS[@]}" \
   --alphas "${REPAIR_ALPHAS:-0,0.05,0.1,0.25,0.5,1}" --keep_weight "${KEEP_WEIGHT:-0.1}"
@@ -84,7 +89,7 @@ train_modes() {
 export_partition() {
   local partition="$1" slot
   if [[ "${RUN_EXTRA_EXPORT}" == 1 ]]; then
-    # The first real query must pass parity against the old sealed global/local evidence.
+    # Check only visual/Base evidence actually consumed by T; R uses sealed v1.
     CUDA_VISIBLE_DEVICES="${GPUS[0]}" "${TRAIN_PYTHON}" "${DRIVER}" --stage export "${COMMON[@]}" --partition "${partition}" --shard_id 0 --probe
     PIDS=()
     for slot in "${!GPUS[@]}"; do

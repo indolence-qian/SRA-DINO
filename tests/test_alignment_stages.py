@@ -18,9 +18,12 @@ from tools.alignment_stages import (
     AlignmentHead, ResidualHead, TeacherExtractor, best_source, bundle_prediction, eligible, head_bundle,
     head_loss, normal_cells, teacher_loss,
 )
-from tools.reference_highres import EvidenceHead, arm_inputs
+from tools.alignment_cache import (
+    EXTRA_LAYOUT, OLD_RELEASE_CODE, repair_interrupted_export, verify_execution, visual_parity,
+)
+from tools.reference_highres import EvidenceHead, arm_inputs, match_reference
 from tools.upstream_repair import constrained_loss
-from tools.vlm_review import file_digest, load_json
+from tools.vlm_review import atomic_json, digest, file_digest, load_json
 from tests.test_reference_highres import FakeExtractor
 import tests.test_reference_highres as legacy_tests
 
@@ -176,6 +179,118 @@ class FakeTeacher(FakeExtractor):
         return g,tiles,boxes
 
 
+class CacheParityTests(unittest.TestCase):
+    def views(self):
+        view = dict(query=torch.tensor([[[[8.003, .10001], [0., -.10001]]]]),
+                    prior=torch.full((1, 2, 2), .2), base=torch.full((1, 4, 4), .2))
+        old = {prefix+"_"+key: value.numpy().astype(np.float32 if key=="base" else np.float16)
+               for prefix in ("global", "high") for key, value in view.items()}
+        return view, old
+
+    def test_visual_rounding_budget_does_not_relax_base_or_hide_real_drift(self):
+        view, old = self.views()
+        report = visual_parity(view, view, old)
+        self.assertTrue(report["passed"])
+        self.assertGreater(report["fields"]["global_query"]["max_abs"], .001)
+        changed = {key: value.clone() for key, value in view.items()}
+        changed["base"] += .0001
+        changed["query"] += .02
+        report = visual_parity(changed, view, old)
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["fields"]["global_base"]["passed"])
+        self.assertFalse(report["fields"]["global_query"]["passed"])
+        self.assertEqual(len(report["fields"]), 6)
+        self.assertTrue(report["fields"]["high_base"]["passed"])
+
+    def test_shape_and_nonfinite_failures_are_explicit(self):
+        view, old = self.views()
+        old["global_query"] = np.zeros((1,), dtype=np.float16)
+        old["high_prior"][0, 0, 0] = np.nan
+        report = visual_parity(view, view, old)
+        self.assertFalse(report["passed"])
+        self.assertIn("reason", report["fields"]["global_query"])
+        self.assertIn("reason", report["fields"]["high_prior"])
+
+    def test_near_tie_residual_jump_is_not_a_t_export_dependency(self):
+        q = F.normalize(torch.tensor([[[1., 1e-5, 0.]]]), dim=-1)
+        other = F.normalize(torch.tensor([[[1., -1e-5, 0.]]]), dim=-1)
+        refs = F.normalize(torch.tensor([[[1., 0., 0.], [1., 0., .01],
+                                          [1., .02, 0.], [1., -.02, 0.]]]), dim=-1)
+        a, _, _ = match_reference(q, refs, torch.zeros(1, 2), torch.zeros(4, 2), radius=0)
+        b, _, _ = match_reference(other, refs, torch.zeros(1, 2), torch.zeros(4, 2), radius=0)
+        self.assertGreater(float((a-b).abs().max()), .001)
+        view = dict(query=other.permute(0, 2, 1).reshape(1, 3, 1, 1),
+                    prior=torch.full((1, 1, 1), .2), base=torch.full((1, 4, 4), .2))
+        old = {prefix+"_"+key: value.numpy().astype(np.float32 if key=="base" else np.float16)
+               for prefix in ("global", "high") for key, value in view.items()}
+        old["global_query"] = q.permute(0, 2, 1).numpy().reshape(1, 3, 1, 1).astype(np.float16)
+        old["global_residual"] = a.numpy()
+        report = visual_parity(view, view, old)
+        self.assertTrue(report["passed"])
+        self.assertNotIn("global_residual", report["fields"])
+
+
+class CacheRepairTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.cfg = dict(protocol="alignment_three_stage_v2", new_code=OLD_RELEASE_CODE)
+        self.actual = dict(OLD_RELEASE_CODE, **{"alignment_stages_experiment.py": "fixed",
+                                               "run_exp_alignment_stages.sh": "fixed",
+                                               "tools/alignment_cache.py": "new"})
+        atomic_json(self.root/"config.json", self.cfg)
+        self.head = self.root/"runs"/"seed42"/"heads"/"H1"/"last.pt"
+        self.head.parent.mkdir(parents=True)
+        self.head.write_bytes(b"unchanged H checkpoint")
+        (self.root/"extra").mkdir()
+        (self.root/"extra"/"partial.npz").write_bytes(b"recoverable partial export")
+
+    def test_repair_preserves_h_and_config_and_is_audited_and_idempotent(self):
+        before = file_digest(self.head), file_digest(self.root/"config.json")
+        repair_interrupted_export(self.root, self.actual)
+        self.assertEqual(before, (file_digest(self.head), file_digest(self.root/"config.json")))
+        archive = self.root/"recovery"/"extra_before_visualfix1"/"partial.npz"
+        self.assertEqual(archive.read_bytes(), b"recoverable partial export")
+        self.assertFalse((self.root/"extra").exists())
+        self.assertTrue(verify_execution(self.root, self.cfg, self.actual))
+        # After a repair, later T work and extra seals must not be moved on rerun.
+        (self.root/"extra").mkdir()
+        (self.root/"extra"/"new.npz").write_bytes(b"keep resumed export")
+        (self.root/"extra_source_seal.json").write_text("{}")
+        repair_interrupted_export(self.root, self.actual)
+        self.assertTrue((self.root/"extra"/"new.npz").exists())
+        with self.assertRaisesRegex(ValueError, "Invalid/stale"):
+            verify_execution(self.root, self.cfg, dict(self.actual, **{"tools/alignment_cache.py": "changed"}))
+
+    def test_repair_refuses_completed_or_unknown_runs_without_moving_data(self):
+        for name in ("extra_source_seal.json", "extra_eval_seal.json", "distance_stats.json"):
+            path = self.root/name
+            path.write_text("{}")
+            with self.assertRaisesRegex(ValueError, "sealed or later-stage"):
+                repair_interrupted_export(self.root, self.actual)
+            path.unlink()
+        t = self.head.parent.parent/"T10"
+        t.mkdir()
+        with self.assertRaisesRegex(ValueError, "existing T"):
+            repair_interrupted_export(self.root, self.actual)
+        t.rmdir()
+        bad = dict(self.cfg, new_code=dict(OLD_RELEASE_CODE, **{"alignment_stages_experiment.py": "unknown"}))
+        atomic_json(self.root/"config.json", bad)
+        with self.assertRaisesRegex(ValueError, "unmodified"):
+            repair_interrupted_export(self.root, self.actual)
+        self.assertTrue((self.root/"extra"/"partial.npz").exists())
+        self.assertFalse((self.root/"export_repair.json").exists())
+
+    def test_interrupted_rename_is_restartable(self):
+        with patch.object(Path, "rename", side_effect=OSError("interrupted")):
+            with self.assertRaisesRegex(OSError, "interrupted"):
+                repair_interrupted_export(self.root, self.actual)
+        self.assertEqual(load_json(self.root/"export_repair.json")["status"], "prepared")
+        repair_interrupted_export(self.root, self.actual)
+        self.assertTrue(verify_execution(self.root, self.cfg, self.actual))
+
+
 class IntegrationTests(unittest.TestCase):
     def setUp(self):
         self.fixture=legacy_tests.PipelineTests("test_prepare_content_families_and_reference_protocol")
@@ -196,18 +311,68 @@ class IntegrationTests(unittest.TestCase):
         app.seal_extra(self.args)
 
     def test_mask_free_extra_export_and_seal_failure(self):
-        self.extra("source"); self.extra("eval")
+        old_sha = file_digest(self.old/"sealed.json")
+        with patch.object(app, "pack_view", side_effect=AssertionError("T export recomputed references")):
+            self.extra("source"); self.extra("eval")
+        self.assertEqual(old_sha, file_digest(self.old/"sealed.json"))
         cfg=app.config(self.root)
         row=app.selected_rows(cfg,"eval")[0]
         sample=app.FeatureData(self.root,cfg,[row],extra=True,masks=False)[0]
         self.assertNotIn("mask",sample)
         self.assertTrue(all("teacher" not in v for v in sample["views"]))
+        self.assertTrue(all(set(v)=={"query", "prior", "base"} for v in sample["views"]))
+        self.assertTrue(load_json(self.root/"parity"/"eval"/f"{row['id']}.json")["passed"])
         with self.assertRaisesRegex(ValueError,"Target masks"):
             app.FeatureData(self.root,cfg,[row],masks=True)
         path=self.root/"extra"/f"{row['id']}.npz"
         path.write_bytes(b"changed")
         with self.assertRaisesRegex(ValueError,"Cache modified"):
             app.FeatureData(self.root,cfg,[row],extra=True)[0]
+
+    def test_failed_visual_parity_saves_all_diagnostics_but_no_cache(self):
+        class WrongBase(FakeTeacher):
+            def image_views(self, image):
+                g, tiles, boxes = super().image_views(image)
+                g["base"] += .01
+                return g, tiles, boxes
+        self.args.partition = "source"; self.args.shard_id = 0
+        row = app.selected_rows(app.config(self.root), "source")[0]
+        with patch.object(app, "TeacherExtractor", WrongBase):
+            with self.assertRaisesRegex(ValueError, "Visual/Base parity failed"):
+                app.export_extra(self.args)
+        report = load_json(self.root/"parity"/"source"/f"{row['id']}.json")
+        self.assertFalse(report["passed"])
+        self.assertEqual(len(report["fields"]), 6)
+        self.assertFalse((self.root/"extra"/f"{row['id']}.npz").exists())
+
+    def test_old_h_checkpoints_resume_after_explicit_export_repair_without_rebinding(self):
+        cfg = load_json(self.root/"config.json")
+        cfg.pop("extra_layout")
+        cfg["new_code"] = OLD_RELEASE_CODE
+        atomic_json(self.root/"config.json", cfg)
+        # Emulate original release H training; model/loss/training math is unchanged.
+        with patch.object(app, "verify_execution", return_value=False):
+            for mode in ("H1", "H2", "H3"):
+                self.args.mode = mode; app.train(self.args)
+        before = {str(p): file_digest(p) for p in (self.root/"runs").rglob("*.pt")}
+        config_sha = file_digest(self.root/"config.json")
+        (self.root/"extra").mkdir()
+        (self.root/"extra"/"partial.npz").write_bytes(b"old incomplete cache")
+        app.repair_export(self.args)
+        app.prepare(self.args)
+        self.assertEqual(config_sha, file_digest(self.root/"config.json"))
+        for path, sha in before.items():
+            self.assertEqual(sha, file_digest(path))
+        app.stage_gate(self.args)
+        self.extra("source")
+        self.args.mode = "H3"; self.args.until_epoch = 2; app.train(self.args)
+        saved = torch.load(app.run_dir(self.root, 42, "H3")/"last.pt", weights_only=False)
+        self.assertEqual(saved["identity"]["fingerprint"], digest(cfg))
+        self.assertEqual(saved["epoch"], 2)
+        self.args.mode = "T10"; app.train(self.args)
+        self.args.workers = 1
+        with self.assertRaisesRegex(ValueError, "Configuration changed"):
+            app.prepare(self.args)
 
     def test_three_stages_resume_freeze_report_and_target_isolation(self):
         self.extra("source")
@@ -283,13 +448,27 @@ class IntegrationTests(unittest.TestCase):
         self.assertFalse(app.reference_gate(self.args))
         self.assertNotEqual(app.run_dir(self.root,42,"R2",dict(parent,sha="a")),app.run_dir(self.root,42,"R2",dict(parent,sha="b")))
 
+    def test_phase_three_locks_best_t_frontend_not_h3_only(self):
+        cfg = app.config(self.root)
+        baseline = dict(PRO_exact=.5, P_AP=.1, alpha=0., epoch=0)
+        atomic_json(self.root/"decisions"/"seed42_gate.json", dict(allowed=True))
+        for index, mode in enumerate(("H3", "T10", "T01", "T11")):
+            out = app.run_dir(self.root, 42, mode)
+            point = dict(PRO_exact=.6+index*.05, P_AP=.2, alpha=.1, epoch=1)
+            app.legacy.save_torch(out/"last.pt", dict(epoch=1))
+            app.legacy.save_torch(out/"best_primary.pt", dict(point=point, baseline=baseline,
+                                  identity=dict(fingerprint=digest(cfg))))
+        self.args.front_level = 3
+        app.select_front(self.args)
+        self.assertEqual(load_json(self.root/"decisions"/"seed42_front.json")["mode"], "T11")
+
 
 BASH=os.environ.get("ALIGNMENT_TEST_BASH") or os.environ.get("SRA_TEST_BASH")
 
 
 @unittest.skipUnless(BASH,"Set SRA_TEST_BASH to Git Bash")
 class ShellTests(unittest.TestCase):
-    def run_shell(self,fail="NEVER",gate=0,gpus="0,1"):
+    def run_shell(self,fail="NEVER",gate=0,gpus="0,1",repair=False):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)
             shutil.copyfile(app.REPO/"run_exp_alignment_stages.sh",root/"run.sh")
@@ -301,6 +480,7 @@ class ShellTests(unittest.TestCase):
             for name in ("fake_python","flock"):
                 (root/name).chmod(0o755)
             env=os.environ.copy(); env.update(TRAIN_PYTHON="./fake_python",V1_DIR="./v1",WORK_DIR="./output",GPU_IDS=gpus,FAIL_STAGE=fail,GATE_CODE=str(gate))
+            env.update(REPAIR_EXPORT="1" if repair else "0", START_PHASE="2" if repair else "1")
             env["PATH"]=str(root)+os.pathsep+str(Path(BASH).parent)+os.pathsep+env.get("PATH","")
             return subprocess.run([BASH,"run.sh"],cwd=root,env=env,text=True,capture_output=True,timeout=45)
 
@@ -320,6 +500,14 @@ class ShellTests(unittest.TestCase):
         result=self.run_shell(fail="--mode T01")
         self.assertNotEqual(result.returncode,0); self.assertNotIn("--stage evaluate",result.stdout)
         self.assertNotEqual(self.run_shell(gpus="0,0").returncode,0)
+
+    def test_repair_runs_before_prepare_and_skips_h_training(self):
+        result = self.run_shell(repair=True)
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertLess(result.stdout.index("--stage repair_export"), result.stdout.index("--stage prepare"))
+        self.assertLess(result.stdout.index("--stage prepare"), result.stdout.index("--mode T10"))
+        self.assertNotIn("--mode H1", result.stdout)
+        self.assertIn("--mode R3", result.stdout)
 
 
 if __name__=="__main__":

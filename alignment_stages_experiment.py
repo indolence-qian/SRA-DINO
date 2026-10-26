@@ -20,6 +20,9 @@ import torch
 from torch.nn import functional as F
 
 import reference_highres_experiment as legacy
+from tools.alignment_cache import (
+    EXTRA_LAYOUT, VISUAL_FIELDS, repair_interrupted_export, verify_execution, visual_parity, visual_view,
+)
 from tools.alignment_stages import (
     CORE_HEADS, HEAD_MODES, KEEP, LATE, AlignmentHead, ResidualHead, TeacherExtractor,
     batch_stitch, best_source, binary_selection_loss, bundle_prediction, bundle_training_logits, early_inputs, eligible,
@@ -31,12 +34,16 @@ from tools.vlm_review import atomic_json, digest, file_digest, load_json
 
 PROTOCOL = "alignment_three_stage_v2"
 REPO = Path(__file__).resolve().parent
-NEW_CODE = ("alignment_stages_experiment.py", "tools/alignment_stages.py", "run_exp_alignment_stages.sh")
+NEW_CODE = ("alignment_stages_experiment.py", "tools/alignment_stages.py", "run_exp_alignment_stages.sh", "tools/alignment_cache.py")
+
+
+def execution_code():
+    return {p: file_digest(REPO / p) for p in NEW_CODE}
 
 
 def prepare(args):
     root, old = Path(args.work_dir).resolve(), Path(args.v1_dir).resolve()
-    if root == old or old in root.parents and root.name in ("features", "results", "heads"):
+    if root == old or old in root.parents or root in old.parents:
         raise ValueError("Use an independent WORK_DIR, never a v1 cache directory")
     original = legacy.cfg_load(old)
     sealed = load_json(old / "sealed.json")
@@ -58,17 +65,24 @@ def prepare(args):
                v1_seal_sha=file_digest(old / "sealed.json"), original_protocol=original["protocol"],
                epochs=args.epochs, alphas=alphas, keep_weight=args.keep_weight, workers=args.workers, num_shards=args.num_shards,
                data_seed=original["seed"], projection_seed=original["seed"], reference_seed=original["seed"],
-               new_code={p: file_digest(REPO / p) for p in NEW_CODE}, panel_ids=panel,
+               new_code=execution_code(), extra_layout=EXTRA_LAYOUT, panel_ids=panel,
                selection="source-category macro PRO/AP Pareto against alpha=0; PRO,AP,alpha,epoch order",
                reference_alphas=[0., .05, .1, .25, .5], target_labels="evaluation only after prediction")
     path = root / "config.json"
-    if path.exists() and load_json(path) != cfg:
-        raise ValueError("Configuration/code changed: use NEW WORK_DIR; old results were not overwritten")
-    atomic_json(path, cfg)
+    if path.exists():
+        previous = load_json(path)
+        if previous != cfg:
+            repaired = verify_execution(root, previous, execution_code())
+            compatible = dict(previous, new_code=cfg["new_code"], extra_layout=EXTRA_LAYOUT)
+            if not repaired or compatible != cfg:
+                raise ValueError("Configuration changed: use NEW WORK_DIR; old results were not overwritten")
+            cfg = previous  # Keep H checkpoint fingerprints and config bytes unchanged.
+    else:
+        atomic_json(path, cfg)
     side=cfg["image_size"]//16
     layers=len(cfg["visual_layers"].split(","))
     teacher_dim=legacy.anchors_for(old).shape[1]
-    per_query=5*(2*layers*(2*cfg["feature_dim"]+3)*side*side+4*cfg["image_size"]**2)
+    per_query=5*(2*layers*(cfg["feature_dim"]+1)*side*side+4*cfg["image_size"]**2)
     source_count=sum(r["partition"] in ("train","val") for r in rows)
     estimate=(len(rows)*per_query+source_count*5*2*teacher_dim*side*side)/2**30
     print(f"Additional full H/T/R cache estimate={estimate:.1f} GiB; free={shutil.disk_usage(root).free/2**30:.1f} GiB (later stages may be skipped)",flush=True)
@@ -80,9 +94,7 @@ def config(root):
     cfg = load_json(Path(root) / "config.json")
     if cfg["protocol"] != PROTOCOL:
         raise ValueError("Wrong three-stage protocol")
-    for name, expected in cfg["new_code"].items():
-        if file_digest(REPO / name) != expected:
-            raise ValueError(f"Code changed: {name}; use NEW WORK_DIR")
+    verify_execution(root, cfg, execution_code())
     old = Path(cfg["v1_root"])
     if file_digest(old / "config.json") != cfg["v1_config_sha"] or file_digest(old / "sealed.json") != cfg["v1_seal_sha"]:
         raise ValueError("v1 experiment identity changed")
@@ -114,18 +126,21 @@ def old_record(cfg, row):
     return seal, load_json(audit_path)
 
 
-def correspondence_panel(query, reference, qxy, rxy, cfg):
-    """Sparse, label-free top-k coordinates, not a full Nquery*Nreference allocation."""
-    indices = torch.linspace(0, query.shape[1] - 1, 12, device=query.device).long().unique()
-    q, ref = query[-1, indices].float(), reference[-1].float()
-    displacement = (qxy[indices, None] - rxy[None]).square().sum(-1)
-    score = q @ ref.T - cfg["spatial_weight"] * displacement
-    if cfg["match_radius"]:
-        score = score.masked_fill(displacement > cfg["match_radius"] ** 2, -torch.inf)
-    values, chosen = score.topk(cfg["match_topk"], dim=1)
-    weights = (values / cfg["match_temperature"]).softmax(1)
-    return dict(query_xy=qxy[indices].cpu().tolist(), reference_xy=rxy[chosen].cpu().tolist(),
-                weights=weights.cpu().tolist(), layer=int(cfg["visual_layers"].split(",")[-1]))
+def repair_export(args):
+    root = Path(args.work_dir)
+    if (root / "config.json").exists():
+        old = load_json(root / "config.json")
+        original = legacy.cfg_load(old["v1_root"])
+        seal = load_json(Path(old["v1_root"]) / "sealed.json")
+        if (seal["fingerprint"] != digest(original)
+                or file_digest(Path(old["v1_root"]) / "config.json") != old["v1_config_sha"]
+                or file_digest(Path(old["v1_root"]) / "sealed.json") != old["v1_seal_sha"]
+                or file_digest(Path(old["v1_root"]) / "anchors.npz") != seal["anchors_sha"]):
+            raise ValueError("Invalid/changed v1 identity, seal or anchors")
+        for row in legacy.records(old["v1_root"]):
+            if row["partition"] in ("train", "val"):
+                legacy.unchanged(row, masks=True)
+    repair_interrupted_export(root, execution_code())
 
 
 def export_extra(args):
@@ -139,7 +154,8 @@ def export_extra(args):
         path = root / "extra" / f"{row['id']}.npz"
         if path.exists() and path.with_suffix(".json").exists():
             audit = load_json(path.with_suffix(".json"))
-            if audit["fingerprint"] != digest(cfg) or audit["sha"] != file_digest(path):
+            if (audit["fingerprint"] != digest(cfg) or audit["sha"] != file_digest(path)
+                    or audit.get("layout") != EXTRA_LAYOUT):
                 raise ValueError("Extra cache changed; use NEW_WORK_DIR")
         else:
             if (root / f"extra_{part}_seal.json").exists():
@@ -152,26 +168,11 @@ def export_extra(args):
     legacy.verify_weights(original)
     device = legacy.device_for(args)
     extractor = TeacherExtractor(original, device)
-    references = {r["id"]: r for r in load_json(Path(cfg["v1_root"]) / "references.json")}
-    bank, current = {}, None
     started = time.monotonic()
     try:
         for index, row in enumerate(pending):
             legacy.unchanged(row)  # Never open a mask in feature export.
             seal, audit = old_record(cfg, row)
-            key = row["dataset"], row["category"]
-            if key != current:
-                bank, current = {}, key
-            extractor.include_teacher = False
-            for ident in audit["references"]:
-                ref = references[ident]
-                if (ref["dataset"], ref["category"]) != key or ref["rgb_sha"] == row["rgb_sha"]:
-                    raise ValueError("Reference provenance/self-match violation")
-                if ident not in bank:
-                    legacy.unchanged(ref)
-                    with Image.open(ref["image_path"]) as image:
-                        g, tiles, boxes = extractor.image_views(image.convert("RGB"))
-                    bank[ident] = (legacy.cpu_view(g), [legacy.cpu_view(t) for t in tiles], boxes)
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
                 torch.cuda.reset_peak_memory_stats(device)
@@ -179,29 +180,18 @@ def export_extra(args):
             extractor.include_teacher = row["partition"] in ("train", "val")
             with Image.open(row["image_path"]) as image:
                 global_view, tiles, boxes = extractor.image_views(image.convert("RGB"))
-            chosen = [bank[i] for i in audit["references"]]
-            side = cfg["image_size"] // 16
-            xy = patch_coordinates(side, device=device)
-            global_ref = torch.cat([ref[0]["raw"].to(device) for ref in chosen], 1)
-            global_xy = xy.repeat(len(chosen), 1)
-            low = pack_view(global_view, global_ref, xy, global_xy, extractor.project, original)
-            high_ref, high_xy = [], []
-            for _, views, ref_boxes in chosen:
-                for view, box in zip(views, ref_boxes):
-                    high_ref.append(view["raw"].to(device))
-                    high_xy.append(patch_coordinates(side, box, device))
-            high_ref, high_xy = torch.cat(high_ref, 1), torch.cat(high_xy)
-            packed = [pack_view(view, high_ref, patch_coordinates(side, box, device), high_xy,
-                                extractor.project, original) for view, box in zip(tiles, boxes)]
+            # T consumes no reference evidence. R continues reading the sealed v1
+            # residual/distance/entropy, not a fresh and potentially different top-k.
+            low = visual_view(global_view, extractor.project)
+            packed = [visual_view(view, extractor.project) for view in tiles]
             high = assemble_tiles(packed, boxes, cfg["feature_grid"], cfg["image_size"])
-            # Check against independently sealed v1 global AND stitched readouts/features.
             with checked_npz(Path(cfg["v1_root"]) / "features" / f"{row['id']}.npz", seal["features"][row["id"]]) as old:
-                for prefix, data in (("global", low), ("high", high)):
-                    for field in ("query", "base", "prior", "residual", "distance", "uncertainty"):
-                        error = float(np.max(np.abs(data[field].cpu().numpy() - old[prefix + "_" + field])))
-                        tolerance = 1e-5 if field == "base" else 1e-3
-                        if error > tolerance:
-                            raise ValueError(f"Real-weight parity failed {row['id']} {prefix}/{field}: {error}")
+                parity = visual_parity(low, high, old)
+            atomic_json(root / "parity" / part / f"{row['id']}.json",
+                        dict(id=row["id"], fingerprint=digest(cfg), execution_code=execution_code(), **parity))
+            if not parity["passed"]:
+                failed = {k: v for k, v in parity["fields"].items() if not v["passed"]}
+                raise ValueError(f"Visual/Base parity failed {row['id']}: {failed}; details: {root / 'parity' / part}")
             arrays = {}
             for v, (data, view) in enumerate(zip([low] + packed, [global_view] + tiles)):
                 for field, value in data.items():
@@ -215,19 +205,19 @@ def export_extra(args):
             seconds = time.monotonic() - tick
             path = root / "extra" / f"{row['id']}.npz"
             legacy.atomic_npz(path, **arrays)
-            panel = correspondence_panel(global_view["raw"], global_ref, xy, global_xy, original) if row["id"] in cfg["panel_ids"] else None
             atomic_json(path.with_suffix(".json"), dict(fingerprint=digest(cfg), sha=file_digest(path),
+                        layout=EXTRA_LAYOUT, parity=parity,
                         old_sha=seal["features"][row["id"]], partition=row["partition"],
                         references=audit["references"], reference_similarity=audit["reference_similarity"],
                         boxes=[[0., 0., 1., 1.]] + boxes, query_seconds=seconds,
                         peak_gib=torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else None,
-                        correspondence=panel, teacher=extractor.include_teacher))
+                        reference_policy="sealed v1 only; no matching in extra export", teacher=extractor.include_teacher))
             print(f"extra {part}/{args.shard_id} {index+1}/{len(pending)} seconds={seconds:.2f}", flush=True)
             if args.probe:
                 break
     finally:
         extractor.close()
-        print(f"extra wall={time.monotonic()-started:.1f}s (includes reference encoding; not per-arm latency)", flush=True)
+        print(f"extra wall={time.monotonic()-started:.1f}s (visual/teacher only; no reference encoding)", flush=True)
 
 
 def seal_extra(args):
@@ -238,13 +228,14 @@ def seal_extra(args):
         audit = load_json(path.with_suffix(".json"))
         old_seal, old_audit = old_record(cfg, row)
         if (audit["fingerprint"] != digest(cfg) or audit["old_sha"] != old_seal["features"][row["id"]]
-                or audit["references"] != old_audit["references"] or audit["partition"] != row["partition"]):
+                or audit["references"] != old_audit["references"] or audit["partition"] != row["partition"]
+                or audit.get("layout") != EXTRA_LAYOUT or not audit.get("parity", {}).get("passed")):
             raise ValueError("Extra cache identity/provenance changed")
         with checked_npz(path, audit["sha"]) as data:
             side, layers = cfg["image_size"] // 16, len(cfg["visual_layers"].split(","))
             for i in range(5):
-                for key in ("query", "residual", "prior", "base", "distance", "uncertainty"):
-                    shape = ((layers, cfg["feature_dim"], side, side) if key in ("query", "residual") else
+                for key in VISUAL_FIELDS:
+                    shape = ((layers, cfg["feature_dim"], side, side) if key == "query" else
                              (1, cfg["image_size"], cfg["image_size"]) if key == "base" else (layers, side, side))
                     value = data[f"v{i}_{key}"]
                     if value.shape != shape or not np.isfinite(value).all():
@@ -256,7 +247,7 @@ def seal_extra(args):
                 elif f"v{i}_teacher" in data:
                     raise ValueError("Target teacher must not become a training input")
         files[row["id"]], metadata[row["id"]] = audit["sha"], file_digest(path.with_suffix(".json"))
-    value = dict(fingerprint=digest(cfg), files=files, metadata=metadata)
+    value = dict(fingerprint=digest(cfg), layout=EXTRA_LAYOUT, files=files, metadata=metadata)
     path = root / f"extra_{args.partition}_seal.json"
     if path.exists() and load_json(path) != value:
         raise ValueError("Extra seal changed")
@@ -273,7 +264,7 @@ class FeatureData(torch.utils.data.Dataset):
         if extra:
             for part in {"eval" if r["partition"] == "eval" else "source" for r in rows}:
                 seal = load_json(self.root / f"extra_{part}_seal.json")
-                if seal["fingerprint"] != digest(cfg):
+                if seal["fingerprint"] != digest(cfg) or seal.get("layout") != EXTRA_LAYOUT:
                     raise ValueError("Extra seal fingerprint changed")
                 self.seals[part] = seal
 
@@ -611,7 +602,7 @@ def select_front(args):
     root, cfg = Path(args.work_dir), config(args.work_dir)
     modes = ["H3"]
     gate = load_json(root / "decisions" / f"seed{args.train_seed}_gate.json")
-    if args.front_level == 2 and gate["allowed"]:
+    if args.front_level >= 2 and gate["allowed"]:
         modes.extend(("T10", "T01", "T11"))
     choices = []
     for mode in modes:
@@ -1096,7 +1087,7 @@ def report(args):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--stage",required=True,choices=("prepare","export","seal","train","gate","select","reference_gate","fit_distance","calibrate_r1","evaluate","report","audit","benchmark"))
+    p.add_argument("--stage",required=True,choices=("prepare","repair_export","export","seal","train","gate","select","reference_gate","fit_distance","calibrate_r1","evaluate","report","audit","benchmark"))
     p.add_argument("--work_dir",required=True)
     p.add_argument("--v1_dir",default="")
     p.add_argument("--partition",choices=("source","eval"),default="source")
@@ -1121,7 +1112,7 @@ def parser():
 
 def main():
     args = parser().parse_args()
-    stages = dict(prepare=prepare,export=export_extra,seal=seal_extra,train=train,gate=stage_gate,select=select_front,
+    stages = dict(prepare=prepare,repair_export=repair_export,export=export_extra,seal=seal_extra,train=train,gate=stage_gate,select=select_front,
                   reference_gate=reference_gate,fit_distance=fit_distance,calibrate_r1=calibrate_r1,evaluate=evaluate,report=report,
                   audit=source_audit,benchmark=benchmark)
     result = stages[args.stage](args)
