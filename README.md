@@ -5,6 +5,23 @@
 
 ![](asset/comparison.png)
 
+## Residual-first normal-reference / high-resolution / text-delta experiment
+
+新增独立入口 [`run_exp_residual_text.sh`](run_exp_residual_text.sh)：冻结原始预训练 DINO，
+查询与全部 K 张正常参考先匹配相减，再进行残差分布学习与冻结 CLIP 文本差异对齐。
+全局/局部各自检测后晚融合；不使用旧 Base/HFA 分数直通，不运行 RL/VLM，不改写旧缓存。
+包含全局/高分辨率距离、残差、文本及融合8组、源类别留出选模、目标预测先封存再评价及断点恢复。
+完整运行、续训、可选源区域语义标注和结果说明见 [`docs/residual_first_hr_text.md`](docs/residual_first_hr_text.md)。
+
+```bash
+GPU_IDS=0,1 REFERENCE_COUNT=4 EPOCHS=15 TRAIN_UNTIL_EPOCH=5 \
+  DINO_WEIGHTS=./dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth \
+  CLIP_WEIGHTS=./CLIP/ckpt/ViT-L-14-336px.pt \
+  bash run_exp_residual_text.sh
+```
+
+此设置允许目标正常支持，不是无参考零样本；二值mask默认仅训练通用异常方向，不宣称细粒度缺陷语言理解。
+
 
 ## Abstract
 Zero-Shot Anomaly Detection (ZSAD) seeks to identify anomalies from arbitrary novel categories, offering a scalable and annotation-efficient solution. Traditionally, most ZSAD works have been based on the CLIP model, which performs anomaly detection by calculating the similarity between visual and text embeddings. Recently, vision foundation models such as DINOv3 have demonstrated strong transferable representation capabilities. In this work, we are the first to adapt DINOv3 for ZSAD. However, this adaptation presents two key challenges: (i) the domain bias between large-scale pretraining data and anomaly detection tasks leads to feature misalignment; and (ii) the inherent bias toward global semantics in pretrained representations often leads to subtle anomalies being misinterpreted as part of the normal foreground objects, rather than being distinguished as abnormal regions. To overcome these challenges, we introduce AD-DINOv3, a novel vision-language multimodal framework designed for ZSAD. Specifically, we formulate anomaly detection as a multimodal contrastive learning problem, where DINOv3 is employed as the visual backbone to extract patch tokens and a CLS token, and the CLIP text encoder provides embeddings for both normal and abnormal prompts. To bridge the domain gap, lightweight adapters are introduced in both modalities, enabling their representations to be recalibrated for the anomaly detection task. Beyond this baseline alignment, we further design an Anomaly-Aware Calibration Module (AACM), which explicitly guides the CLS token to attend to anomalous regions rather than generic foreground semantics, thereby enhancing discriminability. Finally, anomaly localization are achieved by measuring the similarity between adapted visual features and prompt embeddings. Extensive experiments on eight industrial and medical benchmarks demonstrate that AD-DINOv3 consistently matches or surpasses state-of-the-art methods, verifying its effectiveness and broad applicability as a general zero-shot anomaly detection framework.
