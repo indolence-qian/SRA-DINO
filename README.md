@@ -5,6 +5,20 @@
 
 ![](asset/comparison.png)
 
+## Normal residual pool experiment
+
+新增独立入口 [`run_exp_normal_pool.sh`](run_exp_normal_pool.sh)：让同类正常参考互相比较，
+建立真实的正常残差池，再用正常变化尺度校正待检测图的残差。保留全局/局部八组直接对照，
+本轮不训练Flow/文本，不自动回退。支持校验后只读复用上一轮查询特征缓存，旧入口和结果不改写。
+
+```bash
+GPU_IDS=0,1 REUSE_DIR=./checkpoint/residual_first_hr_text_v1 \
+  WORK_DIR=./checkpoint/normal_residual_pool_v1 bash run_exp_normal_pool.sh
+```
+
+无旧缓存时用`REUSE_DIR=none`。运行、续跑、结果与自动分析包说明见
+[`docs/normal_residual_pool.md`](docs/normal_residual_pool.md)。
+
 ## Residual-first normal-reference / high-resolution / text-delta experiment
 
 新增独立入口 [`run_exp_residual_text.sh`](run_exp_residual_text.sh)：冻结原始预训练 DINO，
