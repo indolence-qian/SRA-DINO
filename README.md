@@ -5,6 +5,13 @@
 
 ![](asset/comparison.png)
 
+## 高分辨率 × 残差特征四组消融
+
+独立入口 [`run_exp_factorial_ablation.sh`](run_exp_factorial_ablation.sh) 自动运行：
+原图特征/残差特征 × 仅整图/整图加局部。四组使用相同约束器、Flow、文本差分和固定融合权重，
+禁止距离回退，分别报告纯视觉与完整结构指标。实验设计、运行命令及自动填写的结果表见
+[`消融试验.md`](消融试验.md)。旧实验入口与结果保留。
+
 ## Residual-first normal-reference / high-resolution / text-delta experiment
 
 新增独立入口 [`run_exp_residual_text.sh`](run_exp_residual_text.sh)：冻结原始预训练 DINO，
