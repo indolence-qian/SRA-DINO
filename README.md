@@ -383,6 +383,15 @@ If you use this work, please cite:
 
 ⭐ Star this repo if you find it useful!
 
+## Frozen-visual text comparison
+
+For the second, **fixed-visual text comparison**, run `run_exp_text_alignment_ablation.sh`
+against the completed factorial experiment. It shares one frozen D/Flow and residual
+cache across single-delta, ordinary normal/abnormal, and 24-pair mean-delta text heads.
+It includes a common visual control, explicit dataset image labels, audited nonzero
+masks, and paired text gains. See [design, one-command run and results](对比实验.md).
+The previous factorial implementation and sealed artifacts remain unchanged.
+
 # Three-stage alignment ablations
 
 The new `run_exp_alignment_stages.sh` reads an existing sealed v1 experiment without modifying it,
