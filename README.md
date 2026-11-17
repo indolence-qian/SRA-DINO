@@ -391,6 +391,10 @@ cache across single-delta, ordinary normal/abnormal, and 24-pair mean-delta text
 It includes a common visual control, explicit dataset image labels, audited nonzero
 masks, and paired text gains. See [design, one-command run and results](对比实验.md).
 The previous factorial implementation and sealed artifacts remain unchanged.
+If BTAD empty anomaly masks stop evaluation, `run_repair_text_evaluation.sh`
+audits and reevaluates locked predictions without retraining. Image labels stay
+intact; incomplete full-set pixel metrics and valid-mask subset diagnostics are
+reported separately. See the recovery command in [对比实验.md](对比实验.md).
 
 # Three-stage alignment ablations
 
