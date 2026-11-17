@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import warnings
 from unittest.mock import patch
 import zipfile
 
@@ -17,29 +18,43 @@ from tools.vlm_review import file_digest,load_json
 
 
 class MetricTests(unittest.TestCase):
-    def test_empty_anomaly_keeps_image_label_and_has_no_full_pixel_score(self):
+    def test_empty_anomaly_retained_in_both_image_and_pixel_evaluation(self):
         truth=np.zeros((3,8,8),bool); truth[2,1,1]=True
         maps=np.zeros((3,8,8),np.float32); maps[1]=.8; maps[2,1,1]=.6
-        full,subset=repair.metric_scopes(truth,maps,np.array([0,1,1],bool),np.array([1,0,1],bool),.4)
+        labels=np.array([0,1,1],bool)
+        full,=repair.metric_scopes(truth,maps,labels,.4)
         self.assertEqual(full['I_AUROC'],1.)
         self.assertEqual(full['abnormal_images'],2)
         self.assertEqual(full['images'],3)
-        self.assertEqual(full['pixel_images_valid'],2)
+        self.assertEqual(full['pixel_images_included'],3)
         self.assertEqual(full['empty_anomaly_masks'],1)
-        self.assertTrue(all(full[m] is None for m in repair.PIXEL))
-        self.assertEqual(subset['P_AP'],1.)
-        self.assertEqual(subset['I_AUROC'],full['I_AUROC'])
+        self.assertLess(full['P_AP'],1.)  # High scores on zero GT count as pixel FPs.
+        expected=repair.app.corrected_metrics(truth,maps,labels,.4)
+        for m in repair.app.METRICS: self.assertEqual(full[m],expected[m])
 
-    def test_complete_masks_preserve_original_metrics_and_all_invalid_is_safe(self):
+    def test_complete_masks_preserve_original_metrics_and_all_zero_gt_is_safe(self):
         truth=np.zeros((2,8,8),bool); truth[1,1,1]=True
         maps=truth.astype(np.float32); labels=np.array([0,1],bool)
-        full,subset=repair.metric_scopes(truth,maps,labels,np.ones(2,bool),.5)
+        full,=repair.metric_scopes(truth,maps,labels,.5)
         old=repair.app.corrected_metrics(truth,maps,labels,.5)
         for m in repair.app.METRICS:
-            self.assertEqual(full[m],old[m]); self.assertEqual(full[m],subset[m])
-        full,subset=repair.metric_scopes(truth,maps,labels,np.zeros(2,bool),.5)
-        self.assertTrue(all(subset[m] is None for m in repair.PIXEL))
+            self.assertEqual(full[m],old[m])
+        truth[:]=False; maps[1]=1
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore',UserWarning)
+            full,=repair.metric_scopes(truth,maps,labels,.5)
+        self.assertIsNone(full['P_AP'])  # No foreground in the entire class.
         self.assertEqual(full['I_AUROC'],1.)
+        self.assertEqual(full['background_FPR_source_threshold'],.5)
+        self.assertEqual(full['pixel_images_included'],2)
+
+    def test_btad_directory_labels_are_independent_of_mask_pixels(self):
+        row=dict(dataset='btad',image_path='/data/03/test/ko/0030.bmp',mask_path='/data/03/ground_truth/ko/0030.bmp')
+        self.assertTrue(repair.dataset_label(row))
+        row.update(image_path='/data/03/test/ok/0030.bmp',mask_path=None)
+        self.assertFalse(repair.dataset_label(row))
+        row['mask_path']='/data/03/ground_truth/ko/0030.bmp'
+        with self.assertRaisesRegex(ValueError,'contradiction'): repair.dataset_label(row)
 
     def test_unavailable_class_not_silently_removed_from_macro_mean(self):
         rows=[dict(dataset='d',category='one',I_AUROC=.6,P_AP=.9),
@@ -79,19 +94,22 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(before,{str(p):file_digest(p) for p in self.fixture.root.rglob('*') if p.is_file()})
         with (self.root/'reports/summary.csv').open(encoding='utf-8-sig') as stream:
             summary=list(csv.DictReader(stream))
-        self.assertEqual(len(summary),14)
-        self.assertTrue(all(r['P_AP']=='' for r in summary if r['scope']=='full_set'))
-        self.assertTrue(all(r['P_AP']!='' for r in summary if r['scope']=='valid_masks_diagnostic'))
+        self.assertEqual(len(summary),7)
+        self.assertEqual({r['scope'] for r in summary},{'full_set'})
+        self.assertTrue(all(r['P_AP']!='' for r in summary))
         with (self.root/'empty_masks.csv').open(encoding='utf-8-sig') as stream:
             empty=list(csv.DictReader(stream))
         self.assertEqual(len(empty),1); self.assertEqual(empty[0]['mask_path'],row['mask_path'])
         self.assertTrue(list((self.root/'empty_mask_previews').glob('*.png')))
+        self.assertTrue(list((self.root/'panels').rglob('*.png')))
+        self.assertTrue((self.root/'reports/selected_epochs.csv').is_file())
         text=(self.root/'reports/对比实验.md').read_text(encoding='utf-8')
-        self.assertIn('不能标作标准完整BTAD',text)
+        self.assertIn('保留全部样本',text)
         self.assertIn('T1-T2',text); self.assertIn('T3-T1',text)
         with zipfile.ZipFile(next(self.root.glob('text_reevaluation_analysis_*.zip'))) as archive:
             self.assertIn('reports/对比实验.md',archive.namelist())
             self.assertIn('empty_masks.csv',archive.namelist())
+            self.assertIn('provenance/official_zero_mask_reference.json',archive.namelist())
             self.assertFalse(any(n.endswith(('.pt','.npz')) for n in archive.namelist()))
         self.run_evaluation()  # Idempotent resume.
         Image.fromarray(np.ones((row['native_size'][1],row['native_size'][0]),np.uint8)).save(row['mask_path'])
@@ -108,10 +126,13 @@ class WorkflowTests(unittest.TestCase):
         self.run_evaluation()
         with (self.root/'reports/summary.csv').open(encoding='utf-8-sig') as stream:
             rows=list(csv.DictReader(stream))
-        full={(r['arm'],r['score']):r for r in rows if r['scope']=='full_set'}
-        subset={(r['arm'],r['score']):r for r in rows if r['scope']=='valid_masks_diagnostic'}
-        for key,a in full.items():
-            for m in repair.app.METRICS: self.assertEqual(a[m],subset[key][m])
+        self.assertEqual({r['scope'] for r in rows},{'full_set'})
+        self.fixture.args.shard_id=0; repair.app.evaluate(self.fixture.args)
+        old=load_json(self.fixture.root/'metrics/seed42/through1/mvtec__target.json')['metrics']
+        new=load_json(self.root/'metrics/seed42/mvtec__target.json')['records']
+        lookup={(r['arm'],r['score']):r for r in old}
+        for r in new:
+            for m in repair.app.METRICS: self.assertEqual(r[m],lookup[(r['arm'],r['score'])][m])
         (repair.app.prediction_dir(self.fixture.root,42,1)/'locked.json').unlink()
         with patch.object(repair.app,'evaluation_truth',side_effect=AssertionError('GT read too early')):
             with self.assertRaises(FileNotFoundError): repair.prepare(self.args)
@@ -119,6 +140,21 @@ class WorkflowTests(unittest.TestCase):
 
 @unittest.skipUnless(previous.original.BASH,'Set SRA_TEST_BASH to Git Bash')
 class ShellTests(unittest.TestCase):
+    def test_new_full_runner_keeps_original_training_and_uses_v3_evaluation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp); shutil.copyfile(repair.REPO/'run_exp_text_comparison_v3.sh',root/'run.sh')
+            (root/'run_exp_text_alignment_ablation.sh').write_bytes(b'#!/usr/bin/env bash\necho "TRAIN EVAL=$RUN_EVAL PACKAGE=$RUN_PACKAGE WORK=$WORK_DIR UNTIL=$TRAIN_UNTIL_EPOCH"\n[[ "${FAIL_TRAIN:-0}" == 0 ]]\n')
+            (root/'run_repair_text_evaluation.sh').write_bytes(b'#!/usr/bin/env bash\necho "REEVAL WORK=$WORK_DIR UNTIL=$TRAIN_UNTIL_EPOCH"\n')
+            env=os.environ.copy(); env.update(WORK_DIR='./original',TRAIN_UNTIL_EPOCH='15')
+            env['PATH']=str(Path(previous.original.BASH).parent)+os.pathsep+env.get('PATH','')
+            r=subprocess.run([previous.original.BASH,'run.sh'],cwd=root,env=env,capture_output=True,text=True,timeout=30)
+            self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+            self.assertIn('TRAIN EVAL=0 PACKAGE=0 WORK=./original UNTIL=15',r.stdout)
+            self.assertIn('REEVAL WORK=./original UNTIL=15',r.stdout)
+            env['FAIL_TRAIN']='1'
+            r=subprocess.run([previous.original.BASH,'run.sh'],cwd=root,env=env,capture_output=True,text=True,timeout=30)
+            self.assertNotEqual(r.returncode,0); self.assertNotIn('REEVAL WORK=',r.stdout)
+
     def run_script(self,fail='NEVER',**flags):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp); shutil.copyfile(repair.REPO/'run_repair_text_evaluation.sh',root/'run.sh')

@@ -385,16 +385,17 @@ If you use this work, please cite:
 
 ## Frozen-visual text comparison
 
-For the second, **fixed-visual text comparison**, run `run_exp_text_alignment_ablation.sh`
+For the second, **fixed-visual text comparison**, run `run_exp_text_comparison_v3.sh`
 against the completed factorial experiment. It shares one frozen D/Flow and residual
 cache across single-delta, ordinary normal/abnormal, and 24-pair mean-delta text heads.
 It includes a common visual control, explicit dataset image labels, audited nonzero
 masks, and paired text gains. See [design, one-command run and results](对比实验.md).
 The previous factorial implementation and sealed artifacts remain unchanged.
 If BTAD empty anomaly masks stop evaluation, `run_repair_text_evaluation.sh`
-audits and reevaluates locked predictions without retraining. Image labels stay
-intact; incomplete full-set pixel metrics and valid-mask subset diagnostics are
-reported separately. See the recovery command in [对比实验.md](对比实验.md).
+audits and reevaluates locked predictions without retraining. The 11 zero masks
+match the author's original ZIP byte for byte. All images and as-provided masks
+are included; image labels stay independent of pixel foreground. See the v3
+recovery command and official-file hash evidence in [对比实验.md](对比实验.md).
 
 # Three-stage alignment ablations
 

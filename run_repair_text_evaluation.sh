@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 TRAIN_PYTHON="${TRAIN_PYTHON:-python}"
 WORK_DIR="${WORK_DIR:-./checkpoint/text_comparison_v1}"
-REEVAL_DIR="${REEVAL_DIR:-${WORK_DIR}_reeval_v2}"
+REEVAL_DIR="${REEVAL_DIR:-${WORK_DIR}_reeval_v3}"
 TRAIN_UNTIL_EPOCH="${TRAIN_UNTIL_EPOCH:-5}"
 TRAIN_SEEDS="${TRAIN_SEEDS:-42}"; TRAIN_SEEDS="${TRAIN_SEEDS//[[:space:]]/}"
 EVAL_WORKERS="${EVAL_WORKERS:-2}"
@@ -24,7 +24,7 @@ exec > >(tee -a "${REEVAL_DIR}/repair_$(date +'%Y%m%d_%H%M%S').log") 2>&1
 export PYTHONUNBUFFERED=1 OMP_NUM_THREADS="${CPU_THREADS:-4}" MKL_NUM_THREADS="${CPU_THREADS:-4}"
 DRIVER="${SCRIPT_DIR}/repair_text_evaluation.py"
 COMMON=(--work_dir "${WORK_DIR}" --reeval_dir "${REEVAL_DIR}" --until_epoch "${TRAIN_UNTIL_EPOCH}" --train_seeds "${TRAIN_SEEDS}" --workers "${EVAL_WORKERS}")
-echo 'Cached-prediction reevaluation: retain all image labels; report full-set pixel availability and a separate valid-mask diagnostic.'
+echo 'Cached-prediction reevaluation: retain ALL images and as-provided masks, including officially released zero anomaly masks. NO subset exclusions.'
 "${TRAIN_PYTHON}" "${DRIVER}" --stage prepare "${COMMON[@]}"
 "${TRAIN_PYTHON}" "${DRIVER}" --stage audit "${COMMON[@]}"
 PIDS=()

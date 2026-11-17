@@ -1,0 +1,24 @@
+{
+  "audit_date": "2026-11-17",
+  "author_repository": "https://github.com/pankajmishra000/VT-ADL",
+  "author_zip_url": "https://avires.dimi.uniud.it/papers/btad/btad.zip",
+  "archive_size_bytes": 1229193337,
+  "archive_entries": 2856,
+  "method": "HTTP Range reads of the author ZIP central directory and selected entries; ZIP CRC32 and uncompressed size verified; SHA-256 of original mask bytes compared with the two supplied audit JSONs",
+  "all_11_mask_hashes_match_user_audits": true,
+  "groups": [
+    {
+      "directory_in_zip": "BTech_Dataset_transformed/02/ground_truth/ko",
+      "filenames": ["0145.png"],
+      "sha256_each": "59c9ce808455c79a65dd82d03bb820286b7fbffbcd4a9a7b9f678a482aa7b4f2",
+      "mode": "L", "size": [600, 600], "unique_values": [0]
+    },
+    {
+      "directory_in_zip": "BTech_Dataset_transformed/03/ground_truth/ko",
+      "filenames": ["0028.bmp", "0029.bmp", "0030.bmp", "0031.bmp", "0032.bmp", "0033.bmp", "0034.bmp", "0035.bmp", "0036.bmp", "0037.bmp"],
+      "sha256_each": "906151d63f6d2513ccf462e3937651429dcd69a3eb5a7c4797706c59b41dd580",
+      "mode": "L", "size": [800, 600], "unique_values": [0]
+    }
+  ],
+  "interpretation": "These user mask files match the public author release. Nonempty-mask enforcement and automatic subset exclusion are inappropriate. Keep image labels from ok/ko independent of pixel-mask foreground; evaluate all published masks as provided. This does not assert completeness of human annotation."
+}

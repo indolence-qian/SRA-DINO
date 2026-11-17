@@ -2,8 +2,8 @@
 """Versioned, CPU-only reevaluation of the original locked text predictions.
 
 No training code, masks, checkpoints, source decisions or old outputs are changed.
-Empty decoded anomaly annotations remain anomalous for image metrics. Pixel
-metrics are unavailable on the full set; valid-mask subset results are separate.
+Image labels and pixel annotations are independent. Official BTAD contains
+anomalous images with all-zero masks: include them exactly as distributed.
 """
 from __future__ import annotations
 
@@ -19,11 +19,11 @@ import text_alignment_ablation as app
 from tools.vlm_review import atomic_json, digest, file_digest, load_json
 
 REPO = Path(__file__).resolve().parent
-PROTOCOL = "locked_text_reevaluation_empty_mask_audit_v2"
-CODE = ("repair_text_evaluation.py", "run_repair_text_evaluation.sh")
+PROTOCOL = "locked_text_reevaluation_as_provided_v3"
+CODE = ("repair_text_evaluation.py", "run_repair_text_evaluation.sh", "docs/btad_official_zero_masks.json")
 PIXEL = tuple(m for m in app.METRICS if m not in ("I_AUROC", "I_AP"))
 EXTRA = ("increment_positive_fraction", "mean_increment")
-SCOPES = ("full_set", "valid_masks_diagnostic")
+SCOPES = ("full_set",)
 
 
 def source_context(root, cfg):
@@ -101,13 +101,14 @@ def prepare(args):
     cfg = dict(protocol=PROTOCOL,text_work_dir=str(text_root),until_epoch=args.until_epoch,seeds=seeds,
         workers=args.workers,source_config_sha=file_digest(text_root/"config.json"),source_runs=source_runs,
         decoder_protocol=app.EVALUATION,
-        empty_mask_policy="image_label_retained;full_pixel_unavailable;separate_valid_mask_diagnostic",
+        empty_mask_policy="image_label_retained;all_images_and_as_provided_pixel_masks_included;no_exclusions",
         code={n:file_digest(REPO/n) for n in CODE})
     app.f.immutable(root/"config.json",cfg)
     for name,path in (("text_config.json",text_root/"config.json"),
                       ("manifest.json",source/"manifest.json"),("references.json",source/"references.json"),
                       ("normal_stats.json",source/"normal_stats.json"),("text_bank.json",text_root/"text_bank.json")):
         app.f.immutable(root/"provenance"/name,load_json(path))
+    app.f.immutable(root/"provenance"/"official_zero_mask_reference.json",load_json(REPO/"docs/btad_official_zero_masks.json"))
     for seed in seeds:
         app.f.immutable(root/"provenance"/f"seed{seed}"/"selection.json",load_json(app.decision_path(text_root,seed,args.until_epoch)))
         for arm in app.MODES:
@@ -116,12 +117,23 @@ def prepare(args):
     print("Verified locked cached predictions. No training, feature export or prediction generation.",flush=True)
 
 
+def dataset_label(row):
+    label = bool(row["mask_path"])
+    if row["dataset"] == "btad":
+        state = Path(row["image_path"]).parent.name.lower()
+        if state not in ("ok", "ko") or label != (state == "ko"):
+            raise ValueError(f"BTAD directory/image-label/mask-path contradiction: {row['image_path']}")
+        return state == "ko"
+    return label
+
+
 def decode_audit(row, size):
     truth, info = app.evaluation_truth(row,size)
     empty = bool(info["image_label"] and not info["native_positive"])
     info.update(dataset=row["dataset"],category=row["category"],image_path=row["image_path"],
         mask_path=row["mask_path"],mask_sha=file_digest(row["mask_path"]) if row["mask_path"] else None,
-        pixel_valid=not empty,reason="empty_under_frozen_decoder" if empty else "valid",
+        pixel_included=True,empty_anomaly_mask=empty,
+        reason="empty_as_provided_included" if empty else "as_provided_included",
         palette_zero_rgb=None)
     if empty and info["mode"] == "P":
         with Image.open(row["mask_path"]) as image:
@@ -137,7 +149,7 @@ def preview(root,row,truth):
     decoded = Image.fromarray((truth*255).astype(np.uint8)).resize((size,size),Image.Resampling.NEAREST).convert("RGB")
     canvas = Image.new("RGB",(3*size,size+48),"white"); draw = ImageDraw.Draw(canvas)
     draw.text((4,4),f"{row['dataset']}/{row['category']} {row['id']}",fill="black")
-    for i,(title,tile) in enumerate((("query: anomaly label retained",original),("original mask rendered",raw),("decoded: no pixel GT",decoded))):
+    for i,(title,tile) in enumerate((("query: anomaly label retained",original),("original mask rendered",raw),("decoded: zero GT retained",decoded))):
         draw.text((i*size+4,25),title,fill="black"); canvas.paste(tile,(i*size,48))
     path = Path(root)/"empty_mask_previews"/(row["id"]+".png"); path.parent.mkdir(parents=True,exist_ok=True); canvas.save(path)
 
@@ -146,50 +158,47 @@ def audit(args):
     root = Path(args.reeval_dir); cfg = config(root)
     _,text_cfg,source = source_context(root,cfg)
     verify_all_predictions(root,cfg)
+    references = load_json(REPO/"docs/btad_official_zero_masks.json")["groups"]
+    official = {g["directory_in_zip"].split("/",1)[1]+"/"+name:g["sha256_each"]
+                for g in references for name in g["filenames"]}
     rows,counts,hashes = [],[],{}
     for key,queries in app.f.groups(app.f.rows(source,"eval")).items():
         infos = []
         for row in queries:
             app.unchanged(row)
+            dataset_label(row)
             truth,info = decode_audit(row,text_cfg["settings"]["eval_size"])
+            suffix = f"{row['category']}/ground_truth/ko/{Path(row['mask_path']).name}" if row['mask_path'] else None
+            expected_sha = official.get(suffix) if row['dataset']=='btad' else None
+            info.update(official_reference_sha=expected_sha,
+                        official_bytes_match=(info['mask_sha']==expected_sha) if expected_sha else None)
             infos.append(info); hashes[row["id"]] = info["mask_sha"]
-            if not info["pixel_valid"] and sum(not a["pixel_valid"] for a in infos) <= 4:
+            if info["empty_anomaly_mask"] and sum(a["empty_anomaly_mask"] for a in infos) <= 4:
                 preview(root,row,truth)
         value = dict(fingerprint=digest(cfg),images=infos)
         app.f.immutable(root/"mask_audit"/("__".join(key)+".json"),value)
         rows.extend(infos)
         counts.append(dict(dataset=key[0],category=key[1],images=len(infos),
             abnormal_images=sum(a["image_label"] for a in infos),
-            empty_anomaly_masks=sum(not a["pixel_valid"] for a in infos),
-            pixel_images_valid=sum(a["pixel_valid"] for a in infos)))
+            empty_anomaly_masks=sum(a["empty_anomaly_mask"] for a in infos),
+            pixel_images_included=len(infos)))
     files = {p.name:file_digest(p) for p in sorted((root/"mask_audit").glob("*.json"))}
     app.f.immutable(root/"mask_audit_locked.json",dict(fingerprint=digest(cfg),files=files,mask_hashes=hashes))
     app.base.write_csv(root/"evaluation_counts.csv",counts)
-    app.base.write_csv(root/"empty_masks.csv",[r for r in rows if not r["pixel_valid"]])
-    print(f"Mask audit: {sum(not r['pixel_valid'] for r in rows)} empty anomaly masks. "
-          "Image labels retained; pixel subset results will be labeled diagnostic.",flush=True)
+    app.base.write_csv(root/"empty_masks.csv",[r for r in rows if r["empty_anomaly_mask"]])
+    print(f"Mask audit: {sum(r['empty_anomaly_mask'] for r in rows)} empty anomaly masks. "
+          "All image labels and pixel masks retained as provided; NO sample exclusions.",flush=True)
 
 
-def image_metrics(maps, labels):
-    from sklearn.metrics import roc_auc_score, average_precision_score
-    scores = maps.reshape(len(maps),-1).max(1)
-    return dict(I_AUROC=float(roc_auc_score(labels,scores)) if labels.any() and not labels.all() else None,
-                I_AP=float(average_precision_score(labels,scores)) if labels.any() else None)
-
-
-def metric_scopes(truth, maps, labels, keep, threshold):
-    if (truth.shape != maps.shape or labels.shape != (len(maps),) or keep.shape != labels.shape
+def metric_scopes(truth, maps, labels, threshold):
+    if (truth.shape != maps.shape or labels.shape != (len(maps),)
             or not np.isfinite(maps).all()):
-        raise ValueError("Invalid maps/GT/validity array")
-    pixel = {m:None for m in PIXEL}
-    if keep.any():
-        point = app.corrected_metrics(truth[keep],maps[keep],labels[keep],threshold)
-        pixel = {m:point[m] for m in PIXEL}
-    common = dict(**image_metrics(maps,labels),images=len(maps),abnormal_images=int(labels.sum()),
-        pixel_images_valid=int(keep.sum()),empty_anomaly_masks=int((~keep).sum()),threshold=threshold)
-    subset = dict(common,**pixel,scope="valid_masks_diagnostic")
-    full = dict(common,**(pixel if keep.all() else {m:None for m in PIXEL}),scope="full_set")
-    return [full,subset]
+        raise ValueError("Invalid maps/GT/labels array")
+    point = app.corrected_metrics(truth,maps,labels,threshold)
+    empty = labels & ~truth.reshape(len(truth),-1).any(1)
+    point.update(images=len(maps),abnormal_images=int(labels.sum()),pixel_images_included=len(maps),
+                 empty_anomaly_masks=int(empty.sum()),scope="full_set")
+    return [point]
 
 
 def audit_record(root,cfg,key,queries):
@@ -215,8 +224,7 @@ def evaluate(args):
         if i%cfg["workers"] != args.shard_id: continue
         infos = audit_record(root,cfg,key,queries)
         truth = np.stack([app.evaluation_truth(r,text_cfg["settings"]["eval_size"])[0] for r in queries])
-        keep = np.array([r["pixel_valid"] for r in infos],bool)
-        labels = np.array([bool(r["mask_path"]) for r in queries])
+        labels = np.array([dataset_label(r) for r in queries],bool)
         for seed in cfg["seeds"]:
             out = app.prediction_dir(text_root,seed,cfg["until_epoch"]); lock = load_json(out/"locked.json")
             selected = app.decision(text_root,text_cfg,seed,cfg["until_epoch"])
@@ -231,7 +239,7 @@ def evaluate(args):
                         if set(data.files) != set(app.MAPS): raise ValueError("Wrong prediction arms")
                         values.append(data[name].copy())
                 maps = np.stack(values)
-                for point in metric_scopes(truth,maps,labels,keep,selected["thresholds"][name]):
+                for point in metric_scopes(truth,maps,labels,selected["thresholds"][name]):
                     arm = name.split("_")[0]
                     point.update(dataset=key[0],category=key[1],seed=seed,arm=arm,
                         score="text" if name.endswith("_text") else "full",visual_sha=text_cfg["visual_sha"],
@@ -242,8 +250,9 @@ def evaluate(args):
                     records.append(point)
             app.f.immutable(root/"metrics"/f"seed{seed}"/("__".join(key)+".json"),
                 dict(fingerprint=digest(cfg),audit_sha=file_digest(root/"mask_audit_locked.json"),records=records))
+            app.panels(root,text_cfg,queries,out,seed,cfg["until_epoch"],truth)
         print(f"evaluated {key}: images={len(labels)}, anomaly={labels.sum()}, "
-              f"pixel-valid={keep.sum()}, empty-anomaly={int((~keep).sum())}",flush=True)
+              f"pixel-included={len(labels)}, empty-anomaly={sum(r['empty_anomaly_mask'] for r in infos)} (all retained)",flush=True)
 
 
 def aggregate(rows, keys, metrics=app.METRICS+EXTRA):
@@ -272,8 +281,8 @@ def report(args):
             if (data["fingerprint"] != digest(cfg) or data["audit_sha"] != file_digest(root/"mask_audit_locked.json")
                     or len(points) != len(SCOPES)*len(app.MAPS) or actual != {(s,n) for s in SCOPES for n in app.MAPS}
                     or any(r["seed"] != seed or (r["dataset"],r["category"]) != key or r["images"] != len(queries)
-                        or r["pixel_images_valid"] != sum(a["pixel_valid"] for a in infos)
-                        or r["abnormal_images"] != sum(bool(q["mask_path"]) for q in queries)
+                        or r["pixel_images_included"] != len(infos)
+                        or r["abnormal_images"] != sum(dataset_label(q) for q in queries)
                         or r["visual_sha"] != text_cfg["visual_sha"] for r in points)):
                 raise ValueError("Wrong/stale/incomplete reevaluation metrics")
             records.extend(points)
@@ -293,25 +302,29 @@ def report(args):
     for name,values in (("metrics",records),("per_seed",per_seed),("summary",summary),("per_category",category),
                         ("paired_contrasts",paired),("contrasts",contrasts)):
         app.base.write_csv(target/(name+".csv"),values)
+    selections = []
+    for seed in cfg["seeds"]:
+        for arm,value in app.decision(text_root,text_cfg,seed,cfg["until_epoch"])["text"].items():
+            selections.append(dict(seed=seed,arm=arm,epoch=value["epoch"],**value["source_point"]))
+    app.base.write_csv(target/"selected_epochs.csv",selections)
     counts = []
     for path in sorted((root/"mask_audit").glob("*.json")):
         infos = load_json(path)["images"]
         counts.append(dict(dataset=infos[0]["dataset"],category=infos[0]["category"],images=len(infos),
-            abnormal_images=sum(a["image_label"] for a in infos),pixel_images_valid=sum(a["pixel_valid"] for a in infos),
-            empty_anomaly_masks=sum(not a["pixel_valid"] for a in infos)))
+            abnormal_images=sum(a["image_label"] for a in infos),pixel_images_included=len(infos),
+            empty_anomaly_masks=sum(a["empty_anomaly_mask"] for a in infos)))
     lines = ["# 文本对比实验：空mask审计与缓存复评","",f"协议：`{PROTOCOL}`；原文本快照through{cfg['until_epoch']}；种子{cfg['seeds']}。",
         "全部复用原来已锁定的V/T1/T2/T3及文本单支路预测，不重训、不重新预测、不修改原mask。",
-        "**原始空mask的原因尚需人工核查。下表不把空mask当正常图，也不伪造像素标注。**",
-        "所有图像均参与I-AUROC/I-AP，包括空mask异常图。完整集像素GT不全的类别/数据集显示—，缺失类别不从宏平均中悄悄移除。",
-        "另列有效mask子集的像素诊断：只排除原生异常mask解码为空的图像，正常图保留，七种读出共用完全相同的样本集。",
-        "**有效mask子集是诊断结果，不能标作标准完整BTAD结果或直接与其他论文的完整数据集分数比较。**",
+        "**保留全部样本。图像标签与像素标注独立：空mask的ko图像仍是异常图，像素级使用发布的全零mask。**",
+        "已从作者官方ZIP独立读取02/0145.png及03/0028.bmp—0037.bmp；11个mask的SHA-256与用户审计记录全部一致，原件均为灰度L、像素仅0。",
+        "官方原件核对记录见provenance/official_zero_mask_reference.json；不把全零mask自动判为损坏或缺失，不删除图像、不补造GT。",
+        "图像级I-AUROC/I-AP使用完整图像标签；P-AUROC/P-AP/AUPRO/F1/FPR/召回使用完整集合的原样mask。所有七种读出使用相同样本和GT。",
         f"mask解码仍为原协议`{cfg['decoder_protocol']}`，没有自动改变前景定义或根据预测补标注。",
         "数值为%，类别宏平均后跨文本种子平均；F1-best为目标最优阈值诊断，FPR/召回沿用源CAL阈值。","",
-        "## 样本数与缺失标注","","| 数据集 | 类别 | 图像总数 | 异常图数 | 像素有效图数 | 空异常mask数 |","|---|---|---:|---:|---:|---:|"]
+        "## 全量样本数与全零mask统计","","| 数据集 | 类别 | 图像总数 | 异常图数 | 像素评价图数 | 全零异常mask数 |","|---|---|---:|---:|---:|---:|"]
     for r in counts:
-        lines.append("| "+" | ".join(str(r[k]) for k in ("dataset","category","images","abnormal_images","pixel_images_valid","empty_anomaly_masks"))+" |")
-    for scope,title in (("full_set","完整图像集；像素标注不全时不报告完整分割分数"),
-                        ("valid_masks_diagnostic","有效mask子集诊断；不是标准完整数据集分数")):
+        lines.append("| "+" | ".join(str(r[k]) for k in ("dataset","category","images","abnormal_images","pixel_images_included","empty_anomaly_masks"))+" |")
+    for scope,title in (("full_set","全部图像、全部发布mask的统一评价"),):
         lines += ["",f"## {title}","",*app.table([r for r in summary if r['scope']==scope and r['score']=='full']),
                   "","### 文本单支路","",*app.table([r for r in summary if r['scope']==scope and r['score']=='text'])]
     lines += ["","## 配对增益（百分点）","","| 范围 | 数据集 | 对比 | I-AUROC | P-AP | AUPRO |","|---|---|---|---:|---:|---:|"]
@@ -323,6 +336,9 @@ def report(args):
     for r in summary:
         if r['scope']=='full_set' and r['score']=='full' and r['arm'] in app.MODES:
             lines.append(f"| {r['dataset']} | {r['arm']} | {100*r['increment_positive_fraction']:.2f} | {r['mean_increment']:.4f} |")
+    lines += ["","## 原源验证选择轮次（保持原样）","","| 文本种子 | 组别 | 轮次 | 源P-AP | 源AUPRO |","|---|---|---:|---:|---:|"]
+    for r in selections:
+        lines.append(f"| {r['seed']} | {r['arm']} | {r['epoch']} | {100*r['P_AP']:.2f} | {100*r['PRO_exact']:.2f} |")
     for scope in SCOPES:
         lines += ["",f"## 逐类别：{scope}","",*app.table([r for r in category if r['scope']==scope],True)]
     text = "\n".join(lines)+"\n"; (target/"对比实验.md").write_text(text,encoding="utf-8")
@@ -343,7 +359,7 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--stage",required=True,choices=("prepare","audit","evaluate","report","package"))
     p.add_argument("--work_dir",default="./checkpoint/text_comparison_v1")
-    p.add_argument("--reeval_dir",default="./checkpoint/text_comparison_v1_reeval_v2")
+    p.add_argument("--reeval_dir",default="./checkpoint/text_comparison_v1_reeval_v3")
     p.add_argument("--until_epoch",type=int,default=5); p.add_argument("--train_seeds",default="42")
     p.add_argument("--workers",type=int,default=2); p.add_argument("--shard_id",type=int,default=0)
     p.add_argument("--publish_report",action="store_true")
