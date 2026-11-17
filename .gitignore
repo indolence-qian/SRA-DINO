@@ -21,7 +21,8 @@ checkpoint/
 
 # 数据集 / 结果（按需选）
 TESTING_ALL/
-Datasets/
+Datasets/*
+!Datasets/*.py
 results/
 logs/
 
@@ -30,5 +31,6 @@ logs/
 .idea/
 
 data/
+deliverables/
 nohup*.out
 dev.ipynb

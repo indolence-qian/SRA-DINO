@@ -1,13 +1,15 @@
+import os
 import torch
 
 from Datasets import (
     mvtec, visa, btad, mpdd, 
-    tn3k, clinicdb, colondb, isic
+    tn3k, clinicdb, colondb, isic, ld
 )
 
 # (Dataset, Split, root_path) 
 root_dir = "/Data"
 DATASET_REGISTRY = {
+    "ld":          (ld.Dataset, ld.DatasetSplit, os.environ.get("LD_DATA_ROOT", "/mnt/qfg/Tate_qfg/data/LD_AD_20261116")),
     "mvtec":       (mvtec.Dataset, mvtec.DatasetSplit, f"/mnt/qfg/Tate_qfg/data/mvtec"),
     "visa":        (visa.Dataset, visa.DatasetSplit, f"/mnt/qfg/Tate_qfg/data/VisA"),
     "btad":        (btad.Dataset, btad.DatasetSplit, f"/mnt/qfg/Tate_qfg/data/BTAD/BTech_Dataset_transformed"),
@@ -19,6 +21,7 @@ DATASET_REGISTRY = {
 }
 
 DATASET_CLASSES = {
+    "ld":       set(ld.CLASSNAMES),
     "mvtec":    {'bottle', 'cable', 'capsule', 'carpet', 'grid', 'hazelnut', 'leather', 'metal_nut', 'pill', 'screw', 'tile', 'toothbrush', 'transistor', 'wood', 'zipper'},
     "visa":     {"candle", "capsules", "cashew", "chewinggum", "fryum", "macaroni1", "macaroni2", "pcb1","pcb2", "pcb3", "pcb4", "pipe_fryum"},
     "btad":     {'01', '02', '03'},

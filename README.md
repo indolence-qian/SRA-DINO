@@ -36,6 +36,17 @@ Zero-Shot Anomaly Detection (ZSAD) seeks to identify anomalies from arbitrary no
 ## Results
 ![](asset/visualization.png)
 
+## LD dataset: frozen-model test
+
+`run_test_ld.sh` evaluates the prepared LD dataset with an existing CLIP+DINO
+Base or MARA checkpoint. It preserves the trained network and checkpoint gate
+settings, verifies the data, resumes completed categories, and exports CSV/JSON,
+heatmaps and `ld_test_report.zip`. No training or VLM is run.
+Pass the actual checkpoint file/directory as `WEIGHT_PATH`; see
+[LD preparation and one-command evaluation](docs/ld_dataset.md#一体化测试现有网络).
+Single-label image AUROC is reported as N/A and excluded from its valid-category
+macro average; pixel metrics explicitly use box-derived annotation masks.
+
 ## Quick Start 
 ### 1. Installation  
 ```bash
