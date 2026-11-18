@@ -5,6 +5,10 @@
 服务器默认数据根目录：`/mnt/qfg/Tate_qfg/data/LD_AD_20261116`。
 数据集参数：`--dataset ld`，可通过环境变量 `LD_DATA_ROOT` 覆盖根目录。
 
+**若要重新训练当前的 DINO 残差＋Flow＋高分辨率＋文本网络，并统一测试
+MVTec/BTAD/MPDD/LD，请使用 [四数据集训练测试入口](four_dataset_training.md)。**
+下方 `run_test_ld.sh` 是保留的 CLIP+DINO / MARA 已有权重测试入口，不用于最新残差网络。
+
 ## 实际数据与使用口径
 
 以实际图片、YOLO 标签和 `split.csv` 三者一致性为准，不按文件名的 `OK/NG` 判断。

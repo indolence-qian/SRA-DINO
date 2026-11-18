@@ -32,5 +32,6 @@ logs/
 
 data/
 deliverables/
+tmp/four_dataset_qa_deps*/
 nohup*.out
 dev.ipynb

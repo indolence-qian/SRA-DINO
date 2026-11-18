@@ -36,7 +36,16 @@ Zero-Shot Anomaly Detection (ZSAD) seeks to identify anomalies from arbitrary no
 ## Results
 ![](asset/visualization.png)
 
-## LD dataset: frozen-model test
+## Fresh current network: four-dataset train and test
+
+`run_train_test_four_datasets.sh` freshly trains the current **DINO residual +
+constraint/Flow + high-resolution + text** network on VisA, then evaluates one
+source-selected model on **MVTec, BTAD, MPDD and LD**. No existing trained Base
+checkpoint is required. Default: 15 epochs, K=4, fixed HR/text fusion, T2 text
+readout, two GPUs, and a single-model four-dataset report ZIP. Legacy sealed
+experiments remain usable. See [the one-command server run](docs/four_dataset_training.md).
+
+## LD dataset: older CLIP+DINO / MARA frozen-model test
 
 `run_test_ld.sh` evaluates the prepared LD dataset with an existing CLIP+DINO
 Base or MARA checkpoint. It preserves the trained network and checkpoint gate
