@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1280" viewBox="0 0 1600 1280" role="img">
+<title>Current residual-first high-resolution anomaly detector</title>
+<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#45566b"/></marker></defs>
+<rect width="1600" height="1280" fill="white"/>
+<text x="800" y="40" fill="#203348" font-family="Arial, sans-serif" font-size="26" text-anchor="middle" font-weight="700">Current network: normal-reference residuals + high resolution + optional text</text>
+<text x="800" y="73" fill="#52667a" font-family="Arial, sans-serif" font-size="18" text-anchor="middle" font-weight="400">Frozen DINOv3 / CLIP encoders | source-trained heads | no target gradient updates</text>
+<rect x="35" y="120" width="240" height="82" rx="12" fill="#edf4fb" stroke="#55789c" stroke-width="2"/>
+<text x="155.0" y="154.62" fill="#203348" font-family="Arial, sans-serif" font-size="18" text-anchor="middle" font-weight="400">Query image</text>
+<text x="155.0" y="179.62" fill="#203348" font-family="Arial, sans-serif" font-size="18" text-anchor="middle" font-weight="400">normal or anomalous</text>
+<rect x="35" y="235" width="240" height="93" rx="12" fill="#edf4fb" stroke="#55789c" stroke-width="2"/>
+<text x="155.0" y="263.28" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">K normal references</text>
+<text x="155.0" y="287.28" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">same target category</text>
+<text x="155.0" y="311.28" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">K = 4 in current runs</text>
+<rect x="325" y="135" width="235" height="178" rx="12" fill="#edf4fb" stroke="#55789c" stroke-width="2"/>
+<text x="442.5" y="193.78" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">Shared view construction</text>
+<text x="442.5" y="217.78" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">1 global + 4 native crops</text>
+<text x="442.5" y="241.78" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">each view: 512 x 512</text>
+<text x="442.5" y="265.78" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">crop fraction = 0.6</text>
+<rect x="605" y="135" width="245" height="178" rx="12" fill="#edf4fb" stroke="#55789c" stroke-width="2"/>
+<text x="727.5" y="193.78" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">Frozen DINOv3-L/16</text>
+<text x="727.5" y="217.78" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">layers 5 / 11 / 17 / 23</text>
+<text x="727.5" y="241.78" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">LayerNorm + token L2</text>
+<text x="727.5" y="265.78" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">1024-D patch tokens</text>
+<rect x="900" y="115" width="300" height="84" rx="12" fill="#edf4fb" stroke="#55789c" stroke-width="2"/>
+<text x="1050.0" y="150.78" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">Normal token banks</text>
+<text x="1050.0" y="174.78" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">global: K views | local: 4K views</text>
+<rect x="900" y="235" width="300" height="78" rx="12" fill="#edf4fb" stroke="#55789c" stroke-width="2"/>
+<text x="1050.0" y="267.78" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">Query patch tokens</text>
+<text x="1050.0" y="291.78" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">one global + four local views</text>
+<rect x="1245" y="155" width="320" height="155" rx="12" fill="#edf4fb" stroke="#55789c" stroke-width="2"/>
+<text x="1405.0" y="202.28" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">Per-layer cosine nearest neighbor</text>
+<text x="1405.0" y="226.28" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">global queries -&gt; global bank</text>
+<text x="1405.0" y="250.28" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">local queries -&gt; local bank</text>
+<text x="1405.0" y="274.28" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">search ALL K references</text>
+<path d="M275,161 L300,161 L300,192 L325,192" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="325,192 315.0,196.5 315.0,187.5" fill="#45566b"/>
+<path d="M275,281 L300,281 L300,255 L325,255" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="325,255 315.0,259.5 315.0,250.5" fill="#45566b"/>
+<path d="M560,225 L605,225" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="605,225 595.0,229.5 595.0,220.5" fill="#45566b"/>
+<path d="M850,190 L875,190 L875,157 L900,157" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="900,157 890.0,161.5 890.0,152.5" fill="#45566b"/>
+<path d="M850,260 L900,274" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="900,274 889.1570251380183,275.6370388335141 891.583694467698,266.9703626560864" fill="#45566b"/>
+<path d="M1200,157 L1220,157 L1220,195 L1245,195" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="1245,195 1235.0,199.5 1235.0,190.5" fill="#45566b"/>
+<path d="M1200,274 L1245,274" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="1245,274 1235.0,278.5 1235.0,269.5" fill="#45566b"/>
+<rect x="530" y="370" width="600" height="102" rx="12" fill="#edf4fb" stroke="#55789c" stroke-width="2"/>
+<text x="830.0" y="402.12" fill="#203348" font-family="Arial, sans-serif" font-size="18" text-anchor="middle" font-weight="400">Signed residual: r = query token - matched normal token</text>
+<text x="830.0" y="427.12" fill="#203348" font-family="Arial, sans-serif" font-size="18" text-anchor="middle" font-weight="400">subtract in 1024-D -&gt; fixed projection to 256-D</text>
+<text x="830.0" y="452.12" fill="#203348" font-family="Arial, sans-serif" font-size="18" text-anchor="middle" font-weight="400">source-normal RMS scaling; preserve sign and magnitude</text>
+<path d="M1405,310 L1405,420 L1130,420" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="1130,420 1140.0,415.5 1140.0,424.5" fill="#45566b"/>
+<rect x="35" y="525" width="740" height="270" rx="16" fill="#f6f8fc" stroke="#b0bdca" stroke-width="1.5"/>
+<text x="55" y="555" fill="#203348" font-family="Arial, sans-serif" font-size="20" text-anchor="start" font-weight="700">Visual residual branch: one head per DINO layer</text>
+<rect x="55" y="582" width="210" height="94" rx="12" fill="#fff0e3" stroke="#bb895a" stroke-width="2"/>
+<text x="160.0" y="611.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">Signed constraintor</text>
+<text x="160.0" y="634.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">h = r + W2 GELU(W1 r)</text>
+<text x="160.0" y="657.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">trainable; zero-preserving</text>
+<rect x="295" y="582" width="220" height="94" rx="12" fill="#fff0e3" stroke="#bb895a" stroke-width="2"/>
+<text x="405.0" y="610.78" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">Invertible Flow</text>
+<text x="405.0" y="634.78" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">8 affine coupling blocks</text>
+<text x="405.0" y="658.78" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">fixed permutations</text>
+<rect x="545" y="582" width="210" height="94" rx="12" fill="#fff0e3" stroke="#bb895a" stroke-width="2"/>
+<text x="650.0" y="611.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">Gaussian likelihood</text>
+<text x="650.0" y="634.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">z = Flow(h)</text>
+<text x="650.0" y="657.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">NLL with log-Jacobian</text>
+<rect x="285" y="711" width="275" height="62" rx="12" fill="#edf4fb" stroke="#55789c" stroke-width="2"/>
+<text x="422.5" y="735.78" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">Source-only calibration</text>
+<text x="422.5" y="759.78" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">visual score map V_v</text>
+<path d="M650,472 L650,500 L155,500 L155,582" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="155,582 150.5,572.0 159.5,572.0" fill="#45566b"/>
+<path d="M265,629 L295,629" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="295,629 285.0,633.5 285.0,624.5" fill="#45566b"/>
+<path d="M515,629 L545,629" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="545,629 535.0,633.5 535.0,624.5" fill="#45566b"/>
+<path d="M650,676 L650,742 L560,742" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="560,742 570.0,737.5 570.0,746.5" fill="#45566b"/>
+<text x="405" y="695" fill="#52667a" font-family="Arial, sans-serif" font-size="14" text-anchor="middle" font-weight="400">shared across global / local views</text>
+<rect x="815" y="525" width="750" height="270" rx="16" fill="#f4faf6" stroke="#b0bdca" stroke-width="1.5"/>
+<text x="835" y="555" fill="#203348" font-family="Arial, sans-serif" font-size="20" text-anchor="start" font-weight="700">Text branch: auxiliary; T2 default in the four-target runner</text>
+<rect x="835" y="574" width="225" height="65" rx="12" fill="#edf7ef" stroke="#638e70" stroke-width="2"/>
+<text x="947.5" y="600.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">Normal / abnormal prompts</text>
+<text x="947.5" y="623.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">3 fixed templates per pair</text>
+<rect x="835" y="679" width="225" height="68" rx="12" fill="#edf7ef" stroke="#638e70" stroke-width="2"/>
+<text x="947.5" y="706.94" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">Frozen CLIP text encoder</text>
+<text x="947.5" y="729.94" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">text embeddings cached</text>
+<rect x="1095" y="574" width="225" height="65" rx="12" fill="#fff0e3" stroke="#bb895a" stroke-width="2"/>
+<text x="1207.5" y="600.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">Residual MLP projector</text>
+<text x="1207.5" y="623.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">256 -&gt; 256 -&gt; d_text</text>
+<rect x="1095" y="679" width="225" height="68" rx="12" fill="#edf7ef" stroke="#638e70" stroke-width="2"/>
+<text x="1207.5" y="706.94" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">Frozen text anchors</text>
+<text x="1207.5" y="729.94" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">T1 / T2 / T3 readouts</text>
+<rect x="1360" y="590" width="185" height="80" rx="12" fill="#edf7ef" stroke="#638e70" stroke-width="2"/>
+<text x="1452.5" y="612.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">Text matching</text>
+<text x="1452.5" y="635.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">mean across layers</text>
+<text x="1452.5" y="658.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">semantic map T_v</text>
+<rect x="1360" y="705" width="185" height="65" rx="12" fill="#edf7ef" stroke="#638e70" stroke-width="2"/>
+<text x="1452.5" y="731.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">Source calibration</text>
+<text x="1452.5" y="754.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">A_v = ReLU(T_v)</text>
+<path d="M1000,472 L1000,500 L1205,500 L1205,574" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="1205,574 1200.5,564.0 1209.5,564.0" fill="#45566b"/>
+<text x="1215" y="492" fill="#52667a" font-family="Arial, sans-serif" font-size="14" text-anchor="middle" font-weight="400">pre-constraint residual</text>
+<path d="M947,639 L947,679" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="947,679 942.5,669.0 951.5,669.0" fill="#45566b"/>
+<path d="M1060,713 L1095,713" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="1095,713 1085.0,717.5 1085.0,708.5" fill="#45566b"/>
+<path d="M1320,606 L1360,617" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="1360,617 1349.1647418983673,618.6873594374066 1351.5511502455568,610.0095109021726" fill="#45566b"/>
+<path d="M1320,713 L1340,713 L1340,645 L1360,645" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="1360,645 1350.0,649.5 1350.0,640.5" fill="#45566b"/>
+<path d="M1452,670 L1452,705" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="1452,705 1447.5,695.0 1456.5,695.0" fill="#45566b"/>
+<rect x="530" y="845" width="600" height="88" rx="12" fill="#f1f1fb" stroke="#7779a2" stroke-width="2"/>
+<text x="830.0" y="882.62" fill="#203348" font-family="Arial, sans-serif" font-size="18" text-anchor="middle" font-weight="400">Per-view fusion: S_v = V_v + lambda * A_v</text>
+<text x="830.0" y="907.62" fill="#203348" font-family="Arial, sans-serif" font-size="18" text-anchor="middle" font-weight="400">current lambda = 0.5; lambda = 0 gives the visual baseline</text>
+<path d="M422,773 L422,889 L530,889" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="530,889 520.0,893.5 520.0,884.5" fill="#45566b"/>
+<path d="M1452,770 L1452,889 L1130,889" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="1130,889 1140.0,884.5 1140.0,893.5" fill="#45566b"/>
+<rect x="530" y="985" width="600" height="105" rx="12" fill="#f1f1fb" stroke="#7779a2" stroke-width="2"/>
+<text x="830.0" y="1019.28" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">Place crops on the final 512-grid; Hann-weighted stitching</text>
+<text x="830.0" y="1043.28" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">S = (1 - beta) * global + beta * stitched locals</text>
+<text x="830.0" y="1067.28" fill="#203348" font-family="Arial, sans-serif" font-size="17" text-anchor="middle" font-weight="400">current beta = 0.25; score fusion, not residual averaging</text>
+<path d="M830,933 L830,985" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="830,985 825.5,975.0 834.5,975.0" fill="#45566b"/>
+<rect x="250" y="1140" width="450" height="73" rx="12" fill="#edf4fb" stroke="#55789c" stroke-width="2"/>
+<text x="475.0" y="1170.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">Final anomaly map</text>
+<text x="475.0" y="1193.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">localization and source-calibrated pixel decisions</text>
+<rect x="900" y="1140" width="450" height="73" rx="12" fill="#edf4fb" stroke="#55789c" stroke-width="2"/>
+<text x="1125.0" y="1170.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">Image anomaly score = max pixel score</text>
+<text x="1125.0" y="1193.44" fill="#203348" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">image labels remain independent of GT mask foreground</text>
+<path d="M690,1090 L690,1116 L475,1116 L475,1140" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="475,1140 470.5,1130.0 479.5,1130.0" fill="#45566b"/>
+<path d="M970,1090 L970,1116 L1125,1116 L1125,1140" fill="none" stroke="#45566b" stroke-width="2.3"/>
+<polygon points="1125,1140 1120.5,1130.0 1129.5,1130.0" fill="#45566b"/>
+<text x="800" y="1252" fill="#52667a" font-family="Arial, sans-serif" font-size="16" text-anchor="middle" font-weight="400">Source image/mask labels train the heads only. Target GT is opened after prediction locking. No RL / MARA / learned normal-residual pool.</text>
+</svg>
