@@ -415,6 +415,12 @@ If you use this work, please cite:
 
 ## Frozen-visual text comparison
 
+`run_exp_text_lambda.sh` reuses the completed T1/T2/T3 heads and residual caches
+to compare lambda=0/0.1/0.25/0.5/1/2/4, with a source-gated extension to 8.
+It selects lambda on source validation only, keeps all target masks, writes
+Markdown/CSV comparisons and a fully offline HTML gallery/curves/resource ZIP.
+See the lambda protocol and complete command in [对比实验.md](对比实验.md).
+
 For the second, **fixed-visual text comparison**, run `run_exp_text_comparison_v3.sh`
 against the completed factorial experiment. It shares one frozen D/Flow and residual
 cache across single-delta, ordinary normal/abnormal, and 24-pair mean-delta text heads.
