@@ -4,7 +4,7 @@
 `run_train_test_four_datasets.sh`。新增报告读取该实验源选模后权重生成的锁定预测，
 不训练新模型，也不更改权重、封存预测或历史评价。
 
-## 给当前实验补生成HTML
+## 一体化入口：先可视化当前最新实验
 
 ```bash
 cd /mnt/qfg/Tate_qfg/SRA-DINO
@@ -12,8 +12,9 @@ git pull --ff-only origin main
 conda activate qfg_addino
 mkdir -p logs
 
-nohup env WORK_DIR=./checkpoint/residual_hr_text_four_datasets_v1 \
-  bash run_build_four_dataset_dashboard.sh \
+nohup env PIPELINE_MODE=auto \
+  WORK_DIR=./checkpoint/residual_hr_text_four_datasets_v1 \
+  bash run_four_datasets_with_html.sh \
   > logs/four_dataset_dashboard.log 2>&1 &
 ```
 
@@ -22,6 +23,10 @@ tail -f logs/four_dataset_dashboard.log
 ```
 
 默认CPU运行，自动选择 seed42 下最新已完成并锁定的 horizon。
+统一入口默认为 `auto`：已有锁定预测就直接补报告；已有实验但缺少预测时，
+用该实验已训练权重恢复预测/评价后补报告，不训练新头。
+若默认v1目录不存在，会报错而不会意外开始新的训练。
+独立的 `run_build_four_dataset_dashboard.sh` 仍保留用于只执行报告阶段。
 若完整运行15轮，结果在：
 
 ```text
@@ -36,6 +41,15 @@ checkpoint/residual_hr_text_four_datasets_v1/analysis/seed42/through15/source/
   ld/...
   analysis_report.zip       HTML和全部图片资源，可整体下载
 ```
+
+每次成功生成报告还会更新固定入口：
+
+```text
+checkpoint/residual_hr_text_four_datasets_v1/reports/HTML_ANALYSIS.html
+checkpoint/residual_hr_text_four_datasets_v1/reports/html_analysis.json
+```
+
+固定HTML入口会跳转到本次生成报告；JSON记录具体seed、horizon、路径和预测锁哈希。
 
 整体下载并解压 `analysis_report.zip`，双击 `index.html` 即可离线浏览，无需启动服务器、
 安装额外浏览器插件或连接外部网络。单独拷贝HTML会丢失图片，需保留相对目录或下载整个ZIP。
@@ -100,14 +114,26 @@ cd /mnt/qfg/Tate_qfg/SRA-DINO
 conda activate qfg_addino
 mkdir -p logs
 
-nohup env GPU_IDS=0,1 EPOCHS=15 \
+nohup env PIPELINE_MODE=train GPU_IDS=0,1 EPOCHS=15 \
   WORK_DIR=./checkpoint/residual_hr_text_four_datasets_v2 \
   bash run_four_datasets_with_html.sh \
   > logs/residual_hr_text_four_datasets_v2.log 2>&1 &
 ```
 
 这是一个新的完整训练实验，所以例子使用新的v2目录。当前v1只需运行本页第一段补报告命令。
-`RUN_EXPERIMENT=0 bash run_four_datasets_with_html.sh` 也可只补报告。
+`train` 模式不指定 `WORK_DIR` 时，会自动创建带时间戳的新目录。
+
+| PIPELINE_MODE | 行为 |
+|---|---|
+| auto（默认） | 分析指定的已有实验；有预测则直接生成HTML，缺预测则复用已有权重补推理；不自动启动新训练 |
+| visualize | 只生成HTML，要求已有完成并锁定的预测 |
+| resume | 明确用原实验权重恢复预测和评价后生成HTML，不训练新头 |
+| train | 运行训练/评价，成功后自动生成HTML；原训练入口的断点规则继续生效 |
+
+原 `RUN_EXPERIMENT=0/1` 的显式命令仍兼容，分别对应 `visualize/train`；
+两者同时指定时，以明确设置的 `PIPELINE_MODE` 为准。
+训练或恢复失败会停止流程，不会误报HTML生成成功。
+当前和后续实验的HTML输出要求已写入仓库 `AGENTS.md`，后续新增实验入口也应提供同样的分析产物。
 
 其他参数沿用热图导出：`DATASETS=ld`、`LIMIT_PER_CATEGORY=20`、
 `NORMALIZATION=percentile`、`MAX_SIDE=512`、`OUTPUT_DIR=...` 等。

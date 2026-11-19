@@ -85,8 +85,12 @@ class DashboardTests(unittest.TestCase):
             self.assertIn("index.html", archive.namelist())
             self.assertIn("sample_metrics.csv", archive.namelist())
             self.assertFalse(any(name.endswith((".npz", ".pt", ".pth")) for name in archive.namelist()))
-        after = {str(p): heat.sha256(p) for p in self.work.rglob("*") if p.is_file() and "analysis" not in p.parts}
+        after = {path: heat.sha256(path) for path in before}
         self.assertEqual(before, after)
+        self.assertTrue((self.work / "reports" / "HTML_ANALYSIS.html").is_file())
+        pointer = heat.read_json(self.work / "reports" / "html_analysis.json")
+        self.assertEqual(Path(pointer["index"]), output / "index.html")
+        self.assertEqual(pointer["horizon"], 15)
 
     def test_numpy_truth_matches_existing_torch_evaluation_geometry(self):
         import torch
@@ -144,9 +148,11 @@ class ShellTests(unittest.TestCase):
             for name, stage in (("run_train_test_four_datasets.sh", "EXPERIMENT"), ("run_build_four_dataset_dashboard.sh", "HTML")):
                 (root / name).write_text(f'#!/usr/bin/env bash\necho {stage}\n[[ "${{FAIL_STAGE:-}}" != {stage} ]]\n', encoding="utf-8", newline="\n")
             env = os.environ.copy()
+            env.update(PIPELINE_MODE="train", WORK_DIR=str(root / "new_run"))
             first = subprocess.run([fixtures.BASH, "run.sh"], cwd=root, env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(first.returncode, 0, first.stdout+first.stderr)
             self.assertLess(first.stdout.index("EXPERIMENT"), first.stdout.index("HTML"))
+            env.pop("PIPELINE_MODE", None)
             env["RUN_EXPERIMENT"] = "0"
             second = subprocess.run([fixtures.BASH, "run.sh"], cwd=root, env=env, capture_output=True, text=True, timeout=30)
             self.assertNotIn("EXPERIMENT", second.stdout)
@@ -155,6 +161,70 @@ class ShellTests(unittest.TestCase):
             failed = subprocess.run([fixtures.BASH, "run.sh"], cwd=root, env=env, capture_output=True, text=True, timeout=30)
             self.assertNotEqual(failed.returncode, 0)
             self.assertNotIn("HTML", failed.stdout)
+
+    def test_auto_mode_uses_cache_or_existing_weights_but_never_starts_training(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shutil.copyfile(fixtures.ROOT / "run_four_datasets_with_html.sh", root / "run.sh")
+            (root / "run_train_test_four_datasets.sh").write_text('#!/usr/bin/env bash\necho EXPERIMENT\n', encoding="utf-8", newline="\n")
+            (root / "run_build_four_dataset_dashboard.sh").write_text('#!/usr/bin/env bash\necho "HTML RESUME=$RESUME_PREDICTIONS"\n', encoding="utf-8", newline="\n")
+            work = root / "work with spaces"
+            env = os.environ.copy()
+            for key in ("PIPELINE_MODE", "RUN_EXPERIMENT", "TRAIN_UNTIL_EPOCH", "TRAIN_SEED"):
+                env.pop(key, None)
+            env["WORK_DIR"] = str(work)
+            def run():
+                return subprocess.run([fixtures.BASH, "run.sh"], cwd=root, env=env, capture_output=True, text=True, timeout=30)
+            missing = run()
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertNotIn("EXPERIMENT", missing.stdout)
+            work.mkdir()
+            (work / "config.json").write_text('{}', encoding="utf-8")
+            resume = run()
+            self.assertEqual(resume.returncode, 0, resume.stdout+resume.stderr)
+            self.assertIn("HTML RESUME=1", resume.stdout)
+            self.assertNotIn("EXPERIMENT", resume.stdout)
+            lock = work / "predictions" / "seed42" / "through5" / "locked.json"
+            lock.parent.mkdir(parents=True)
+            lock.write_text('{}', encoding="utf-8")
+            cached = run()
+            self.assertEqual(cached.returncode, 0, cached.stdout+cached.stderr)
+            self.assertIn("HTML RESUME=0", cached.stdout)
+            self.assertNotIn("EXPERIMENT", cached.stdout)
+            env["TRAIN_UNTIL_EPOCH"] = "15"
+            requested = run()
+            self.assertIn("HTML RESUME=1", requested.stdout)
+            env["PIPELINE_MODE"] = "bad"
+            self.assertNotEqual(run().returncode, 0)
+
+    def test_explicit_train_allocates_new_directory_by_default(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shutil.copyfile(fixtures.ROOT / "run_four_datasets_with_html.sh", root / "run.sh")
+            for name, text in (("run_train_test_four_datasets.sh", 'echo "TRAIN WORK=$WORK_DIR"'),
+                               ("run_build_four_dataset_dashboard.sh", 'echo "HTML RESUME=$RESUME_PREDICTIONS"')):
+                (root / name).write_text('#!/usr/bin/env bash\n'+text+'\n', encoding="utf-8", newline="\n")
+            env = os.environ.copy()
+            env.pop("WORK_DIR", None)
+            env.update(PIPELINE_MODE="train")
+            result = subprocess.run([fixtures.BASH, "run.sh"], cwd=root, env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+            self.assertIn("TRAIN WORK=./checkpoint/residual_hr_text_four_datasets_20", result.stdout)
+            self.assertNotIn("four_datasets_v1", result.stdout)
+            self.assertLess(result.stdout.index("TRAIN WORK="), result.stdout.index("HTML RESUME=0"))
+
+    def test_prediction_recovery_passes_run_train_zero(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shutil.copyfile(fixtures.ROOT / "run_build_four_dataset_dashboard.sh", root / "run.sh")
+            (root / "run_train_test_four_datasets.sh").write_text('#!/usr/bin/env bash\necho "RECOVER TRAIN=$RUN_TRAIN PREDICT=$RUN_PREDICT EVAL=$RUN_EVAL"\n', encoding="utf-8", newline="\n")
+            (root / "runtime").write_text('#!/usr/bin/env bash\necho HTML\n', encoding="utf-8", newline="\n")
+            (root / "runtime").chmod(0o755)
+            env = os.environ.copy()
+            env.update(TRAIN_PYTHON="./runtime", RESUME_PREDICTIONS="1")
+            result = subprocess.run([fixtures.BASH, "run.sh"], cwd=root, env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+            self.assertIn("RECOVER TRAIN=0 PREDICT=1 EVAL=1", result.stdout)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 推荐入口：`run_four_datasets_with_html.sh`，训练/评价后自动生成交互式HTML分析报告。
 原训练实现为 `run_train_test_four_datasets.sh` / `train_test_four_datasets.py`。
+统一入口默认分析已有v1结果；下面的新训练命令明确指定 `PIPELINE_MODE=train`。
 本入口对应 **DINO 正常参考残差＋约束器/Flow＋高分辨率＋文本**，
 不是 `run_test_ld.sh` 对应的早期 CLIP+DINO / MARA 网络。
 无需提供已训练的 checkpoint，只需要原来的 DINO/CLIP 预训练权重和数据。
@@ -38,7 +39,7 @@ git pull --ff-only origin main
 conda activate qfg_addino
 mkdir -p logs
 
-nohup env GPU_IDS=0,1 EPOCHS=15 \
+nohup env PIPELINE_MODE=train GPU_IDS=0,1 EPOCHS=15 \
   WORK_DIR=./checkpoint/residual_hr_text_four_datasets_v1 \
   bash run_four_datasets_with_html.sh \
   > logs/residual_hr_text_four_datasets_v1.log 2>&1 &

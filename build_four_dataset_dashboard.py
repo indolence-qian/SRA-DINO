@@ -9,8 +9,10 @@ from __future__ import annotations
 from collections import defaultdict
 import csv
 import json
+import os
 from pathlib import Path
 import shutil
+from urllib.parse import quote
 import zipfile
 
 import numpy as np
@@ -258,6 +260,21 @@ def run(args):
             for path in sorted(files):
                 archive.write(path, path.relative_to(output).as_posix())
         print(f"Download HTML + assets: {output / 'analysis_report.zip'}", flush=True)
+    report_dir = work / "reports"
+    report_dir.mkdir(exist_ok=True)
+    try:
+        href = quote(Path(os.path.relpath(output / "index.html", report_dir)).as_posix(), safe="/:")
+    except ValueError:
+        href = (output / "index.html").as_uri()
+    (report_dir / "HTML_ANALYSIS.html").write_text(
+        '<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
+        f'<meta http-equiv="refresh" content="0;url={href}"><title>实验可视化</title>'
+        f'<p><a href="{href}">打开最新生成的四数据集 HTML 分析报告</a></p></html>', encoding="utf-8")
+    heat.write_json(report_dir / "html_analysis.json", dict(
+        experiment=str(work), seed=args.seed, horizon=until, normalization=args.normalization,
+        index=str(output / "index.html"), archive=str(output / "analysis_report.zip") if args.pack else None,
+        prediction_lock_sha256=heat.sha256(predictions / "locked.json")))
+    print(f"Stable HTML entry: {report_dir / 'HTML_ANALYSIS.html'}", flush=True)
     print(f"Interactive analysis: {output / 'index.html'}", flush=True)
     return output, data
 
