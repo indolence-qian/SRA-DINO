@@ -21,7 +21,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 PROTOCOL = "fresh_residual_hr_text_four_targets_v1"
-RENDERER_VERSION = 1
+RENDERER_VERSION = 2
 TARGETS = ("mvtec", "btad", "mpdd", "ld")
 
 
@@ -54,6 +54,73 @@ def component(value):
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
         raise ValueError(f"Invalid dataset/category/id for output paths: {value!r}")
     return value
+
+
+def output_variant(args):
+    fraction = format(args.sample_fraction * 100, ".10g").replace(".", "p")
+    return f"{args.normalization}_sample{fraction}_v2"
+
+
+def select_samples(rows, args):
+    """Systematic sampling within dataset/category/image-label strata.
+
+    Midpoints of equal-width filename bins cover the whole stratum, without
+    looking at scores, localization quality, or mask foreground. Small strata
+    round up to one, so the actual fraction can be slightly above the request.
+    """
+    if not math.isfinite(args.sample_fraction) or not 0 < args.sample_fraction <= 1:
+        raise ValueError("sample-fraction must be in (0, 1]")
+    datasets = args.datasets.replace(",", " ").split()
+    if not datasets or len(set(datasets)) != len(datasets) or not set(datasets) <= set(TARGETS):
+        raise ValueError("DATASETS must contain unique choices from mvtec,btad,mpdd,ld")
+    categories = args.categories.replace(",", " ").split() if args.categories else []
+    eligible = [r for r in rows if r["dataset"] in datasets and (not categories or r["category"] in categories)]
+    if not eligible or (categories and set(categories)-{r["category"] for r in eligible}):
+        raise ValueError("No matching predictions or unknown category filter")
+    grouped = {}
+    for row in eligible:
+        key = component(row["dataset"]), component(row["category"]), int(bool(row["mask_path"]))
+        grouped.setdefault(key, []).append(row)
+    selected = []
+    for key in sorted(grouped):
+        samples = sorted(grouped[key], key=lambda r: (Path(r["image_path"]).name, r["id"]))
+        count = max(1, math.ceil(len(samples) * args.sample_fraction))
+        selected.extend(samples[(2*i+1)*len(samples)//(2*count)] for i in range(count))
+    if args.limit_per_category:
+        capped = {}
+        for row in selected:
+            capped.setdefault((row["dataset"], row["category"]), []).append(row)
+        selected = []
+        for samples in capped.values():
+            samples.sort(key=lambda r: fingerprint([args.seed, "heatmap_sample", r["id"]]))
+            selected.extend(samples[:args.limit_per_category])
+    selected_ids = {r["id"] for r in selected}
+    sampling = dict(method="systematic_midpoints_by_dataset_category_label", fraction=args.sample_fraction,
+        limit_per_category=args.limit_per_category, eligible=len(eligible), selected=len(selected),
+        actual_fraction=len(selected)/len(eligible), selected_ids=[r["id"] for r in selected],
+        strata=[dict(dataset=key[0], category=key[1], label=key[2], total=len(samples),
+                     selected=sum(r["id"] in selected_ids for r in samples)) for key, samples in sorted(grouped.items())])
+    return eligible, selected, sampling
+
+
+def pack_assets(output, archive_name, files):
+    """Package an explicit resource closure, never leftovers from older renders."""
+    output = Path(output).resolve()
+    paths = sorted({Path(path) for path in files})
+    hashes = {}
+    for path in paths:
+        if not path.resolve().is_relative_to(output) or not path.is_file():
+            raise ValueError(f"Missing or nonportable report resource: {path}")
+        hashes[path.relative_to(output).as_posix()] = sha256(path)
+    manifest = output / "asset_manifest.json"
+    write_json(manifest, dict(version=1, entry="index.html", files=hashes))
+    temporary = output / (archive_name+".tmp")
+    with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path in paths + [manifest]:
+            archive.write(path, path.relative_to(output).as_posix())
+    archive_path = output / archive_name
+    temporary.replace(archive_path)
+    return archive_path
 
 
 def load_run(work, seed, until=None):
@@ -231,18 +298,29 @@ def render_sample(row, maps, thresholds, folder, args, expected_mask_sha=None):
 
 
 def make_gallery(output, records):
+    datasets = [name for name in TARGETS if any(r["dataset"] == name for r in records)]
     content = ['<!doctype html><html lang="en"><meta charset="utf-8"><title>Four-dataset heatmaps</title>',
-        '<style>body{font:16px system-ui;margin:28px;background:#f5f7fa;color:#192333}article{background:white;margin:24px 0;padding:16px;border-radius:12px}img{max-width:100%;height:auto}a{margin-right:18px}</style>',
+        '<style>body{font:16px system-ui;margin:28px;background:#f5f7fa;color:#192333}article{background:white;margin:24px 0;padding:16px;border-radius:12px}img{max-width:100%;height:auto}a{margin-right:18px}select{font:inherit;padding:8px}[hidden]{display:none!important}</style>',
         '<h1>Four-dataset anomaly heatmaps</h1>',
-        '<p>Existing locked predictions. Heatmap colors are display values, not anomaly probabilities. LD ground truth is box-derived.</p>']
+        '<p>Existing locked predictions. Heatmap colors are display values, not anomaly probabilities. LD ground truth is box-derived.</p>',
+        '<label>Dataset / 数据集 <select id="galleryDataset">'+''.join(f'<option value="{name}">{name.upper()}</option>' for name in datasets)+'</select></label>',
+        '<p id="galleryCount"></p>']
     for row in records:
         files = row["files"]
         title = html.escape(f"{row['dataset']}/{row['category']} | {Path(row['image_path']).name}")
-        content += [f'<article><h2>{title}</h2><img loading="lazy" src="{quote(files["panel"])}" alt="{title}"><p>']
+        hidden = '' if row["dataset"] == datasets[0] else ' hidden'
+        content += [f'<article data-dataset="{row["dataset"]}"{hidden}><h2>{title}</h2><img loading="lazy" src="{quote(files["panel"])}" alt="{title}"><p>']
         for key in ("full_heatmap", "visual_heatmap", "overlay", "prediction"):
             content.append(f'<a href="{quote(files[key])}">{key}</a>')
         content.append('</p></article>')
-    content.append('</html>')
+    content.append('''<script>
+const selector=document.getElementById('galleryDataset');
+if([...selector.options].some(option=>option.value===location.hash.slice(1)))selector.value=location.hash.slice(1);
+function showDataset(){let count=0;document.querySelectorAll('article[data-dataset]').forEach(el=>{
+el.hidden=el.dataset.dataset!==selector.value;if(!el.hidden)count++;});
+document.getElementById('galleryCount').textContent=selector.value.toUpperCase()+' · '+count+' sampled images / 抽样图片';}
+selector.addEventListener('change',showDataset);showDataset();
+</script></html>''')
     (output / "index.html").write_text("\n".join(content), encoding="utf-8")
 
 
@@ -254,22 +332,8 @@ def run(args):
     if not 0 <= args.low_percentile < args.high_percentile <= 100 or args.limit_per_category < 0:
         raise ValueError("Invalid percentile range or image limit")
     cfg, rows, predictions, lock, thresholds, until = load_run(args.work_dir, args.seed, args.until_epoch)
-    datasets = args.datasets.replace(",", " ").split()
-    if not datasets or len(set(datasets)) != len(datasets) or not set(datasets) <= set(TARGETS):
-        raise ValueError("DATASETS must contain unique choices from mvtec,btad,mpdd,ld")
-    categories = args.categories.replace(",", " ").split() if args.categories else []
-    eligible = [r for r in rows if r["dataset"] in datasets and (not categories or r["category"] in categories)]
-    if not eligible or (categories and set(categories)-{r["category"] for r in eligible}):
-        raise ValueError("No matching predictions or unknown category filter")
-    grouped = {}
-    for row in eligible:
-        key = component(row["dataset"]), component(row["category"])
-        grouped.setdefault(key, []).append(row)
-    selected = []
-    for key in sorted(grouped):
-        samples = sorted(grouped[key], key=lambda r: fingerprint([args.seed, "heatmap_sample", r["id"]]))
-        selected += samples[:args.limit_per_category] if args.limit_per_category else samples
-    output = Path(args.output_dir).resolve() if args.output_dir else Path(args.work_dir).resolve() / "heatmaps" / f"seed{args.seed}" / f"through{until}" / args.normalization
+    eligible, selected, sampling = select_samples(rows, args)
+    output = Path(args.output_dir).resolve() if args.output_dir else Path(args.work_dir).resolve() / "heatmaps" / f"seed{args.seed}" / f"through{until}" / output_variant(args)
     # The renderer only writes inside heatmaps, never to sealed model/data folders.
     if output in (Path(args.work_dir).resolve(), predictions.resolve()) or output.is_relative_to(predictions.resolve()):
         raise ValueError("Use a separate heatmap output directory")
@@ -282,6 +346,7 @@ def run(args):
     if settings_path.exists() and read_json(settings_path) != settings:
         raise ValueError("Heatmap style/predictions changed; choose a new OUTPUT_DIR")
     write_json(settings_path, settings)
+    print(f"Uniform heatmap sample: {len(selected)}/{len(eligible)} eligible images (requested {args.sample_fraction:.0%}; small strata round up).", flush=True)
     records = []
     audit_cache = {}
     for index, row in enumerate(selected, 1):
@@ -314,6 +379,7 @@ def run(args):
         if index == 1 or index % 25 == 0 or index == len(selected):
             print(f"Heatmaps {index}/{len(selected)}: {row['dataset']}/{row['category']}", flush=True)
     make_gallery(output, records)
+    write_json(output / "sampling.json", sampling)
     write_json(output / "index.json", records)
     with (output / "index.csv").open("w", newline="", encoding="utf-8-sig") as stream:
         fields = ["id", "dataset", "category", "image_path", "is_anomaly", "full_min", "full_max", "full_threshold", "predicted_pixels"]
@@ -321,14 +387,11 @@ def run(args):
         writer.writeheader()
         writer.writerows(records)
     if args.pack:
-        archive_path = output / "heatmaps.zip"
-        files = [output / name for name in ("render_config.json", "index.html", "index.json", "index.csv")]
+        files = [output / name for name in ("render_config.json", "index.html", "index.json", "index.csv", "sampling.json")]
         for row in records:
             files += [output / name for name in row["files"].values()]
             files.append(output / row["dataset"] / row["category"] / (row["id"]+".json"))
-        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
-            for path in sorted(set(files)):
-                archive.write(path, path.relative_to(output).as_posix())
+        archive_path = pack_assets(output, "heatmaps.zip", files)
         print(f"Download ZIP: {archive_path}", flush=True)
     print(f"Generated {len(records)} image sets. Gallery: {output / 'index.html'}", flush=True)
     return output, records
@@ -342,6 +405,8 @@ def parser():
     p.add_argument("--until-epoch", type=int)
     p.add_argument("--datasets", default=",".join(TARGETS))
     p.add_argument("--categories", default="")
+    p.add_argument("--sample-fraction", type=float, default=.1,
+                   help="Fraction rendered per dataset/category/image-label stratum (default: 0.1)")
     p.add_argument("--limit-per-category", type=int, default=0)
     p.add_argument("--max-side", type=int, default=512)
     p.add_argument("--alpha", type=float, default=.45)

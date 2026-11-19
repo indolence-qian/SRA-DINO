@@ -13,10 +13,11 @@ for flag in SHOW_GT PACK; do
   [[ -z "${value}" || "${value}" == 0 || "${value}" == 1 ]] || { echo "${flag} must be 0 or 1" >&2; exit 1; }
 done
 [[ "${SHOW_GT:-1}" == 1 ]] || FLAGS+=(--no-gt)
-[[ "${PACK:-0}" == 0 ]] || FLAGS+=(--pack)
+[[ "${PACK:-1}" == 0 ]] || FLAGS+=(--pack)
 "${TRAIN_PYTHON}" render_four_dataset_heatmaps.py \
   --work-dir "${WORK_DIR}" --seed "${TRAIN_SEED:-42}" \
   --datasets "${DATASETS:-mvtec,btad,mpdd,ld}" --categories "${CATEGORIES:-}" \
+  --sample-fraction "${SAMPLE_FRACTION:-0.1}" \
   --limit-per-category "${LIMIT_PER_CATEGORY:-0}" --max-side "${MAX_SIDE:-512}" \
   --normalization "${NORMALIZATION:-source}" --temperature "${TEMPERATURE:-1}" \
   --low-percentile "${LOW_PERCENTILE:-1}" --high-percentile "${HIGH_PERCENTILE:-99}" \

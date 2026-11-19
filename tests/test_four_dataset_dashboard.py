@@ -114,7 +114,7 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(ap, .5)
         self.assertIsNone(app.binary_ranking([1, 1], [0, 1])[0])
 
-    def test_published_metrics_are_used_only_for_complete_category_coverage(self):
+    def test_full_metrics_remain_full_when_gallery_is_sampled(self):
         rows = [r for r in self.rows if r["dataset"] == "mvtec"]
         path = self.work / "metrics" / "seed42" / "through15" / "mvtec__object.json"
         heat.write_json(path, dict(
@@ -127,8 +127,69 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(data["categories"][0]["full"]["best_f1"], .7)
         self.args.limit_per_category = 1
         _, preview = app.run(self.args)
-        self.assertIsNone(preview["categories"][0]["full"]["pixel_ap"])
+        self.assertEqual(preview["categories"][0]["full"]["pixel_ap"], .75)
+        self.assertEqual(preview["categories"][0]["images"], 2)
+        self.assertEqual(preview["categories"][0]["visualized_images"], 1)
         self.assertEqual(preview["coverage"]["selected"], 1)
+        self.assertEqual(preview["coverage"]["analyzed"], 2)
+
+    def test_tenth_gallery_has_full_statistics_and_a_portable_relocated_zip(self):
+        self.fixture.replicate_queries(10)
+        before = self.fixture.sealed_hashes()
+        output, sampled = app.run(self.args)
+        self.assertEqual(sampled["coverage"], dict(selected=8, total=80, eligible=80, analyzed=80))
+        self.assertTrue(all(row["images"] == 20 and row["visualized_images"] == 2 for row in sampled["datasets"]))
+        self.assertEqual(len(list(output.rglob("*_panel.jpg"))), 8)
+        self.assertEqual(len(list(output.rglob("*_original.jpg"))), 8)
+        with zipfile.ZipFile(output / "analysis_report.zip") as archive, tempfile.TemporaryDirectory() as temp:
+            extracted = Path(temp) / "moved report with spaces"
+            archive.extractall(extracted)
+            self.assertIsNone(archive.testzip())
+            self.assertIn("HTML_ANALYSIS.html", archive.namelist())
+            self.assertIn("README.txt", archive.namelist())
+            packaged = heat.read_json(extracted / "analysis.json")
+            closure = heat.read_json(extracted / "asset_manifest.json")
+            for name, expected in closure["files"].items():
+                self.assertFalse(Path(name).is_absolute())
+                self.assertEqual(heat.sha256(extracted / name), expected)
+            for row in packaged["cases"]:
+                for name in row["files"].values():
+                    self.assertIn(name, closure["files"])
+                    with Image.open(extracted / name) as image:
+                        image.verify()
+            entry = (extracted / "HTML_ANALYSIS.html").read_text(encoding="utf-8")
+            self.assertIn('url=index.html', entry)
+            self.assertNotIn(str(self.work), entry)
+            html = (extracted / "index.html").read_text(encoding="utf-8")
+            self.assertIn('id="caseDataset"', html)
+            self.assertIn('r.dataset===state.caseDataset', html)
+            self.assertNotIn('fetch(', html)
+        # Sampling changes only the gallery, never the full-cohort numbers.
+        self.args.sample_fraction = 1
+        _, full = app.run(self.args)
+        for key in ("datasets", "categories"):
+            strip = lambda rows: [{k: v for k, v in row.items() if k != "visualized_images"} for row in rows]
+            self.assertEqual(strip(sampled[key]), strip(full[key]))
+        self.assertEqual(before, {path: heat.sha256(path) for path in before})
+
+    def test_unrendered_masks_are_audited_and_missing_assets_stop_packaging(self):
+        self.fixture.replicate_queries(10)
+        rows = self.fixture.rows
+        _, selected, _ = heat.select_samples(rows, self.args)
+        selected_ids = {r["id"] for r in selected}
+        unsampled = next(r for r in rows if r["id"] not in selected_ids and r["mask_path"])
+        # Auditing full-cohort summaries must include images absent from the gallery.
+        audit = {r["id"]: heat.sha256(r["mask_path"]) if r["mask_path"] else None
+                 for r in rows if (r["dataset"], r["category"]) == (unsampled["dataset"], unsampled["category"])}
+        audit[unsampled["id"]] = "changed"
+        heat.write_json(self.work / "metrics" / "seed42" / "through15" /
+                        (unsampled["dataset"]+"__"+unsampled["category"]+".json"),
+                        dict(prediction_lock_sha=heat.sha256(self.fixture.predictions / "locked.json"),
+                             evaluation_mask_hashes=audit, metrics=[]))
+        with self.assertRaisesRegex(ValueError, "GT changed after evaluation"):
+            app.run(self.args)
+        with self.assertRaisesRegex(ValueError, "Missing or nonportable"):
+            heat.pack_assets(self.work, "bad.zip", [self.work / "missing.jpg"])
 
     def test_json_payload_is_safe_for_untrusted_filename(self):
         text = '</script><script>window.bad=1</script>'

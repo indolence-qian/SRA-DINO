@@ -13,7 +13,6 @@ import os
 from pathlib import Path
 import shutil
 from urllib.parse import quote
-import zipfile
 
 import numpy as np
 from PIL import Image
@@ -21,7 +20,7 @@ from PIL import Image
 import render_four_dataset_heatmaps as heat
 
 TEMPLATE = Path(__file__).resolve().parent / "asset" / "four_dataset_dashboard.html"
-VERSION = 1
+VERSION = 2
 
 
 def write_html(output, data):
@@ -156,10 +155,11 @@ def aggregate(cases, official=None):
     for (dataset, category), values in sorted(grouped.items()):
         row = dict(dataset=dataset, category=category, images=len(values))
         for branch in ("visual", "full"):
+            published = official.get((dataset, category, branch), {})
             auc, ap = binary_ranking([r["label"] for r in values], [r[branch]["score"] for r in values])
             counts = {name: sum(r[branch]["outcome"] == name for r in values) for name in ("TP", "TN", "FP", "FN")}
             dices = [r[branch]["dice"] for r in values if r[branch]["dice"] is not None]
-            row[branch] = dict(**counts, image_auc=auc, image_ap=ap,
+            row[branch] = dict(**counts, image_auc=published.get("I_AUROC", auc), image_ap=published.get("I_AP", ap),
                 dice=float(np.mean(dices)) if dices else None, localized_images=len(dices),
                 pixel_ap=official.get((dataset, category, branch), {}).get("P_AP"),
                 pixel_auc=official.get((dataset, category, branch), {}).get("P_AUROC"),
@@ -192,32 +192,31 @@ def run(args):
     if args.no_gt:
         raise ValueError("Error analysis needs GT; use the heatmap-only renderer when GT is unavailable")
     work = Path(args.work_dir).resolve()
-    output = args.output_dir or work / "analysis" / f"seed{args.seed}" / f"through{until}" / args.normalization
+    eligible, selected, sampling = heat.select_samples(manifest, args)
+    output = args.output_dir or work / "analysis" / f"seed{args.seed}" / f"through{until}" / heat.output_variant(args)
     render_args = copy_args(args, output)
     output, rendered = heat.run(render_args)
     shutil.copyfile(output / "index.html", output / "gallery.html")
-    by_id = {r["id"]: r for r in manifest}
+    rendered_by_id = {r["id"]: r for r in rendered}
     expected_groups = defaultdict(set)
-    for row in manifest:
+    for row in eligible:
         expected_groups[row["dataset"], row["category"]].add(row["id"])
-    selected_groups = defaultdict(set)
-    for row in rendered:
-        selected_groups[row["dataset"], row["category"]].add(row["id"])
     official, audit = {}, {}
-    for key, ids in selected_groups.items():
+    for key, ids in expected_groups.items():
         path = work / "metrics" / f"seed{args.seed}" / f"through{until}" / ("__".join(key)+".json")
         if not path.is_file():
             continue
         data = heat.read_json(path)
         if data["prediction_lock_sha"] != heat.sha256(predictions / "locked.json"):
             raise ValueError("Official metrics do not match prediction lock")
+        if set(data["evaluation_mask_hashes"]) != ids:
+            raise ValueError("Official metrics do not cover the full category")
         audit.update(data["evaluation_mask_hashes"])
-        if ids == expected_groups[key]:
-            for point in data["metrics"]:
-                official[key[0], key[1], point["score"]] = point
-    cases = []
-    for index, record in enumerate(rendered, 1):
-        row = by_id[record["id"]]
+        for point in data["metrics"]:
+            official[key[0], key[1], point["score"]] = point
+    cases, all_cases = [], []
+    print(f"Full-cohort diagnostics: {len(eligible)} images; render/package only {len(selected)} images.", flush=True)
+    for index, row in enumerate(eligible, 1):
         maps = heat.load_scores(row, cfg, predictions, lock)
         truth, mask_sha = evaluation_truth(row, cfg["eval_size"])
         if row["id"] in audit and audit[row["id"]] != mask_sha:
@@ -226,21 +225,36 @@ def run(args):
         branches = metrics.pop("branches")
         case = dict(id=row["id"], dataset=row["dataset"], category=row["category"],
             filename=Path(row["image_path"]).name, image_path=row["image_path"], label=int(bool(row["mask_path"])),
-            annotation_kind=record["annotation_kind"], visual=branches["visual"], full=branches["full"],
-            **metrics, files=dict(record["files"]))
-        case["files"].update(export_details(row, truth, maps, thresholds, output, args.max_side))
-        case["notes"] = suggestions(case)
-        cases.append(case)
-        if index % 25 == 0 or index == len(rendered):
-            print(f"Analysis {index}/{len(rendered)}", flush=True)
-    datasets, categories = aggregate(cases, official)
+            annotation_kind="bounding_box" if row["dataset"] == "ld" else "as_provided_mask",
+            visual=branches["visual"], full=branches["full"], **metrics)
+        all_cases.append(case)
+        if row["id"] in rendered_by_id:
+            case = dict(case, files=dict(rendered_by_id[row["id"]]["files"]))
+            case["files"].update(export_details(row, truth, maps, thresholds, output, args.max_side))
+            case["notes"] = suggestions(case)
+            cases.append(case)
+        if index % 100 == 0 or index == len(eligible):
+            print(f"Analysis {index}/{len(eligible)} (full statistics, sampled images)", flush=True)
+    datasets, categories = aggregate(all_cases, official)
+    for row in datasets + categories:
+        row["visualized_images"] = sum(case["dataset"] == row["dataset"] and
+            ("category" not in row or case["category"] == row["category"]) for case in cases)
     data = dict(version=VERSION, seed=args.seed, horizon=until, normalization=args.normalization,
         experiment=str(work), source_thresholds=thresholds, datasets=datasets, categories=categories, cases=cases,
-        coverage=dict(selected=len(cases), total=len(manifest)),
+        metrics_scope="full_filtered_evaluation", sampling=sampling,
+        coverage=dict(selected=len(cases), total=len(manifest), eligible=len(eligible), analyzed=len(all_cases)),
         provenance=dict(prediction_lock_sha256=heat.sha256(predictions / "locked.json"), builder_sha256=heat.sha256(__file__),
                         template_sha256=heat.sha256(TEMPLATE)))
     heat.write_json(output / "analysis.json", data)
     write_html(output, data)
+    write_entry(output / "HTML_ANALYSIS.html", "index.html")
+    (output / "README.txt").write_text(
+        "Extract the ENTIRE ZIP into a folder, then open index.html or HTML_ANALYSIS.html.\n"
+        "Keep the dataset subfolders beside the HTML files. No server, Python, Internet or original data paths are needed.\n"
+        "To publish, upload the entire extracted folder to any static web host.\n"
+        "Dataset/category charts use the full filtered evaluation cohort; image galleries and sample_metrics.csv use only the uniform sample.\n"
+        "sampling.json lists sampling strata and IDs; asset_manifest.json lists packaged file checksums.\n",
+        encoding="utf-8")
     fields = ["id", "dataset", "category", "filename", "label", "annotation_kind", "gt_fraction", "empty_anomaly_mask", "dice_delta"]
     flat = []
     for row in cases:
@@ -253,12 +267,11 @@ def run(args):
         writer.writeheader()
         writer.writerows(flat)
     if args.pack:
-        files = {output / name for name in ("index.html", "gallery.html", "analysis.json", "sample_metrics.csv", "render_config.json", "index.csv", "index.json")}
+        files = {output / name for name in ("index.html", "HTML_ANALYSIS.html", "gallery.html", "analysis.json", "sample_metrics.csv", "render_config.json", "index.csv", "index.json", "sampling.json", "README.txt")}
         for row in cases:
             files.update(output / path for path in row["files"].values())
-        with zipfile.ZipFile(output / "analysis_report.zip", "w", zipfile.ZIP_DEFLATED) as archive:
-            for path in sorted(files):
-                archive.write(path, path.relative_to(output).as_posix())
+            files.add(output / row["dataset"] / row["category"] / (row["id"]+".json"))
+        heat.pack_assets(output, "analysis_report.zip", files)
         print(f"Download HTML + assets: {output / 'analysis_report.zip'}", flush=True)
     report_dir = work / "reports"
     report_dir.mkdir(exist_ok=True)
@@ -266,17 +279,24 @@ def run(args):
         href = quote(Path(os.path.relpath(output / "index.html", report_dir)).as_posix(), safe="/:")
     except ValueError:
         href = (output / "index.html").as_uri()
-    (report_dir / "HTML_ANALYSIS.html").write_text(
-        '<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
-        f'<meta http-equiv="refresh" content="0;url={href}"><title>实验可视化</title>'
-        f'<p><a href="{href}">打开最新生成的四数据集 HTML 分析报告</a></p></html>', encoding="utf-8")
+    write_entry(report_dir / "HTML_ANALYSIS.html", href)
     heat.write_json(report_dir / "html_analysis.json", dict(
         experiment=str(work), seed=args.seed, horizon=until, normalization=args.normalization,
         index=str(output / "index.html"), archive=str(output / "analysis_report.zip") if args.pack else None,
+        sampling=sampling, metrics_scope="full_filtered_evaluation",
         prediction_lock_sha256=heat.sha256(predictions / "locked.json")))
     print(f"Stable HTML entry: {report_dir / 'HTML_ANALYSIS.html'}", flush=True)
     print(f"Interactive analysis: {output / 'index.html'}", flush=True)
     return output, data
+
+
+def write_entry(path, href):
+    from html import escape
+    href = escape(href, quote=True)
+    Path(path).write_text(
+        '<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
+        f'<meta http-equiv="refresh" content="0;url={href}"><title>实验可视化</title>'
+        f'<p><a href="{href}">打开四数据集 HTML 分析报告</a></p></html>', encoding="utf-8")
 
 
 def copy_args(args, output):

@@ -6,7 +6,8 @@
 脚本独立于封存训练代码，更新后可直接读取原来的预测。
 
 旧输出 `panels/` 每类别仅抽两张256像素小图，且没有单独的彩色热力图。
-这个入口默认处理四个数据集全部测试图，使用经典蓝—青—黄—红色图，并保持原图宽高比。
+这个入口默认按数据集、类别、正常/异常图像标签均匀抽取约1/10测试图，使用经典蓝—青—黄—红色图，并保持原图宽高比。
+每层按文件名/ID排序后等距取区间中点，数量向上取整且至少一张；不是按检测好坏挑图。
 
 ## 服务器运行
 
@@ -29,10 +30,12 @@ tail -f logs/four_dataset_heatmaps.log
 例如训练到15轮的输出为：
 
 ```text
-checkpoint/residual_hr_text_four_datasets_v1/heatmaps/seed42/through15/source/
+checkpoint/residual_hr_text_four_datasets_v1/heatmaps/seed42/through15/source_sample10_v2/
   index.html                          可下载到本机打开的图片浏览页
   index.csv / index.json              原图地址、标签、原始分数与渲染对应关系
   render_config.json                  色标/源阈值/预测锁及脚本哈希
+  sampling.json                       各分层总体/抽样数与选中ID
+  asset_manifest.json                 包内资源路径及SHA256校验和
   ld/gear_teeth/
     <id>_panel.jpg                    六联图
     <id>_full_heatmap.png             完整模型的纯热力图
@@ -41,7 +44,7 @@ checkpoint/residual_hr_text_four_datasets_v1/heatmaps/seed42/through15/source/
     <id>_prediction.png               原始分数按固定源阈值二值化
     <id>.json                        该样本的色标、分数范围和输出文件校验和
   ...                                其余类别及 MVTec/BTAD/MPDD
-  heatmaps.zip                       PACK=1时生成，可整体下载
+  heatmaps.zip                       默认生成，可整体下载
 ```
 
 六联图上排依次是原图、GT红色标注、源阈值下的二值预测；
@@ -49,7 +52,7 @@ checkpoint/residual_hr_text_four_datasets_v1/heatmaps/seed42/through15/source/
 GT单独显示，不影响热图色标或二值预测。LD的GT是矩形框代理标注。
 缩略GT按正覆盖保留微小前景；BTAD全零mask仍显示为无像素标注，图像异常标签独立保留。
 
-`index.html` 使用相对路径。整体下载解压 `heatmaps.zip` 后打开，能直接浏览图片；
+`index.html` 使用相对路径，提供数据集选择，每次只显示一个数据集。整体下载并完整解压 `heatmaps.zip` 后打开，能直接浏览图片；
 它不是 `four_datasets_report.zip`，新ZIP专门包含热图及索引，不包含模型或预测NPZ。
 
 ## 对比度与颜色解释
@@ -73,23 +76,27 @@ WORK_DIR=./checkpoint/residual_hr_text_four_datasets_v1 \
 两分支共用显示范围，避免把弱文本增量放大成明显模型差异。
 增强只用于看空间分布：**不同图片之间的颜色强度不可直接比较，红色不代表该位置超过实际检测阈值**。
 二值预测图仍使用原始分数和固定源阈值。
-增强结果独立保存到 `heatmaps/seed42/through15/percentile/`，不覆盖默认图。
+增强结果独立保存到 `heatmaps/seed42/through15/percentile_sample10_v2/`，不覆盖默认图。
 
 ## 只看LD或先少量预览
 
 ```bash
-# 只输出LD的全部测试图
-DATASETS=ld PACK=1 bash run_render_four_dataset_heatmaps.sh
+# 只输出LD的均匀1/10图片
+DATASETS=ld bash run_render_four_dataset_heatmaps.sh
 
-# 四数据集每个类别先固定抽20张，不按预测好坏挑图
+# 明确需要全部测试图时
+SAMPLE_FRACTION=1 bash run_render_four_dataset_heatmaps.sh
+
+# 均匀抽样后，每个类别最多输出20张
 LIMIT_PER_CATEGORY=20 bash run_render_four_dataset_heatmaps.sh
 
 # 只看轴面Cam5
 DATASETS=ld CATEGORIES=shaft_cam5 bash run_render_four_dataset_heatmaps.sh
 ```
 
-默认 `LIMIT_PER_CATEGORY=0` 代表全部图片。抽样按固定哈希，和GT/模型分数无关。
-重复运行相同设置会校验并复用已完成图片；从少量预览扩展到全量时会补齐其余图片。
+默认 `SAMPLE_FRACTION=0.1`，`LIMIT_PER_CATEGORY=0` 表示不额外限制抽样数量。
+分层仅使用独立图像标签，不使用mask前景或模型分数。可选数量上限以固定哈希取样。
+重复运行相同设置会校验并复用已完成图片；改变采样比例默认使用不同目录，保留之前的报告。
 索引和可选ZIP包含本次选中的图片，其他已渲染文件保留。
 
 | 环境变量 | 默认值 | 含义 |
@@ -99,14 +106,15 @@ DATASETS=ld CATEGORIES=shaft_cam5 bash run_render_four_dataset_heatmaps.sh
 | TRAIN_UNTIL_EPOCH | 自动 | 数字最大的已锁定训练horizon |
 | DATASETS | mvtec,btad,mpdd,ld | 可选一个或多个测试集 |
 | CATEGORIES | 全部 | 可选类别，逗号或空格分隔 |
-| LIMIT_PER_CATEGORY | 0 | 0为全部；正数为每类别固定抽样数 |
+| SAMPLE_FRACTION | 0.1 | 每个数据集/类别/图像标签层的采样比例，范围(0,1]；1为全量 |
+| LIMIT_PER_CATEGORY | 0 | 抽样后每类别额外数量上限，0不限制 |
 | MAX_SIDE | 512 | 图片最长边；保持原始宽高比 |
 | NORMALIZATION | source | source固定阈值色标，或percentile显示增强 |
 | TEMPERATURE | 1 | source模式的显示过渡宽度，越小越陡 |
 | LOW_PERCENTILE / HIGH_PERCENTILE | 1 / 99 | percentile显示范围 |
 | OVERLAY_ALPHA | 0.45 | 热力图叠加比例 |
 | SHOW_GT | 1 | 0可在没有GT文件时生成热图 |
-| PACK | 0 | 1额外生成热图ZIP |
+| PACK | 1 | 默认打包抽样热图及全部相对路径资源；0不打包 |
 | OUTPUT_DIR | 自动 | 自定义热图目录；改显示参数需新目录 |
 
 完整导出会生成较多图片；可先 `LIMIT_PER_CATEGORY=20` 检查效果。

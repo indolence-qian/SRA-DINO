@@ -15,6 +15,7 @@ FLAGS=()
 "${TRAIN_PYTHON}" build_four_dataset_dashboard.py \
   --work-dir "${WORK_DIR}" --seed "${TRAIN_SEED:-42}" \
   --datasets "${DATASETS:-mvtec,btad,mpdd,ld}" --categories "${CATEGORIES:-}" \
+  --sample-fraction "${SAMPLE_FRACTION:-0.1}" \
   --limit-per-category "${LIMIT_PER_CATEGORY:-0}" --max-side "${MAX_SIDE:-512}" \
   --normalization "${NORMALIZATION:-source}" --temperature "${TEMPERATURE:-1}" \
   --low-percentile "${LOW_PERCENTILE:-1}" --high-percentile "${HIGH_PERCENTILE:-99}" \

@@ -49,7 +49,12 @@ remain usable. See [the unified run modes](docs/four_dataset_dashboard.md).
 For an already completed `residual_hr_text_four_datasets_v1` run, use
 `bash run_build_four_dataset_dashboard.sh` to build an offline interactive HTML
 report with dataset/category metrics, good/bad cases, false positives/negatives,
-localization errors and text-branch comparisons. See [HTML analysis](docs/four_dataset_dashboard.md).
+localization errors and text-branch comparisons. Reports render a uniform 10%
+sample per dataset/category/image label by default, keep full-cohort summary
+metrics, and show one dataset at a time in both galleries. Download and fully
+extract `analysis_report.zip` to open `index.html` offline; all required assets
+and their checksums are included. The training entry uses the same defaults.
+See [HTML analysis](docs/four_dataset_dashboard.md).
 
 To export full-color heatmaps and overlays from existing locked predictions,
 run `bash run_render_four_dataset_heatmaps.sh`. It uses CPU/Pillow/NumPy and

@@ -69,6 +69,67 @@ class HeatmapTests(unittest.TestCase):
     def sealed_hashes(self):
         return {str(p): app.sha256(p) for p in self.work.rglob("*") if p.is_file() and "heatmaps" not in p.parts}
 
+    def replicate_queries(self, count):
+        originals = self.rows
+        scores = {}
+        for row in originals:
+            with np.load(self.predictions / (row["id"]+".npz")) as archive:
+                scores[row["id"]] = {key: archive[key].copy() for key in archive.files}
+        self.rows = []
+        for row in originals:
+            for index in range(count):
+                clone = dict(row, id=hashlib.sha256((row["id"]+str(index)).encode()).hexdigest()[:24])
+                self.rows.append(clone)
+                np.savez(self.predictions / (clone["id"]+".npz"), **scores[row["id"]])
+        app.write_json(self.work / "manifest.json", self.rows)
+        self.cfg["manifest_sha"] = app.sha256(self.work / "manifest.json")
+        app.write_json(self.work / "config.json", self.cfg)
+        app.write_json(self.work / "sealed_eval.json", {"fingerprint": app.fingerprint(self.cfg)})
+        decision = self.work / "decisions" / "seed42" / "through15" / "selection.json"
+        selection = app.read_json(decision)
+        selection["fingerprint"] = app.fingerprint(self.cfg)
+        app.write_json(decision, selection)
+        identity = dict(fingerprint=app.fingerprint(self.cfg), selection=app.sha256(decision),
+                        eval_seal=app.sha256(self.work / "sealed_eval.json"), seed=42, horizon=15)
+        hashes = {}
+        for row in self.rows:
+            path = self.predictions / (row["id"]+".npz")
+            hashes[row["id"]] = app.sha256(path)
+            app.write_json(path.with_suffix(".json"), dict(identity=identity, sha=hashes[row["id"]]))
+        app.write_json(self.predictions / "locked.json", dict(identity=identity, predictions=hashes))
+
+    def test_default_uniform_tenth_covers_every_dataset_category_and_label(self):
+        rows = [dict(id=f"{dataset}_{category}_{label}_{index:03}", dataset=dataset, category=category,
+                     image_path=f"/data/{index:03}.png", mask_path="mask.png" if label else None)
+                for dataset in app.TARGETS for category in ("a", "b") for label in (0, 1) for index in range(100)]
+        eligible, selected, sampling = app.select_samples(rows, self.args)
+        self.assertEqual(len(selected), len(eligible)//10)
+        self.assertTrue(all(r["selected"] == 10 and r["total"] == 100 for r in sampling["strata"]))
+        for stratum in sampling["strata"]:
+            matches = [r for r in selected if (r["dataset"], r["category"], int(bool(r["mask_path"]))) ==
+                       (stratum["dataset"], stratum["category"], stratum["label"])]
+            self.assertEqual([int(Path(r["image_path"]).stem) for r in matches], list(range(5, 100, 10)))
+        self.assertEqual(selected, app.select_samples(list(reversed(rows)), self.args)[1])
+        for fraction in (0, -.1, 1.1, float("nan"), float("inf")):
+            self.args.sample_fraction = fraction
+            with self.assertRaisesRegex(ValueError, "sample-fraction"):
+                app.select_samples(rows, self.args)
+
+    def test_renderer_creates_only_sampled_images_and_packages_only_current_selection(self):
+        self.replicate_queries(10)
+        output, records = app.run(self.args)
+        self.assertEqual(len(records), 8)
+        self.assertEqual(len(list(output.rglob("*_panel.jpg"))), 8)
+        self.assertIn("source_sample10_v2", output.parts)
+        stale = output / "mvtec" / "object" / "old_unselected_panel.jpg"
+        stale.write_bytes(b"previous render")
+        app.run(self.args)
+        with zipfile.ZipFile(output / "heatmaps.zip") as archive:
+            self.assertNotIn(stale.relative_to(output).as_posix(), archive.namelist())
+            self.assertIn("sampling.json", archive.namelist())
+            self.assertIsNone(archive.testzip())
+        self.assertIn('id="galleryDataset"', (output / "index.html").read_text(encoding="utf-8"))
+
     def test_all_four_datasets_real_render_gallery_zip_and_immutable_inputs(self):
         before = self.sealed_hashes()
         with patch.dict("sys.modules", {"torch": None, "cv2": None, "matplotlib": None}):

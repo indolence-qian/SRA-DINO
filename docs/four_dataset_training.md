@@ -1,6 +1,9 @@
 # 训练当前网络并统一测试四个数据集
 
 推荐入口：`run_four_datasets_with_html.sh`，训练/评价后自动生成交互式HTML分析报告。
+默认保留全量测试指标，但仅按数据集/类别/正常异常均匀抽取约1/10图片制作热图，
+HTML图库按数据集单独切换；自动生成包含全部页面资源、可解压离线打开的ZIP。
+`SAMPLE_FRACTION=0.1` 对当前结果复盘和后续训练都生效；细节见 [HTML报告说明](four_dataset_dashboard.md)。
 原训练实现为 `run_train_test_four_datasets.sh` / `train_test_four_datasets.py`。
 统一入口默认分析已有v1结果；下面的新训练命令明确指定 `PIPELINE_MODE=train`。
 本入口对应 **DINO 正常参考残差＋约束器/Flow＋高分辨率＋文本**，
