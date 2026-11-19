@@ -38,12 +38,17 @@ Zero-Shot Anomaly Detection (ZSAD) seeks to identify anomalies from arbitrary no
 
 ## Fresh current network: four-dataset train and test
 
-`run_train_test_four_datasets.sh` freshly trains the current **DINO residual +
+`run_four_datasets_with_html.sh` freshly trains the current **DINO residual +
 constraint/Flow + high-resolution + text** network on VisA, then evaluates one
 source-selected model on **MVTec, BTAD, MPDD and LD**. No existing trained Base
 checkpoint is required. Default: 15 epochs, K=4, fixed HR/text fusion, T2 text
 readout, two GPUs, and a single-model four-dataset report ZIP. Legacy sealed
 experiments remain usable. See [the one-command server run](docs/four_dataset_training.md).
+
+For an already completed `residual_hr_text_four_datasets_v1` run, use
+`bash run_build_four_dataset_dashboard.sh` to build an offline interactive HTML
+report with dataset/category metrics, good/bad cases, false positives/negatives,
+localization errors and text-branch comparisons. See [HTML analysis](docs/four_dataset_dashboard.md).
 
 To export full-color heatmaps and overlays from existing locked predictions,
 run `bash run_render_four_dataset_heatmaps.sh`. It uses CPU/Pillow/NumPy and

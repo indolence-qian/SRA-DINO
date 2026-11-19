@@ -1,0 +1,118 @@
+# 四数据集 HTML 交互分析报告
+
+当前实验：`checkpoint/residual_hr_text_four_datasets_v1`，即你已运行的
+`run_train_test_four_datasets.sh`。新增报告读取该实验源选模后权重生成的锁定预测，
+不训练新模型，也不更改权重、封存预测或历史评价。
+
+## 给当前实验补生成HTML
+
+```bash
+cd /mnt/qfg/Tate_qfg/SRA-DINO
+git pull --ff-only origin main
+conda activate qfg_addino
+mkdir -p logs
+
+nohup env WORK_DIR=./checkpoint/residual_hr_text_four_datasets_v1 \
+  bash run_build_four_dataset_dashboard.sh \
+  > logs/four_dataset_dashboard.log 2>&1 &
+```
+
+```bash
+tail -f logs/four_dataset_dashboard.log
+```
+
+默认CPU运行，自动选择 seed42 下最新已完成并锁定的 horizon。
+若完整运行15轮，结果在：
+
+```text
+checkpoint/residual_hr_text_four_datasets_v1/analysis/seed42/through15/source/
+  index.html                交互式分析首页
+  analysis.json             完整数据集/类别/逐图诊断数据与来源哈希
+  sample_metrics.csv        可独立分析的逐图数据，含两个分支指标
+  gallery.html              简单热图浏览页
+  mvtec/...                 原图缩略图、GT、误差图、热图、叠加图等
+  btad/...
+  mpdd/...
+  ld/...
+  analysis_report.zip       HTML和全部图片资源，可整体下载
+```
+
+整体下载并解压 `analysis_report.zip`，双击 `index.html` 即可离线浏览，无需启动服务器、
+安装额外浏览器插件或连接外部网络。单独拷贝HTML会丢失图片，需保留相对目录或下载整个ZIP。
+
+如果只完成训练而尚无锁定预测，可显式要求用当前实验已保存的权重补齐预测：
+
+```bash
+RESUME_PREDICTIONS=1 WORK_DIR=./checkpoint/residual_hr_text_four_datasets_v1 \
+  bash run_build_four_dataset_dashboard.sh
+```
+
+该选项调用原实验入口并设置 `RUN_TRAIN=0`，复用已有头权重和正常参考，不训练新头；
+若特征不存在，会调用原冻结骨干重新导出。GPU、数据、预训练权重和原始配置仍需可用，
+且必须与原运行相同。没有已训练快照时明确报错，不会悄悄开始一轮新训练。
+
+## 页面可以分析什么
+
+- **数据集概览**：MVTec/BTAD/MPDD/LD 的图像AUROC/AP、像素AUROC/AP、AUPRO、最佳像素F1、
+  定位Dice与TP/TN/FP/FN诊断。宏平均和有效类别数明确显示，缺失指标为N/A。
+- **类别明细**：按类别查看问题规模，点击类别后定位到对应样本；不把不同数据集直接混成一个分数。
+- **好坏样本筛选**：正常正确、异常检出且定位好、正常误报、异常未触发、图像检出但定位差、空像素标注。
+- **排序**：定位Dice从低到高/高到低、背景误报面积、原始分数相对源阈值、文本带来的Dice变化。
+- **文本分支比较**：同图查看纯视觉与完整模型，筛选文本改善/退化样本。
+- **逐图放大**：原图、GT、完整模型/纯视觉热图、叠加图、二值预测及六联图；可用方向键前后浏览。
+- **误差叠加**：绿色表示预测与GT命中，红色表示背景误报，蓝色表示标注区域漏检。
+- **导出**：页面按钮可下载当前筛选样本CSV；结果目录也包含完整逐图CSV。
+
+页面会给出需人工核查的线索，例如微小标注区域召回低、背景响应扩散、检出但定位重叠低；
+不会仅凭热图直接断言反光、油污、磨损等具体原因。应结合原图和拍摄情况进一步判断。
+
+## 怎么定义“好”和“差”
+
+图像诊断定义：`最大像素分数 >= 该分支的固定源CAL像素阈值` 视为触发。
+这个像素阈值未单独按图像误报率校准，所以这里的TP/FP/FN/TN用于复盘，
+不等同于部署图像分类阈值下的性能。图像AUROC/AP独立按连续分数和显式图像标签计算。
+
+定位IoU/Dice/召回率使用与原评价一致的GT前景保留缩放，在原预测分辨率计算，
+不在缩略图上打分。定位指标仅用于“异常且像素标注非空”的图片：
+
+- **表现好**：正常未触发，或异常检出且定位Dice≥0.7。
+- **问题样本**：正常误报、异常未触发，或定位Dice<0.3。
+- **定位差**：异常有非零像素标注，Dice<0.3，即便图像已检出也单独标出。
+- **文本改善/退化**：Dice变化超过±0.05，或完整模型相对视觉分支修复/引入图像诊断错误。
+
+上述阈值只是复盘分组，不参与选模或更新权重。页面始终显示原始指标供你自行判断。
+两个分支分别使用原来固定的源阈值，触发结果的变化不能单独证明文本抑制了视觉误报。
+
+BTAD异常图的官方全零mask不丢弃，图像标签仍为异常，定位指标为N/A。
+LD标注来自矩形框，框级定位Dice/AP不能当作精确分割指标。
+Cam5图像标签只有异常时，类别图像AUROC为N/A，不当作0计入宏平均。
+
+全量且评价文件与预测锁一致时，页面读取原逐类别评价的像素AUROC/AP/AUPRO/F1；
+仅生成固定抽样预览时，对抽样不完整的类别不混入全量像素指标，以免口径混淆。
+若原评价未完成，仍可浏览已锁定预测的逐图诊断，缺失的原像素指标显示N/A。
+
+## 以后默认带HTML的运行方式
+
+保留原训练脚本和封存哈希，以免破坏当前实验的续跑；新的推荐入口在它结束后自动追加HTML：
+
+```bash
+cd /mnt/qfg/Tate_qfg/SRA-DINO
+conda activate qfg_addino
+mkdir -p logs
+
+nohup env GPU_IDS=0,1 EPOCHS=15 \
+  WORK_DIR=./checkpoint/residual_hr_text_four_datasets_v2 \
+  bash run_four_datasets_with_html.sh \
+  > logs/residual_hr_text_four_datasets_v2.log 2>&1 &
+```
+
+这是一个新的完整训练实验，所以例子使用新的v2目录。当前v1只需运行本页第一段补报告命令。
+`RUN_EXPERIMENT=0 bash run_four_datasets_with_html.sh` 也可只补报告。
+
+其他参数沿用热图导出：`DATASETS=ld`、`LIMIT_PER_CATEGORY=20`、
+`NORMALIZATION=percentile`、`MAX_SIDE=512`、`OUTPUT_DIR=...` 等。
+默认四数据集全部图片、source固定色标、自动打包。
+percentile仅增强显示，不改变排名、IoU/Dice、误报/漏报或模型指标。
+
+报告在本地用具有明确TP/TN/FP/FN、定位正确/错误与空标注的小样本验证统计，
+并在真实浏览器检查筛选、排序和逐图查看。真实实验效果由你的v1缓存生成，不预先编造数值。

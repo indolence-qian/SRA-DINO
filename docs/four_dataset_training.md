@@ -1,6 +1,7 @@
 # 训练当前网络并统一测试四个数据集
 
-入口：`run_train_test_four_datasets.sh` / `train_test_four_datasets.py`。
+推荐入口：`run_four_datasets_with_html.sh`，训练/评价后自动生成交互式HTML分析报告。
+原训练实现为 `run_train_test_four_datasets.sh` / `train_test_four_datasets.py`。
 本入口对应 **DINO 正常参考残差＋约束器/Flow＋高分辨率＋文本**，
 不是 `run_test_ld.sh` 对应的早期 CLIP+DINO / MARA 网络。
 无需提供已训练的 checkpoint，只需要原来的 DINO/CLIP 预训练权重和数据。
@@ -39,7 +40,7 @@ mkdir -p logs
 
 nohup env GPU_IDS=0,1 EPOCHS=15 \
   WORK_DIR=./checkpoint/residual_hr_text_four_datasets_v1 \
-  bash run_train_test_four_datasets.sh \
+  bash run_four_datasets_with_html.sh \
   > logs/residual_hr_text_four_datasets_v1.log 2>&1 &
 ```
 
@@ -133,7 +134,10 @@ checkpoint/residual_hr_text_four_datasets_v1/
   four_datasets_report.zip       可下载的小型结果包
 ```
 
-若想生成全部测试图片的彩色热力图、独立热图与原图叠加图，使用
+现有v1实验可直接补生成[HTML好坏样本分析报告](four_dataset_dashboard.md)，不用重新训练。
+报告包括数据集/类别对比、误报漏报筛选、定位排名及逐图查看。
+
+若想仅生成全部测试图片的彩色热力图、独立热图与原图叠加图，使用
 [离线热力图导出脚本](four_dataset_heatmaps.md)。它只读取已有预测，在CPU运行，
 不需要重新训练，也不更改本实验的封存代码和指标。
 
