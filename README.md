@@ -45,6 +45,10 @@ checkpoint is required. Default: 15 epochs, K=4, fixed HR/text fusion, T2 text
 readout, two GPUs, and a single-model four-dataset report ZIP. Legacy sealed
 experiments remain usable. See [the one-command server run](docs/four_dataset_training.md).
 
+To export full-color heatmaps and overlays from existing locked predictions,
+run `bash run_render_four_dataset_heatmaps.sh`. It uses CPU/Pillow/NumPy and
+provides a downloadable gallery without retraining; see [heatmap export](docs/four_dataset_heatmaps.md).
+
 ## LD dataset: older CLIP+DINO / MARA frozen-model test
 
 `run_test_ld.sh` evaluates the prepared LD dataset with an existing CLIP+DINO

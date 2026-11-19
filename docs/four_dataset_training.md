@@ -133,6 +133,10 @@ checkpoint/residual_hr_text_four_datasets_v1/
   four_datasets_report.zip       可下载的小型结果包
 ```
 
+若想生成全部测试图片的彩色热力图、独立热图与原图叠加图，使用
+[离线热力图导出脚本](four_dataset_heatmaps.md)。它只读取已有预测，在CPU运行，
+不需要重新训练，也不更改本实验的封存代码和指标。
+
 主表 `full` 是同一完整模型在四个数据集上的效果；`visual` 是同模型 Flow 分支，
 用于看文本带来的变化，并不表示另外训练了一套网络。
 报告 I-AUROC、I-AP、P-AUROC、P-AP、AUPRO、F1-best，以及源阈值下的背景FPR和像素召回。
