@@ -420,6 +420,16 @@ If you use this work, please cite:
 
 ## Frozen-visual text comparison
 
+The pinned current frozen configuration is **T3, 24 paired descriptions, lambda=2**
+for every dataset, defined in [`configs/fixed_t3_lambda2_v1.json`](configs/fixed_t3_lambda2_v1.json).
+`bash run_fixed_t3_lambda2.sh` publishes its full-cohort metrics and a portable
+10% stratified HTML gallery from the completed lambda run, without retraining.
+`fixed_text_configuration.py` also exposes frozen-model loading and residual-batch
+inference with this exact fusion. This is a development configuration chosen
+using the three established target results; new held-out evaluation is needed.
+Existing source-selected runs and old training defaults are preserved.
+See the fixed configuration results and command in [对比实验.md](对比实验.md).
+
 `run_exp_text_lambda.sh` reuses the completed T1/T2/T3 heads and residual caches
 to compare lambda=0/0.1/0.25/0.5/1/2/4, with a source-gated extension to 8.
 It selects lambda on source validation only, keeps all target masks, writes
